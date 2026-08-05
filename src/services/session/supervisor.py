@@ -93,7 +93,7 @@ class SessionSupervisor:
                 self._lifecycle.heartbeat(session)
                 self._lifecycle.apply_health(session, ingest=ingest, publish=publish)
 
-                if self._should_fail(session_id, ingest, publish):
+                if self._should_fail(session_id, ingest, publish, session_state=session.state):
                     detail = f"ingest={ingest} publish={publish} for over {self._grace_s}s"
                     self._lifecycle.fail(session, "supervisor", detail)
                     logger.error("session.failed", detail=detail)
@@ -102,9 +102,29 @@ class SessionSupervisor:
                     return
 
     def _should_fail(
-        self, session_id: SessionId, ingest: ComponentState, publish: ComponentState
+        self,
+        session_id: SessionId,
+        ingest: ComponentState,
+        publish: ComponentState,
+        *,
+        session_state: SessionState,
     ) -> bool:
-        """True once a leg has been unhealthy past the grace window."""
+        """True once a leg has been unhealthy past the grace window.
+
+        Exempt while still ``JOINING``: a leg reporting ``UNKNOWN`` there means it
+        has not attempted its first attach yet — for RTMS ingest that is normal
+        while a session waits on ``meeting.rtms_started`` (doc 003 §3.1), and that
+        wait has its own, longer timeout (``RtmsAudioSource``'s
+        ``attach_wait_timeout_s``). This grace window is for a leg that *was* up
+        and went bad, not for the ordinary time a first attach takes. Once a leg
+        actually fails to attach it reports ``UNHEALTHY``, not ``UNKNOWN``, which
+        moves the session out of ``JOINING`` (``domain.session.derive_state``) and
+        back under this clock.
+        """
+        if session_state is SessionState.JOINING:
+            self._unhealthy_since.pop(session_id, None)
+            return False
+
         loop = asyncio.get_running_loop()
         now = loop.time()
         impaired = not ingest.is_serving or not publish.is_serving

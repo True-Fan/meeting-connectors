@@ -21,13 +21,11 @@ from pathlib import Path
 
 from src.avatar.client import AvatarClient
 from src.avatar.ws_transport import WebSocketAvatarTransport
-from src.connectors.zoom.auth.rtms_signature import build_signature
 from src.connectors.zoom.auth.sdk_jwt import SdkJwtFactory
 from src.connectors.zoom.config import ZoomConnectorConfig
 from src.connectors.zoom.publisher.publisher import MeetingPublisher
 from src.connectors.zoom.publisher.uds_client import SidecarUdsClient
 from src.connectors.zoom.rtms.audio_source import RtmsAudioSource
-from src.connectors.zoom.rtms.mapping import rtms_attachment
 from src.domain.health import ComponentHealth, ComponentState, HealthReport
 from src.domain.media import AudioFormat, VideoFormat
 from src.domain.session import SessionContext
@@ -219,18 +217,13 @@ class ZoomSessionFactory:
     def _build_source(
         self, session: SessionContext, ctx: object, clock: MediaClock
     ) -> AudioSource:
-        meeting_uuid, stream_id, signaling_url = rtms_attachment(session.meeting)
-        signature = build_signature(
+        # No attachment is read here: it may not exist yet (doc 003 §3.1). The
+        # source is handed the live ``session`` and resolves the attachment itself,
+        # once ``meeting.rtms_started`` has bound it — see ``RtmsAudioSource``.
+        return RtmsAudioSource(
+            session=session,
             client_id=self._config.client_id,
             client_secret=self._config.client_secret,
-            meeting_uuid=meeting_uuid,
-            rtms_stream_id=stream_id,
-        )
-        return RtmsAudioSource(
-            meeting_uuid=meeting_uuid,
-            rtms_stream_id=stream_id,
-            signaling_url=signaling_url,
-            signature=signature,
             ctx=ctx,  # type: ignore[arg-type]
             clock=clock,
             queue_size=self._config.inbound_queue_size,
