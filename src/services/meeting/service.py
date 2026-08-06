@@ -3,23 +3,27 @@
 The single entry point for "start an avatar in a meeting" and "stop it". It allocates
 and supervises; it never touches a media frame.
 
-Also resolves the **join/RTMS race** (doc 003 §3.1): a session can be created before or
-after the ``meeting.rtms_started`` webhook arrives, and whichever lands second completes
-the binding. Handling only one order would make attachment depend on timing we do not
-control.
+Also resolves the **join/RTMS race** (doc 003 §3.1): a Zoom session can be created
+before or after the ``meeting.rtms_started`` webhook arrives, and whichever lands
+second completes the binding. Handling only one order would make attachment depend on
+timing we do not control. That race is Zoom's alone — Teams initiates its own join and
+has nothing to park — so the claim step is gated on the platform (doc 005 §3.4).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from src.domain.exceptions import DomainError
 from src.domain.ids import CorrelationId, SessionId, new_correlation_id, new_session_id
-from src.domain.meeting import MeetingContext
+from src.domain.meeting import MeetingContext, MeetingPlatform
 from src.domain.session import SessionContext, SessionState
 from src.infrastructure.context import bind_context
 from src.infrastructure.logging import get_logger
 from src.infrastructure.metrics import MetricName, MetricsCollector
+from src.protocols.connector import ConnectorSession, ConnectorSessionFactory
+from src.services.meeting.connector_registry import ConnectorRegistry
 from src.services.session.lifecycle import SessionLifecycle
 from src.services.session.registry import PendingRtmsBinding, SessionRegistry
 from src.services.session.supervisor import SessionSupervisor
@@ -45,14 +49,21 @@ class CreateSessionCommand:
     display_name: str | None = None
     meeting_uuid: str | None = None
     correlation_id: CorrelationId | None = None
+    platform: MeetingPlatform = MeetingPlatform.ZOOM
+    """Which connector serves this session. Defaults to ``ZOOM``, so every existing
+    caller keeps its exact behaviour."""
+    meeting_url: str | None = None
+    """Optional platform join URL. Zoom ignores it (it joins by number); the Teams
+    connector parses it for the Graph join descriptor when no numeric meeting id and
+    passcode are supplied (doc 005 §3.2)."""
 
 
 class MeetingService:
     """Creates, stops, and looks up avatar meeting sessions."""
 
     __slots__ = (
+        "_connectors",
         "_default_display_name",
-        "_factory",
         "_lifecycle",
         "_metrics",
         "_registry",
@@ -65,16 +76,40 @@ class MeetingService:
         registry: SessionRegistry,
         lifecycle: SessionLifecycle,
         supervisor: SessionSupervisor,
-        session_factory: object,
+        connectors: ConnectorRegistry | None = None,
+        session_factory: ConnectorSessionFactory | None = None,
         default_display_name: str = "AI Avatar",
         metrics: MetricsCollector | None = None,
     ) -> None:
+        """Wire the service.
+
+        Args:
+            connectors: Platform → factory lookup. The path used in production.
+            session_factory: A single factory, registered as the ``ZOOM`` connector.
+                Retained so the pre-Teams constructor signature keeps working
+                unchanged; supply one or the other, not both.
+
+        Raises:
+            ValueError: neither or both of ``connectors`` and ``session_factory``.
+        """
+        if (connectors is None) == (session_factory is None):
+            raise ValueError("supply exactly one of connectors= or session_factory=")
+
+        if connectors is None:
+            assert session_factory is not None
+            connectors = ConnectorRegistry().register(MeetingPlatform.ZOOM, session_factory)
+
         self._registry = registry
         self._lifecycle = lifecycle
         self._supervisor = supervisor
-        self._factory = session_factory
+        self._connectors = connectors
         self._default_display_name = default_display_name
         self._metrics = metrics
+
+    @property
+    def supported_platforms(self) -> frozenset[MeetingPlatform]:
+        """Platforms this deployment has a connector registered for."""
+        return self._connectors.supported()
 
     # -- creation ----------------------------------------------------------
 
@@ -86,13 +121,24 @@ class MeetingService:
         and idles until the webhook arrives (doc 003 §3.1).
 
         Raises:
-            MeetingServiceError: a session for this meeting already exists, or start
-                failed.
+            MeetingServiceError: a session for this meeting already exists, no
+                connector is registered for the requested platform, or start failed.
         """
         if self._registry.by_meeting_number(command.meeting_number) is not None:
             raise MeetingServiceError(
                 f"a session for meeting {command.meeting_number} already exists"
             )
+
+        # Resolved before anything is allocated: an unsupported platform must fail
+        # before a session id, a registry entry, or a socket exists.
+        try:
+            factory = self._connectors.get(command.platform)
+        except DomainError as exc:
+            raise MeetingServiceError(str(exc)) from exc
+
+        platform_data: dict[str, Any] = {}
+        if command.meeting_url:
+            platform_data["meeting_url"] = command.meeting_url
 
         session = SessionContext(
             session_id=new_session_id(),
@@ -102,6 +148,8 @@ class MeetingService:
                 display_name=command.display_name or self._default_display_name,
                 passcode=command.passcode,
                 meeting_uuid=command.meeting_uuid,
+                platform_data=platform_data,
+                platform=command.platform,
             ),
         )
 
@@ -112,28 +160,41 @@ class MeetingService:
             self._registry.register(session)
 
             try:
-                zoom_session = self._factory.build(session)  # type: ignore[attr-defined]
+                connector_session = factory.build(session)
                 self._lifecycle.transition(session, SessionState.JOINING)
-                await zoom_session.start()
+                await connector_session.start()
             except Exception as exc:
                 self._lifecycle.fail(session, "meeting_service", str(exc))
                 self._registry.remove(session.session_id)
                 logger.error("session.start_failed", error=str(exc))
                 raise MeetingServiceError(f"cannot start session: {exc}") from exc
 
-            self._supervisor.supervise(zoom_session)
+            self._supervisor.supervise(connector_session)
             if self._metrics is not None:
-                self._metrics.increment(MetricName.SESSIONS_STARTED_TOTAL)
+                self._metrics.increment(
+                    MetricName.SESSIONS_STARTED_TOTAL, platform=command.platform
+                )
 
             logger.info(
                 "session.created",
+                platform=command.platform,
                 meeting_number=command.meeting_number,
                 rtms_bound=session.meeting.meeting_uuid is not None,
             )
             return session
 
     def _claim_pending_rtms(self, session: SessionContext) -> None:
-        """Bind a parked ``rtms_started`` payload to a new session, if one is waiting."""
+        """Bind a parked ``rtms_started`` payload to a new session, if one is waiting.
+
+        **Zoom only.** ``take_any_pending_rtms`` claims by arrival order rather than
+        identity, so without this guard a Teams session created while a Zoom webhook
+        sat parked would swallow that binding — leaving the Zoom session that the
+        payload belongs to waiting forever for a webhook that had already been
+        consumed. The guard is what keeps the two connectors' races from touching.
+        """
+        if session.meeting.platform is not MeetingPlatform.ZOOM:
+            return
+
         binding = None
         if session.meeting.meeting_uuid:
             binding = self._registry.take_pending_rtms(session.meeting.meeting_uuid)
@@ -215,5 +276,5 @@ class MeetingService:
 
     def health_report(self, session_id: SessionId) -> object | None:
         """Component-level health for one session, if it is supervised."""
-        zoom_session = self._supervisor.get(session_id)
-        return zoom_session.health() if zoom_session is not None else None
+        connector_session: ConnectorSession | None = self._supervisor.get(session_id)
+        return connector_session.health() if connector_session is not None else None

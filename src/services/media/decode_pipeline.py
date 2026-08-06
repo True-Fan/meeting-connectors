@@ -14,6 +14,8 @@ that reports success and produces permanently black video.
 
 from __future__ import annotations
 
+import asyncio
+
 from src.domain.context import FrameContext
 from src.domain.health import ComponentHealth, ComponentState
 from src.domain.media import MediaChunk
@@ -40,6 +42,7 @@ class DecodePipeline:
         "_metrics",
         "_restarts",
         "_started",
+        "_started_event",
     )
 
     def __init__(
@@ -59,10 +62,28 @@ class DecodePipeline:
         self._init_segment: MediaChunk | None = None
         self._restarts = 0
         self._started = False
+        # Signals that ``decoder`` is live and safe to iterate. The decoder only exists
+        # once the first chunk arrives from the avatar, but ``MediaRouter`` starts its
+        # output legs at session start — so without something to wait on, those legs call
+        # ``decoder.video()`` before there is a decoder and take the session's task group
+        # down on the first frame of every session.
+        self._started_event = asyncio.Event()
 
     @property
     def decoder(self) -> MediaDecoder:
         return self._decoder
+
+    @property
+    def is_started(self) -> bool:
+        return self._started
+
+    async def wait_started(self) -> None:
+        """Block until the decoder is running.
+
+        For consumers of ``decoder.video()`` / ``decoder.audio()``, which cannot be
+        iterated before ``start()``. Returns immediately once started.
+        """
+        await self._started_event.wait()
 
     @property
     def restarts(self) -> int:
@@ -78,6 +99,7 @@ class DecodePipeline:
             self._init_segment = init_segment
         await self._decoder.start(self._init_segment)
         self._started = True
+        self._started_event.set()
 
     async def feed(self, chunk: MediaChunk) -> None:
         """Feed one chunk, caching it if it is the init segment."""
@@ -90,6 +112,7 @@ class DecodePipeline:
     async def stop(self) -> None:
         """Stop decoding. Idempotent."""
         self._started = False
+        self._started_event.clear()
         await self._decoder.stop()
 
     async def restart(self) -> bool:
@@ -119,6 +142,7 @@ class DecodePipeline:
 
         await self._decoder.start(self._init_segment)
         self._started = True
+        self._started_event.set()
 
         if self._metrics is not None:
             self._metrics.increment(MetricName.DECODER_RESTARTS_TOTAL, ctx=self._ctx)

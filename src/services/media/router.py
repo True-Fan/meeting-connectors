@@ -147,6 +147,10 @@ class MediaRouter:
     # -- decoder → pacer ---------------------------------------------------
 
     async def _route_video(self) -> None:
+        # The decoder does not exist until the avatar streams its first chunk, and
+        # ``decoder.video()`` raises before then. Every leg starts at session start, so
+        # without this wait the first thing a session did was kill its own task group.
+        await self._decode.wait_started()
         async for frame in self._decode.decoder.video():
             self._pacer.submit_video(frame)
             if self._metrics is not None:
@@ -157,6 +161,7 @@ class MediaRouter:
                 )
 
     async def _route_audio(self) -> None:
+        await self._decode.wait_started()
         async for frame in self._decode.decoder.audio():
             self._pacer.submit_audio(frame)
             if self._metrics is not None:

@@ -8,6 +8,11 @@ health alone cannot make (``domain.session.derive_state`` deliberately never ret
 
 One ``asyncio.Task`` per session. A session's failure cannot touch another's, because
 they share no task and no state.
+
+Platform-blind: it drives ``ConnectorSession`` and never learns which platform is
+underneath. Zoom's two legs recover independently and Teams' single media session
+recovers as a unit — both surface through ``leg_states()`` as a health pair, so the
+difference is data rather than a second supervisor.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ from src.domain.session import SessionState
 from src.infrastructure.context import bind_context
 from src.infrastructure.logging import get_logger
 from src.infrastructure.metrics import MetricName, MetricsCollector
+from src.protocols.connector import ConnectorSession
 from src.services.session.lifecycle import SessionLifecycle
 from src.services.session.registry import SessionRegistry
 
@@ -61,24 +67,24 @@ class SessionSupervisor:
         self._metrics = metrics
         self._poll_s = poll_interval_s
         self._grace_s = unhealthy_grace_s
-        self._sessions: dict[SessionId, object] = {}
+        self._sessions: dict[SessionId, ConnectorSession] = {}
         self._tasks: dict[SessionId, asyncio.Task[None]] = {}
         self._unhealthy_since: dict[SessionId, float] = {}
 
-    def supervise(self, zoom_session: object) -> None:
+    def supervise(self, connector_session: ConnectorSession) -> None:
         """Begin supervising a started session."""
-        session = zoom_session.session  # type: ignore[attr-defined]
+        session = connector_session.session
         session_id: SessionId = session.session_id
-        self._sessions[session_id] = zoom_session
+        self._sessions[session_id] = connector_session
         self._tasks[session_id] = asyncio.create_task(
             self._watch(session_id), name=f"supervise-{session_id}"
         )
 
     async def _watch(self, session_id: SessionId) -> None:
-        zoom_session = self._sessions.get(session_id)
-        if zoom_session is None:
+        connector_session = self._sessions.get(session_id)
+        if connector_session is None:
             return
-        session = zoom_session.session  # type: ignore[attr-defined]
+        session = connector_session.session
 
         with bind_context(
             session_id=session.session_id, correlation_id=session.correlation_id
@@ -89,7 +95,7 @@ class SessionSupervisor:
                 if session.state.is_terminal:
                     return
 
-                ingest, publish = zoom_session.leg_states()  # type: ignore[attr-defined]
+                ingest, publish = connector_session.leg_states()
                 self._lifecycle.heartbeat(session)
                 self._lifecycle.apply_health(session, ingest=ingest, publish=publish)
 
@@ -144,15 +150,15 @@ class SessionSupervisor:
             with suppress(asyncio.CancelledError):
                 await task
 
-        zoom_session = self._sessions.pop(session_id, None)
+        connector_session = self._sessions.pop(session_id, None)
         self._unhealthy_since.pop(session_id, None)
-        if zoom_session is None:
+        if connector_session is None:
             return
 
-        session = zoom_session.session  # type: ignore[attr-defined]
+        session = connector_session.session
         if not session.state.is_terminal:
             self._lifecycle.transition(session, SessionState.STOPPING)
-        await zoom_session.stop()  # type: ignore[attr-defined]
+        await connector_session.stop()
         if session.state is SessionState.STOPPING:
             self._lifecycle.transition(session, SessionState.STOPPED)
 
@@ -168,7 +174,7 @@ class SessionSupervisor:
         for session_id in list(self._tasks):
             await self.shutdown(session_id)
 
-    def get(self, session_id: SessionId) -> object | None:
+    def get(self, session_id: SessionId) -> ConnectorSession | None:
         return self._sessions.get(session_id)
 
     def __len__(self) -> int:

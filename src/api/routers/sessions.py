@@ -1,7 +1,10 @@
 """Session endpoints.
 
-Platform-blind: the DTOs and this router mention meetings and sessions, never RTMS,
-the Meeting SDK, or a sidecar. All of that is behind ``MeetingService``.
+Platform-blind: the DTOs and this router mention meetings, sessions, and a ``platform``
+enum — never RTMS, Graph, the Meeting SDK, or a sidecar. All of that is behind
+``MeetingService``, which resolves the platform to a connector through the registry.
+Adding Teams changed two lines here (passing ``platform`` and ``meeting_url`` through);
+adding Google Meet will change none.
 """
 
 from __future__ import annotations
@@ -45,6 +48,8 @@ async def create_session(
         passcode=request.passcode,
         display_name=request.display_name,
         meeting_uuid=request.meeting_uuid,
+        platform=request.platform,
+        meeting_url=request.meeting_url,
         # Carry the request's correlation id into the session so one HTTP call can be
         # traced through every frame it causes.
         correlation_id=current_correlation_id(),

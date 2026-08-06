@@ -4,8 +4,9 @@ Separate from domain models on purpose: an HTTP contract and an internal model c
 for different reasons, and coupling them means an internal refactor becomes a breaking
 API change.
 
-Nothing here names a platform. A caller cannot tell from this contract that the
-implementation is Zoom.
+Nothing here names a *specific* platform's mechanics. ``platform`` is a domain enum, so
+the contract says which connector to use without exposing RTMS, Graph, or a sidecar —
+a caller still cannot tell from this contract how either platform is implemented.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.domain.health import ComponentState, HealthReport
+from src.domain.meeting import MeetingPlatform
 from src.domain.session import SessionContext, SessionState
 
 
@@ -47,18 +49,36 @@ class CreateSessionRequest(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    meeting_number: str = Field(min_length=1, max_length=64, examples=["1234567890"])
+    meeting_number: str = Field(min_length=1, max_length=512, examples=["1234567890"])
+    """The meeting's numeric identifier. On Zoom, the meeting number; on Teams, the
+    "Meeting ID" printed in the invite. A Teams join URL is also accepted here, which
+    is why the length allows for one."""
     passcode: str | None = Field(default=None, max_length=128)
     display_name: str | None = Field(
         default=None,
         max_length=128,
         description="Name other participants see. Defaults to the configured value.",
     )
+    platform: MeetingPlatform = Field(
+        default=MeetingPlatform.ZOOM,
+        description=(
+            "Which connector serves this session. Defaults to zoom, so requests "
+            "written before Teams existed behave identically."
+        ),
+    )
+    meeting_url: str | None = Field(
+        default=None,
+        max_length=2048,
+        description=(
+            "Optional platform join URL. Used by Teams when a numeric meeting id is "
+            "not to hand; ignored by Zoom, which joins by number."
+        ),
+    )
     meeting_uuid: str | None = Field(
         default=None,
         description=(
-            "Optional. Supplying it lets an inbound RTMS stream be matched to this "
-            "session exactly rather than by arrival order."
+            "Optional, Zoom only. Supplying it lets an inbound RTMS stream be matched "
+            "to this session exactly rather than by arrival order."
         ),
     )
 
@@ -79,11 +99,16 @@ class SessionResponse(BaseModel):
 
     session_id: str
     correlation_id: str
+    platform: MeetingPlatform
     meeting_number: str
     display_name: str
     state: SessionState
     audio_attached: bool = Field(
-        description="True once an RTMS stream is bound. The avatar publishes before this."
+        description=(
+            "True once audio ingest is bound. On Zoom this waits for the RTMS stream, "
+            "and the avatar publishes before it; on Teams one join covers both "
+            "directions, so it is true from the moment the session is active."
+        )
     )
     created_at: datetime
     started_at: datetime | None = None
@@ -95,10 +120,11 @@ class SessionResponse(BaseModel):
         return cls(
             session_id=session.session_id,
             correlation_id=session.correlation_id,
+            platform=session.meeting.platform,
             meeting_number=session.meeting.meeting_number,
             display_name=session.meeting.display_name,
             state=session.state,
-            audio_attached=session.meeting.meeting_uuid is not None,
+            audio_attached=_audio_attached(session),
             created_at=session.created_at,
             started_at=session.started_at,
             ended_at=session.ended_at,
@@ -141,3 +167,17 @@ class SessionListResponse(BaseModel):
 
     sessions: tuple[SessionResponse, ...] = ()
     total: int = 0
+
+
+def _audio_attached(session: SessionContext) -> bool:
+    """Whether audio ingest is bound, which the two platforms answer differently.
+
+    Zoom's ingest attaches only once ``meeting.rtms_started`` supplies a meeting UUID,
+    so the UUID's presence *is* the answer — and the field was originally defined that
+    way. Teams has no equivalent signal: its single join covers both directions, so a
+    running session is by definition attached, and reusing the UUID test would report
+    every healthy Teams session as unattached forever.
+    """
+    if session.meeting.platform is MeetingPlatform.ZOOM:
+        return session.meeting.meeting_uuid is not None
+    return session.state.is_running

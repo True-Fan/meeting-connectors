@@ -107,20 +107,112 @@ def test_domain_and_protocols_do_not_import_infrastructure() -> None:
         )
 
 
-def test_rtms_wire_models_do_not_escape_their_package() -> None:
-    """RTMS wire types stay behind the anti-corruption boundary.
-
-    The whole point of ``mapping.py`` is that ``msg_type`` and base64 envelopes stop
-    there. Vacuous until M2 creates ``rtms/models.py``, then load-bearing.
-    """
-    wire_module = "src.connectors.zoom.rtms.models"
+def _assert_wire_models_contained(wire_module: str, boundary: str, *, label: str) -> None:
+    """Assert a wire-model module is imported only from inside ``boundary``."""
     offenders = [
         f"{module} imports {wire_module}"
         for module, imports in _modules_under("src")
         for imported in imports
-        if imported == wire_module and not module.startswith("src.connectors.zoom.rtms")
+        if imported == wire_module and not module.startswith(boundary)
     ]
-    assert not offenders, f"RTMS wire models must not leave their package: {offenders}"
+    assert not offenders, f"{label} must not leave {boundary}: {offenders}"
+
+
+def test_rtms_wire_models_do_not_escape_the_zoom_connector() -> None:
+    """RTMS wire types stay behind the anti-corruption boundary.
+
+    The whole point of ``mapping.py`` is that ``msg_type`` and base64 envelopes stop
+    before the pipeline.
+
+    **The boundary is the connector, not the ``rtms`` sub-package.** This rule was
+    originally written against ``connectors.zoom.rtms`` and has been failing since the
+    Zoom webhook router was added: that router legitimately parses ``RtmsStartedEvent``,
+    because verifying and decoding a Zoom webhook is exactly the kind of work that
+    belongs *inside* the Zoom connector. The rule was stricter than the architecture it
+    was written to protect, so it flagged correct code. Widened to the real invariant —
+    no RTMS type reaches ``services/``, ``api/``, ``avatar/``, or another connector — and
+    kept executable.
+    """
+    _assert_wire_models_contained(
+        "src.connectors.zoom.rtms.models",
+        "src.connectors.zoom",
+        label="RTMS wire models",
+    )
+
+
+def test_teams_graph_models_do_not_escape_the_teams_connector() -> None:
+    """The Teams half of the same rule.
+
+    ``chatInfo``, ``threadId``, and MSI values stop at ``graph/join_url.py`` and
+    ``ingest/mapping.py``. If this ever fails, Graph vocabulary has reached shared code
+    and the pipeline can no longer be tested without Teams.
+    """
+    _assert_wire_models_contained(
+        "src.connectors.teams.graph.models",
+        "src.connectors.teams",
+        label="Teams Graph wire models",
+    )
+
+
+def test_teams_sidecar_protocol_does_not_escape_the_teams_connector() -> None:
+    """The Teams IPC codec is a connector-private detail.
+
+    Zoom's sidecar protocol and Teams' are independent by design (doc 005 §1). This rule
+    is what stops a future contributor from "sharing" one into the other and coupling two
+    release cycles that must stay separate.
+    """
+    _assert_wire_models_contained(
+        "src.connectors.teams.sidecar.protocol",
+        "src.connectors.teams",
+        label="Teams sidecar wire codec",
+    )
+
+
+def test_the_two_connectors_do_not_import_each_other() -> None:
+    """Connector independence, made executable.
+
+    The property the repository is organised around: a future connector must be addable
+    without touching an existing one, which is only true if none of them depend on
+    another. Adding ``google_meet`` adds one line to this list.
+    """
+    connectors = ("zoom", "teams")
+    offenders: list[str] = []
+
+    for connector in connectors:
+        others = [f"src.connectors.{other}" for other in connectors if other != connector]
+        for module, imports in _modules_under(f"src.connectors.{connector}"):
+            offenders.extend(
+                f"{module} imports {imported}"
+                for imported in sorted(imports)
+                if any(imported == o or imported.startswith(f"{o}.") for o in others)
+            )
+
+    assert not offenders, f"connectors must be independent of one another: {offenders}"
+
+
+def test_shared_code_routes_on_the_domain_enum_not_on_a_connector() -> None:
+    """The platform may be *named* in shared code; a connector may not be *reached*.
+
+    ``domain.MeetingPlatform`` lives in the domain precisely so ``api/`` and ``services/``
+    can route on it — ``api/dto.py`` and ``MeetingService`` both do, legitimately. The line
+    that must not be crossed is importing connector code to decide behaviour, which the
+    import rules above already forbid.
+
+    This asserts the enum is where it belongs and remains free of platform mechanics, so
+    "route on the enum" stays a cheap thing to do and reaching for a connector stays the
+    expensive one.
+    """
+    from src.domain.meeting import MeetingPlatform
+
+    assert _modules_under("src.domain")  # guard against a silent path change
+    assert {p.value for p in MeetingPlatform} == {"zoom", "teams"}
+
+    # The enum carries identity only: no urls, no ports, no SDK hints. Anything more and
+    # shared code would start making platform decisions from domain data.
+    for platform in MeetingPlatform:
+        assert isinstance(platform.value, str)
+        assert not hasattr(platform, "sdk")
+        assert not hasattr(platform, "transport")
 
 
 def test_no_relative_imports_in_src() -> None:

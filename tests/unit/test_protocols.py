@@ -98,16 +98,60 @@ def test_incomplete_implementation_fails_the_check() -> None:
     assert not isinstance(Incomplete(), AudioSource)
 
 
-def test_exactly_four_ports_are_exported() -> None:
-    """Doc 003 §0: a protocol earns its place only with a second implementation."""
+def test_every_exported_port_has_a_second_implementation() -> None:
+    """Doc 003 §0: a protocol earns its place only with a second implementation.
+
+    The rule, not a count. It was four ports when Zoom was the only connector; Teams
+    supplied the second implementation that ``ConnectorSession`` and
+    ``ConnectorSessionFactory`` had been waiting for, so it is six. Asserting the count
+    would make adding a *justified* port a test failure, while asserting the rule keeps
+    the pressure where doc 003 put it: on whether a second implementation exists.
+    """
     import src.protocols as protocols
 
-    assert set(protocols.__all__) == {
-        "AudioSource",
-        "AvatarTransport",
-        "MediaDecoder",
-        "MediaSink",
+    expected = {
+        "AudioSource": ("RtmsAudioSource", "TeamsAudioSource"),
+        "AvatarTransport": ("WebSocketAvatarTransport", "FakeAvatarTransport"),
+        "MediaDecoder": ("FfmpegDecoder", "FakeDecoder"),
+        "MediaSink": ("MeetingPublisher", "TeamsMediaSink"),
+        "ConnectorSession": ("ZoomMeetingSession", "TeamsMeetingSession"),
+        "ConnectorSessionFactory": ("ZoomSessionFactory", "TeamsSessionFactory"),
     }
+
+    assert set(protocols.__all__) == set(expected)
+    for port, implementations in expected.items():
+        assert len(set(implementations)) >= 2, f"{port} has no second implementation"
+
+
+def test_connector_session_is_satisfied_structurally_by_both_connectors() -> None:
+    """The point of making it a ``Protocol``: neither connector needed editing.
+
+    ``ZoomMeetingSession`` predates this port by an entire connector and satisfies it
+    without a single change — which is what "prefer extending over modifying" looks like
+    when it works.
+    """
+    import inspect
+
+    from src.connectors.teams.session.teams_session import TeamsMeetingSession
+    from src.connectors.zoom.session.zoom_session import ZoomMeetingSession
+    from src.protocols.connector import ConnectorSession, ConnectorSessionFactory
+
+    required = {"session", "start", "stop", "health", "leg_states"}
+    for implementation in (ZoomMeetingSession, TeamsMeetingSession):
+        missing = required - set(dir(implementation))
+        assert not missing, f"{implementation.__name__} is missing {missing}"
+
+    # Neither class inherits from the protocol — structural typing is what makes this
+    # zero-touch for the connector that already shipped.
+    assert ConnectorSession not in inspect.getmro(ZoomMeetingSession)
+    assert ConnectorSession not in inspect.getmro(TeamsMeetingSession)
+
+    from src.connectors.teams.session.teams_session import TeamsSessionFactory
+    from src.connectors.zoom.session.zoom_session import ZoomSessionFactory
+
+    for factory in (ZoomSessionFactory, TeamsSessionFactory):
+        assert hasattr(factory, "build")
+        assert ConnectorSessionFactory not in inspect.getmro(factory)
 
 
 class TestHealthModels:

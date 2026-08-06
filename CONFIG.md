@@ -1,4 +1,8 @@
-# Testing Configuration — Zoom Portal + Local Setup
+# Testing Configuration — Platform Portals + Local Setup
+
+**Zoom** is §1–§9. **Microsoft Teams** is §10, and its prerequisites are entirely
+different — an Azure AD app registration, a Windows host, and two certificates rather
+than a Marketplace app and a webhook URL.
 
 **Goal of this guide:** get your own code (RTMS ingest, session lifecycle, stub sidecar,
 mock avatar) exercised end-to-end with dummy/stub data — **not** a real, visible
@@ -264,3 +268,145 @@ across the Zoom Developer Forum, hit by developers with otherwise-correct config
 every resolved thread ends in Zoom staff manually enabling RTMS for the reporter's
 App ID. Nothing left to try locally at this point; the forum post above is the
 next step, not another config or curl change.
+
+
+---
+
+# 10. Microsoft Teams
+
+Nothing in §1–§8 applies here. Teams' prerequisites are Azure, not a Marketplace app,
+and the honest headline is that **Teams cannot be exercised end-to-end without a Windows
+host** — app-hosted media is Windows/.NET only ([doc 005 §1](docs/design/005-teams-connector-architecture.md)).
+
+The good news mirrors how Zoom was de-risked: the bridge side is fully testable without
+any of it (§10.5).
+
+## 10.1 Azure AD app registration
+
+In [portal.azure.com](https://portal.azure.com) → **Microsoft Entra ID** → **App registrations** → **New registration**:
+
+1. Name it, single-tenant is fine, no redirect URI needed (this is a daemon, not a UI).
+2. **Certificates & secrets** → **New client secret**. Copy the value immediately — it is
+   shown once.
+3. **API permissions** → **Add a permission** → **Microsoft Graph** → **Application
+   permissions**:
+
+| Permission | Why |
+|---|---|
+| `Calls.JoinGroupCall.All` | Join a scheduled meeting |
+| `Calls.AccessMedia.All` | App-hosted media. **Without it the bot joins successfully and no media ever flows** — the most confusing failure in this whole setup, because nothing errors. |
+| `Calls.JoinGroupCallAsGuest.All` | Only if joining meetings outside your tenant |
+
+4. **Grant admin consent** — application permissions do nothing until an admin consents.
+   This needs a Global Administrator; if you are not one, this is the step to hand off.
+
+Note these three, they go in `.env` as `MC_TEAMS__TENANT_ID`, `MC_TEAMS__CLIENT_ID`,
+`MC_TEAMS__CLIENT_SECRET`.
+
+## 10.2 Bot registration
+
+Register an **Azure Bot** with the **Microsoft Teams** channel enabled, and set its
+**calling webhook** to:
+
+```
+https://<your-fqdn>:<media-public-port>/api/calls
+```
+
+That endpoint is served by the sidecar, not by this bridge — Graph's notifications are
+input to the Calling SDK, which lives on the Windows side ([doc 005 §3.3](docs/design/005-teams-connector-architecture.md)).
+Consequence: there is no Teams webhook to configure on the bridge, and no ngrok tunnel to
+set up the way §2.3 needs one for Zoom.
+
+## 10.3 Windows host
+
+- Windows Server 2019+ (or Windows 10/11 to develop against), **x64**
+- .NET Framework 4.7.2+
+- A **publicly resolvable** DNS name — Microsoft's service connects *inbound*
+- A **publicly trusted** certificate whose subject matches that name. A self-signed
+  certificate fails at `MediaPlatform.Initialize` with a message that does not mention
+  certificates, which is a long detour if you have not been warned.
+- Inbound TCP open on the media public port and the notification port
+
+Full build and run instructions: `src/connectors/teams/sidecar/dotnet/README.md`.
+
+## 10.4 `.env` checklist
+
+```bash
+MC_TEAMS__TENANT_ID=<tenant guid>
+MC_TEAMS__CLIENT_ID=<app registration guid>
+MC_TEAMS__CLIENT_SECRET=<client secret>
+MC_TEAMS__SIDECAR_HOST=teams-bot.example.com
+MC_TEAMS__SIDECAR_CA_FILE=/etc/mc/teams-sidecar-ca.pem
+```
+
+The connector registers only when the first four are present. Leave them unset and the
+service is Zoom-only — no Teams surface at all, and `{"platform": "teams"}` returns a
+precise "no connector registered" rather than failing deep inside a join.
+
+**Do not set `MC_TEAMS__VIDEO_FPS=25`.** Teams negotiates video against an enumerated
+list of formats and 25 fps is not on it — even though 25 is this repo's shared default
+for Zoom. The connector validates this at startup and refuses with the supported list, so
+the failure is loud and local rather than happening on the Windows host mid-join. This is
+also why Teams has its own geometry settings instead of reading `MC_MEDIA__*`.
+
+## 10.5 Testing without any of the above
+
+The whole Teams pipeline runs against an in-process fake sidecar that speaks the real wire
+protocol:
+
+```bash
+poetry run pytest tests/unit/test_teams_link.py tests/unit/test_teams_session.py
+poetry run pytest tests/unit/test_teams_sidecar_protocol.py   # the .NET contract
+poetry run pytest -k teams                                    # everything Teams
+```
+
+That covers join, per-participant attribution, backpressure, full rejoin, budget
+exhaustion, and the shared pipeline being reused — with no Windows host, no Azure tenant,
+and no admin consent. The same strategy as proving RTMS against `FakeRtmsTransport` before
+a Zoom account existed.
+
+## 10.6 Starting a Teams session
+
+```bash
+# By the numeric Meeting ID from the invite — the same request shape as Zoom
+curl -X POST localhost:8000/sessions -H 'content-type: application/json' \
+  -d '{"platform": "teams", "meeting_number": "123 456 789 012", "passcode": "abc123"}'
+
+# Or by join URL, when that is all you have
+curl -X POST localhost:8000/sessions -H 'content-type: application/json' \
+  -d '{"platform": "teams", "meeting_url": "https://teams.microsoft.com/l/meetup-join/19%3ameeting_...%40thread.v2/0?context=%7b%22Tid%22..."}'
+```
+
+Printed spacing in the meeting id is stripped for you. A join URL pasted into
+`meeting_number` is also accepted — it is a natural mistake and everything needed is
+present.
+
+## 10.7 Expected log lines, in order
+
+```
+connectors.registered           platforms=['teams', 'zoom']
+session.created                 platform=teams
+teams_sidecar.connected         endpoint=teams-bot.example.com:8445 tls=True
+teams_link.ready                call_id=... negotiated_audio=16000Hz/1ch negotiated_video=1280x720@30
+teams_link.call_state           state=ESTABLISHED
+teams_link.own_participant_known msi=...
+echo_guard.own_participant_known user_id=...
+```
+
+The last two are the pair worth watching. Teams reports the bot's own identity from the
+**roster, after** the call is established — where Zoom learns it during the join
+handshake. Until they appear, echo suppression is running on the speaking gate alone,
+which is by design but should not be the steady state.
+
+## 10.8 Failures and what they mean
+
+| Symptom | Cause |
+|---|---|
+| `no connector registered for platform 'teams'` | One of the four required `MC_TEAMS__*` values is missing, or Teams config failed validation — check startup logs for `connectors.teams_registration_failed`. |
+| `Teams cannot send 1280x720@25` at startup | §10.4. Use 30 fps. |
+| `teams.tenant_id` in a 409 on session create | Credentials absent; the connector refuses before dialling anything. |
+| `GRAPH_403` / `missing Calls.AccessMedia.All` | §10.1 step 4 — admin consent not granted. Fatal by design, so it fails fast rather than retrying ten times. |
+| Bot joins, but is silent and has no video | Almost always `Calls.AccessMedia.All` missing. The call succeeds; only media is refused. |
+| `MEDIA_PLATFORM_INIT` | The certificate does not match `--service-fqdn`, its private key is unreadable by the service account, or the internal port is in use. |
+| `AUDIO_FORMAT_MISMATCH` / `VIDEO_FORMAT_MISMATCH` | Sidecar negotiated something other than what was requested. Fatal deliberately — a silent mismatch produces pitch-shifted speech or garbled frames that read as avatar bugs. |
+| `cannot verify sidecar certificate` | `MC_TEAMS__SIDECAR_CA_FILE` does not chain to the sidecar's IPC certificate. Fatal, not retried. |

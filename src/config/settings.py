@@ -92,6 +92,73 @@ class ZoomSettings(BaseModel):
         return bool(self.sdk_key and self.sdk_secret.get_secret_value())
 
 
+class TeamsSettings(BaseModel):
+    """Microsoft Teams credentials and app-hosted media sidecar settings.
+
+    Teams' real-time media is only reachable from a **Windows** host running the
+    .NET ``Microsoft.Graph.Communications.Calls.Media`` SDK, so unlike Zoom the
+    sidecar is a separate machine rather than a sibling process on a shared volume
+    (doc 005 §2). Everything here is therefore either an Azure AD credential the
+    Python bridge holds, or the network coordinates of that Windows host.
+
+    The bridge itself never calls Graph: the app-hosted media blob can only be
+    produced by the media platform inside the sidecar, so the sidecar owns the join
+    (doc 005 §3.1). The credentials below are what the *sidecar* is provisioned with;
+    they live here so a deployment configures one place, and are forwarded over the
+    IPC join message rather than being baked into the Windows image.
+    """
+
+    tenant_id: str = ""
+    client_id: str = ""
+    client_secret: SecretStr = SecretStr("")
+    """Azure AD app registration with the ``Calls.JoinGroupCall.All`` and
+    ``Calls.AccessMedia.All`` *application* permissions, admin-consented."""
+
+    sidecar_host: str = ""
+    sidecar_port: int = Field(default=8445, ge=1, le=65535)
+    sidecar_connect_timeout_s: float = Field(default=20.0, gt=0)
+    sidecar_ready_timeout_s: float = Field(default=60.0, gt=0)
+    """Longer than Zoom's: a Graph call has to be created, signalled, and negotiated
+    before media flows, where the Zoom sidecar only has to attach a local SDK."""
+    sidecar_reconnect_max_attempts: int = Field(default=10, ge=1)
+
+    sidecar_tls_enabled: bool = True
+    """The link crosses a host boundary carrying meeting audio and a bearer token,
+    so TLS is on by default and turning it off is an explicit local-dev act."""
+    sidecar_ca_file: Path | None = None
+    sidecar_client_cert_file: Path | None = None
+    sidecar_client_key_file: Path | None = None
+    """Client certificate for mutual TLS. When unset the link is server-authenticated
+    only — acceptable on a private subnet, not on a shared network."""
+
+    unmixed_audio: bool = True
+    """Request per-participant (unmixed) audio from the media platform. Teams gives
+    up to four dominant speakers with a source id, which is what lets ``EchoGuard``
+    filter by identity instead of falling back to the gate alone."""
+
+    publish_sample_rate_hz: int = Field(default=16_000, ge=8_000)
+    """PCM rate handed to the Teams media platform. Its own value rather than the
+    shared ``media.publish_sample_rate_hz`` because the two SDKs want different
+    rates, and Zoom's is already set for Zoom."""
+
+    video_width: int = Field(default=1280, ge=2)
+    video_height: int = Field(default=720, ge=2)
+    video_fps: int = Field(default=30, ge=1, le=30)
+    """Teams' send formats are an enumerated set, not a free choice — see
+    ``connectors/teams/config.py``, which validates the triple against it."""
+
+    display_name: str = "AI Avatar"
+
+    def is_configured(self) -> bool:
+        """True when the connector has everything it needs to join a meeting."""
+        return bool(
+            self.tenant_id
+            and self.client_id
+            and self.client_secret.get_secret_value()
+            and self.sidecar_host
+        )
+
+
 class AvatarSettings(BaseModel):
     """Streaming Avatar Agent connection settings."""
 
@@ -165,6 +232,7 @@ class Settings(BaseSettings):
 
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     zoom: ZoomSettings = Field(default_factory=ZoomSettings)
+    teams: TeamsSettings = Field(default_factory=TeamsSettings)
     avatar: AvatarSettings = Field(default_factory=AvatarSettings)
     media: MediaSettings = Field(default_factory=MediaSettings)
     sidecar: SidecarSettings = Field(default_factory=SidecarSettings)

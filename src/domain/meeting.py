@@ -1,16 +1,31 @@
 """Meeting and participant models.
 
-Deliberately Zoom-shaped-but-not-Zoom-typed: ``meeting_number`` and ``passcode`` are
-what a Zoom join needs, and no RTMS or SDK type appears here. ``platform_data`` holds
-the connector-private payload (RTMS stream id, server urls) as opaque data — only
-``connectors/zoom`` may interpret it, and it validates it into a typed model at its
-own boundary.
+Deliberately platform-shaped-but-not-platform-typed: ``meeting_number`` and
+``passcode`` are what a join needs on every platform we support, and no RTMS, Graph,
+or SDK type appears here. ``platform_data`` holds the connector-private payload (Zoom:
+RTMS stream id and server urls; Teams: the resolved Graph join descriptor) as opaque
+data — only the owning connector may interpret it, and it validates it into a typed
+model at its own boundary.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any
+
+
+class MeetingPlatform(StrEnum):
+    """The meeting platform a session runs against.
+
+    Added when Teams arrived: with one connector the platform was a constant folded
+    into the code (doc 003 §0.1), and with two it is data. It is a *domain* enum
+    rather than a connector concept precisely so that ``api/`` and ``services/`` can
+    route on it without importing a connector.
+    """
+
+    ZOOM = "zoom"
+    TEAMS = "teams"
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +50,9 @@ class MeetingContext:
     passcode: str | None = None
     meeting_uuid: str | None = None
     platform_data: dict[str, Any] = field(default_factory=dict)
+    platform: MeetingPlatform = MeetingPlatform.ZOOM
+    """Which connector owns this meeting. Defaults to ``ZOOM`` so every existing
+    construction site — and every Zoom code path — behaves exactly as before."""
 
     def with_uuid(self, meeting_uuid: str) -> MeetingContext:
         """Return a copy carrying the meeting UUID learned from a webhook.
@@ -49,4 +67,5 @@ class MeetingContext:
             passcode=self.passcode,
             meeting_uuid=meeting_uuid,
             platform_data=dict(self.platform_data),
+            platform=self.platform,
         )

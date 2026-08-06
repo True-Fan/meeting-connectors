@@ -31,7 +31,7 @@ from src.domain.media import (
     VideoFormat,
     VideoFrame,
 )
-from src.domain.meeting import MeetingContext, ParticipantRef
+from src.domain.meeting import MeetingContext, MeetingPlatform, ParticipantRef
 from src.domain.session import (
     SessionContext,
     SessionError,
@@ -62,6 +62,7 @@ __all__ = [
     "InvalidFrameError",
     "MediaChunk",
     "MeetingContext",
+    "MeetingPlatform",
     "ParticipantRef",
     "PixelFormat",
     "SampleFormat",
