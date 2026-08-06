@@ -1,0 +1,471 @@
+"""M7 — a full Google Meet conversation, through the real shared pipeline.
+
+**What is real here, and what is not.** Everything except Chromium and the avatar service:
+
+* the ``PageBridgeServer``, its token check, and a real loopback WebSocket;
+* the real wire codec, in both directions;
+* the real ``MediaRouter``, ``AvatarClient``, ``DecodePipeline``, ``EchoGuard``, ``Pacer``,
+  ``IdleFrameSource`` and ``MediaClock`` — the shared pipeline, unmodified, reused;
+* the real ``MeetAudioSource``, ``ChromiumMediaSink``, ``VirtualCameraAdapter`` and
+  ``VirtualMicrophoneAdapter``;
+* the real ``GoogleMeetSessionFactory``, and the real ``MeetingService`` in the API test.
+
+Faked: the browser (``FakeBrowserDriver``), the avatar agent (``FakeAvatarTransport``, which
+streams canned fMP4), and the decoder (``FakeDecoder``, so no ffmpeg binary is needed).
+
+The flow being proved is the one the connector exists for:
+
+    page PCM ──▶ MeetAudioSource ──▶ EchoGuard ──▶ AvatarClient ──▶ fMP4
+                                                                    │
+                                                        DecodePipeline
+                                                                    ▼
+                                            I420 + PCM ──▶ Pacer ──▶ ChromiumMediaSink
+                                                                    │
+                                        VirtualCamera + VirtualMicrophone ──▶ page
+"""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+import pytest
+
+from src.config.settings import GoogleMeetSettings, Settings
+from src.connectors.google_meet.browser.profile import ProfileManager
+from src.connectors.google_meet.config import GoogleMeetConnectorConfig
+from src.connectors.google_meet.session.google_meet_session import (
+    GoogleMeetSession,
+    GoogleMeetSessionFactory,
+)
+from src.connectors.google_meet.websocket.protocol import MeetState
+from src.domain.health import ComponentState
+from src.domain.ids import new_correlation_id, new_session_id
+from src.domain.meeting import MeetingContext, MeetingPlatform
+from src.domain.session import SessionContext, SessionState
+from src.services.media.decode_pipeline import DecodePipeline
+from src.services.media.router import MediaRouter
+from tests.fakes.avatar import FakeAvatarTransport
+from tests.fakes.decoder import FakeDecoder
+from tests.fakes.meet_page import FakeBrowserDriver, joined_driver
+
+CODE = "abc-defg-hij"
+VIDEO = (320, 180)
+FRAME_SAMPLES = 320  # 20 ms at 16 kHz
+PCM_FRAME = b"\x11\x22" * FRAME_SAMPLES
+
+
+@pytest.fixture
+def meet_settings(tmp_path: Path) -> Settings:
+    template = tmp_path / "profile"
+    (template / "Default").mkdir(parents=True)
+    (template / "Default" / "Cookies").write_bytes(b"cookie")
+    return Settings(  # type: ignore[call-arg]
+        _env_file=None,
+        google_meet=GoogleMeetSettings(
+            profile_dir=template,
+            video_width=VIDEO[0],
+            video_height=VIDEO[1],
+            video_fps=25,
+            publish_sample_rate_hz=48_000,
+            bridge_ready_timeout_s=5.0,
+            join_timeout_s=2.0,
+            lobby_timeout_s=2.0,
+            watchdog_interval_s=0.05,
+        ),
+    )
+
+
+@pytest.fixture
+def session_context() -> SessionContext:
+    return SessionContext(
+        session_id=new_session_id(),
+        correlation_id=new_correlation_id(),
+        meeting=MeetingContext(
+            meeting_number=CODE,
+            display_name="AI Avatar",
+            platform=MeetingPlatform.GOOGLE_MEET,
+        ),
+    )
+
+
+def _build_session(
+    settings: Settings,
+    driver: FakeBrowserDriver,
+    session_context: SessionContext,
+    *,
+    avatar_response: bytes | None = None,
+) -> tuple[GoogleMeetSession, FakeAvatarTransport, FakeDecoder]:
+    """Wire a real session, substituting only the browser, the avatar and the decoder.
+
+    Reaches into the built session to swap the avatar transport and decoder rather than
+    threading two more overrides through the factory. That is deliberate: the factory's
+    production wiring is what this test is verifying, so it must run unchanged — the point is
+    that ``GoogleMeetSessionFactory.build`` composes the real shared pipeline, and adding
+    override hooks for this test would make the assertion weaker rather than stronger.
+    """
+    config = GoogleMeetConnectorConfig.from_settings(settings)
+    factory = GoogleMeetSessionFactory(
+        config=config,
+        driver_factory=lambda: driver,
+        profiles=ProfileManager(template=config.require_configured()),
+    )
+    session = factory.build(session_context)
+
+    ctx = session_context.frame_context()
+    transport = FakeAvatarTransport(ctx=ctx, response=avatar_response)
+    decoder = FakeDecoder(
+        ctx=ctx,
+        video_format=config.video_format,
+        audio_format=config.publish_audio_format,
+        video_per_chunk=2,
+        audio_per_chunk=2,
+    )
+
+    router: MediaRouter = session.router
+    avatar_client = router._avatar
+    avatar_client._transport = transport
+    router._decode = DecodePipeline(decoder=decoder, ctx=ctx)
+
+    return session, transport, decoder
+
+
+async def _wait_for(predicate, *, timeout_s: float = 3.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while not predicate():
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("condition was never met")
+        await asyncio.sleep(0.01)
+
+
+# --------------------------------------------------------------------------- #
+# The full round trip
+# --------------------------------------------------------------------------- #
+
+
+class TestFullConversation:
+    async def test_conference_audio_reaches_the_avatar(
+        self, meet_settings, session_context
+    ) -> None:
+        driver = joined_driver(auto_page=True)
+        session, transport, _ = _build_session(meet_settings, driver, session_context)
+        try:
+            await session.start()
+            for _ in range(3):
+                await driver.page.send_audio(PCM_FRAME)  # type: ignore[union-attr]
+
+            await _wait_for(lambda: len(transport.sent_pcm) >= 3)
+
+            # Byte-for-byte: no resample, no reframe, no conversion anywhere between the
+            # browser's AudioWorklet and the avatar agent.
+            assert transport.sent_pcm[0] == PCM_FRAME
+            assert all(len(pcm) == FRAME_SAMPLES * 2 for pcm in transport.sent_pcm[:3])
+        finally:
+            await session.stop()
+
+    async def test_the_avatar_receives_the_fixed_contract_format(
+        self, meet_settings, session_context
+    ) -> None:
+        """``AvatarClient.send`` asserts the format rather than converting, so a frame that
+        reaches it at all is proof the contract held end to end.
+
+        Asserted through the client rather than through a handshake: no connector in this
+        repository calls ``AvatarClient.start()``, so the hello is never exchanged during a
+        session — see the note in the changeset summary. That is pre-existing shared
+        behaviour, identical for Zoom and Teams, and not something this connector changes.
+        """
+        driver = joined_driver(auto_page=True)
+        session, transport, _ = _build_session(meet_settings, driver, session_context)
+        try:
+            await session.start()
+            await driver.page.send_audio(PCM_FRAME)  # type: ignore[union-attr]
+            await _wait_for(lambda: len(transport.sent_pcm) >= 1)
+
+            source_format = session._source.audio_format
+            assert source_format.sample_rate_hz == 16_000
+            assert source_format.channels == 1
+            assert str(source_format.sample_format) == "s16le"
+        finally:
+            await session.stop()
+
+    async def test_the_avatars_video_reaches_the_page_as_the_synthetic_camera(
+        self, meet_settings, session_context
+    ) -> None:
+        driver = joined_driver(auto_page=True)
+        session, _, _ = _build_session(meet_settings, driver, session_context)
+        try:
+            await session.start()
+            await driver.page.send_audio(PCM_FRAME)  # type: ignore[union-attr]
+
+            page = driver.page
+            await _wait_for(lambda: len(page.received_video) > 0, timeout_s=5.0)  # type: ignore[union-attr]
+
+            width, height, size = page.received_video[0]  # type: ignore[union-attr]
+            assert (width, height) == VIDEO
+            assert size == VIDEO[0] * VIDEO[1] * 3 // 2
+        finally:
+            await session.stop()
+
+    async def test_the_avatars_audio_reaches_the_page_as_the_synthetic_microphone(
+        self, meet_settings, session_context
+    ) -> None:
+        driver = joined_driver(auto_page=True)
+        session, _, _ = _build_session(meet_settings, driver, session_context)
+        try:
+            await session.start()
+            await driver.page.send_audio(PCM_FRAME)  # type: ignore[union-attr]
+
+            page = driver.page
+            await _wait_for(lambda: len(page.received_audio) > 0, timeout_s=5.0)  # type: ignore[union-attr]
+
+            # 20 ms at the configured 48 kHz publish rate, mono s16le.
+            assert len(page.received_audio[0]) == 48_000 // 50 * 2  # type: ignore[union-attr]
+        finally:
+            await session.stop()
+
+    async def test_the_camera_publishes_continuously_even_while_the_avatar_is_silent(
+        self, meet_settings, session_context
+    ) -> None:
+        """The Pacer's idle continuity, unmodified and reused.
+
+        It matters more here than on the other connectors: the synthetic camera track is
+        driven frame by frame, so if frames stop the canvas stops changing and Meet publishes
+        a still image — which reads as a broken connection rather than as someone listening.
+        """
+        driver = joined_driver(auto_page=True)
+        session, _, _ = _build_session(meet_settings, driver, session_context)
+        try:
+            await session.start()
+            # No inbound audio at all: the avatar has nothing to say.
+            page = driver.page
+            await _wait_for(lambda: len(page.received_video) >= 3, timeout_s=5.0)  # type: ignore[union-attr]
+
+            assert all(size > 0 for _, _, size in page.received_video)  # type: ignore[union-attr]
+        finally:
+            await session.stop()
+
+
+# --------------------------------------------------------------------------- #
+# Session semantics
+# --------------------------------------------------------------------------- #
+
+
+class TestSessionSemantics:
+    async def test_both_legs_move_together(self, meet_settings, session_context) -> None:
+        """One browser tab is the participant: there is no state in which Meet ingest works
+        while Meet egress does not."""
+        driver = joined_driver(auto_page=True)
+        session, _, _ = _build_session(meet_settings, driver, session_context)
+        try:
+            await session.start()
+            ingest, publish = session.leg_states()
+            assert ingest is publish is ComponentState.HEALTHY
+        finally:
+            await session.stop()
+
+    async def test_the_session_derives_active_from_its_legs(
+        self, meet_settings, session_context
+    ) -> None:
+        """Reusing the shared derivation, with no new state and no new supervisor."""
+        from src.domain.session import derive_state
+
+        driver = joined_driver(auto_page=True)
+        session, _, _ = _build_session(meet_settings, driver, session_context)
+        try:
+            await session.start()
+            assert derive_state(*session.leg_states()) is SessionState.ACTIVE
+        finally:
+            await session.stop()
+
+    async def test_health_names_the_bridge_the_publisher_and_the_watchdog_separately(
+        self, meet_settings, session_context
+    ) -> None:
+        """``leg_states`` collapses to a pair because ``derive_state`` takes one, but an
+        operator debugging a silent avatar needs to know *which* component is unhappy."""
+        driver = joined_driver(auto_page=True)
+        session, _, _ = _build_session(meet_settings, driver, session_context)
+        try:
+            await session.start()
+            names = {c.name for c in session.health().components}
+
+            assert "google_meet_ingest" in names
+            assert "google_meet_publisher" in names
+            assert "google_meet_watchdog" in names
+            assert "avatar_client" in names
+        finally:
+            await session.stop()
+
+    async def test_the_publisher_reports_its_publish_counts(
+        self, meet_settings, session_context
+    ) -> None:
+        """A count stuck at zero while the bridge is healthy is the only observable for Meet
+        holding a track it was never told to publish."""
+        driver = joined_driver(auto_page=True)
+        session, _, _ = _build_session(meet_settings, driver, session_context)
+        try:
+            await session.start()
+            # Parsed rather than substring-matched: "video=0" is also a substring of
+            # "dropped_video=0", so a naive check passes on a session that published nothing.
+            await _wait_for(lambda: _publish_counts(session).get("video", 0) > 0, timeout_s=5.0)
+
+            counts = _publish_counts(session)
+            assert counts["video"] > 0
+            assert "audio" in counts
+            assert counts["dropped_video"] == 0
+        finally:
+            await session.stop()
+
+    async def test_the_watchdog_downgrades_a_healthy_pair_but_cannot_upgrade_a_broken_one(
+        self, meet_settings, session_context
+    ) -> None:
+        """An inference must not be able to declare a broken bridge healthy."""
+        driver = joined_driver(auto_page=True)
+        session, _, _ = _build_session(meet_settings, driver, session_context)
+        try:
+            await session.start()
+            await driver.page.send_state(MeetState.EJECTED)  # type: ignore[union-attr]
+            await _wait_for(lambda: session.leg_states()[0] is ComponentState.UNHEALTHY)
+
+            assert session.leg_states() == (
+                ComponentState.UNHEALTHY,
+                ComponentState.UNHEALTHY,
+            )
+        finally:
+            await session.stop()
+
+    async def test_stop_leaves_the_meeting_and_closes_the_browser(
+        self, meet_settings, session_context
+    ) -> None:
+        driver = joined_driver(auto_page=True)
+        session, _, _ = _build_session(meet_settings, driver, session_context)
+        await session.start()
+        await session.stop()
+
+        assert any("Leave call" in selector for selector in driver.clicked)
+        assert driver.stopped == 1
+
+    async def test_stop_is_idempotent(self, meet_settings, session_context) -> None:
+        driver = joined_driver(auto_page=True)
+        session, _, _ = _build_session(meet_settings, driver, session_context)
+        await session.start()
+        await session.stop()
+        await session.stop()
+
+
+# --------------------------------------------------------------------------- #
+# Echo suppression
+# --------------------------------------------------------------------------- #
+
+
+class TestEchoSuppression:
+    async def test_the_guard_runs_in_strict_mode(self, meet_settings, session_context) -> None:
+        """The capture graph mixes every remote track, so no inbound frame carries
+        attribution and the speaking gate is the only usable defence."""
+        driver = joined_driver(auto_page=True)
+        session, _, _ = _build_session(meet_settings, driver, session_context)
+        guard = session.router._echo_guard
+        assert guard.is_strict is True
+
+    async def test_no_own_participant_is_ever_set(
+        self, meet_settings, session_context
+    ) -> None:
+        """There is nothing to set: the WebRTC tap is inbound-only, so the avatar's own audio
+        never enters it. Arming the identity filter would only invite a false suppression."""
+        driver = joined_driver(auto_page=True)
+        session, _, _ = _build_session(meet_settings, driver, session_context)
+        try:
+            await session.start()
+            assert session.router._echo_guard.own_user_id is None
+        finally:
+            await session.stop()
+
+
+# --------------------------------------------------------------------------- #
+# Through the service layer
+# --------------------------------------------------------------------------- #
+
+
+class TestThroughMeetingService:
+    async def test_a_session_is_created_and_supervised_platform_blind(
+        self, meet_settings
+    ) -> None:
+        """``MeetingService`` and ``SessionSupervisor`` are reused with no Meet knowledge."""
+        from src.infrastructure.metrics import MetricsCollector
+        from src.services.meeting.connector_registry import ConnectorRegistry
+        from src.services.meeting.service import CreateSessionCommand, MeetingService
+        from src.services.session.lifecycle import SessionLifecycle
+        from src.services.session.registry import SessionRegistry
+        from src.services.session.supervisor import SessionSupervisor
+
+        config = GoogleMeetConnectorConfig.from_settings(meet_settings)
+        driver = joined_driver(auto_page=True)
+        factory = GoogleMeetSessionFactory(
+            config=config,
+            driver_factory=lambda: driver,
+            profiles=ProfileManager(template=config.require_configured()),
+        )
+
+        registry = SessionRegistry()
+        lifecycle = SessionLifecycle()
+        metrics = MetricsCollector(histogram_capacity=64)
+        supervisor = SessionSupervisor(
+            registry=registry, lifecycle=lifecycle, metrics=metrics, poll_interval_s=0.05
+        )
+        service = MeetingService(
+            registry=registry,
+            lifecycle=lifecycle,
+            supervisor=supervisor,
+            connectors=ConnectorRegistry().register(MeetingPlatform.GOOGLE_MEET, factory),
+            metrics=metrics,
+        )
+
+        session = await service.create_session(
+            CreateSessionCommand(meeting_number=CODE, platform=MeetingPlatform.GOOGLE_MEET)
+        )
+        try:
+            assert session.meeting.platform is MeetingPlatform.GOOGLE_MEET
+            # The supervisor derives ACTIVE from the leg pair with no platform knowledge.
+            await _wait_for(lambda: session.state is SessionState.ACTIVE)
+        finally:
+            await service.stop_session(session.session_id)
+
+        assert session.state is SessionState.STOPPED
+
+    async def test_the_api_reports_meet_audio_as_attached_once_running(
+        self, meet_settings
+    ) -> None:
+        """``_audio_attached`` needed no change: its non-Zoom branch already answers this
+        correctly, because one join covers both directions."""
+        from src.api.dto import SessionResponse
+
+        context = SessionContext(
+            session_id=new_session_id(),
+            correlation_id=new_correlation_id(),
+            meeting=MeetingContext(
+                meeting_number=CODE,
+                display_name="AI Avatar",
+                platform=MeetingPlatform.GOOGLE_MEET,
+            ),
+            state=SessionState.ACTIVE,
+        )
+        response = SessionResponse.from_domain(context)
+
+        assert response.platform is MeetingPlatform.GOOGLE_MEET
+        assert response.audio_attached is True
+        # And a Meet session has no meeting UUID, which is what the Zoom branch keys on.
+        assert context.meeting.meeting_uuid is None
+
+
+def _publisher_detail(session: GoogleMeetSession) -> str | None:
+    component = session.health().component("google_meet_publisher")
+    return component.detail if component is not None else None
+
+
+def _publish_counts(session: GoogleMeetSession) -> dict[str, int]:
+    """Parse the publisher's ``key=value`` health detail into numbers."""
+    detail = _publisher_detail(session) or ""
+    return {
+        key: int(value)
+        for key, _, value in (part.partition("=") for part in detail.split())
+        if value.isdigit()
+    }

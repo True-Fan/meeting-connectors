@@ -17,6 +17,20 @@ dependency-injector = "^4.42.0"
 structlog = "^24.4.0"
 orjson = "^3.10.0"
 
+# Google Meet only, and optional for that reason. Google publishes no server-side way to
+# send media into a Meet conference — its Media API is receive-only and says so — so the
+# avatar has to join as a real signed-in browser. Zoom and Teams reach their platforms
+# through SDKs and never touch this.
+#
+# An extra rather than a hard dependency so a Zoom-only or Teams-only deployment does not
+# pull a ~150 MB browser it will never launch. `connectors/google_meet/automation/driver.py`
+# imports it lazily and raises PlaywrightUnavailableError naming the install command, so a
+# missing browser is a clear error at session start rather than an ImportError at boot.
+playwright = { version = "^1.49.0", optional = true }
+
+[tool.poetry.extras]
+google-meet = ["playwright"]
+
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.0"
 pytest-asyncio = "^0.24.0"

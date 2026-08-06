@@ -1,0 +1,367 @@
+"""GoogleMeetSession — one avatar in one Google Meet conference.
+
+**This file is where the reuse claim is either true or false, so it is worth reading as
+evidence.** Everything between the two platform legs is the *same shared code* Zoom shipped
+and Teams reused without modification: ``AvatarClient``, ``WebSocketAvatarTransport``,
+``MediaRouter``, ``DecodePipeline``, ``FfmpegDecoder``, ``Pacer``, ``EchoGuard``,
+``IdleFrameSource``, ``MediaClock``, ``ReconnectPolicy``, ``BoundedFrameQueue``. Not one line
+of any of them changed to accommodate a browser.
+
+What this connector adds is a platform adapter — a browser instead of an SDK — and nothing
+else. Structurally identical in role to ``ZoomSessionFactory`` and ``TeamsSessionFactory``,
+which is what lets all three satisfy ``ConnectorSessionFactory`` and be registered side by
+side.
+
+**The two places Meet genuinely differs, and how each is expressed as data rather than as a
+branch:**
+
+* ``EchoGuard(per_participant_audio=False)``. The capture graph mixes every remote track
+  before sampling, so inbound frames carry no attribution and the guard runs its speaking
+  gate in strict mode. That is the guard's documented fallback, reached by configuration.
+  It is also the *only* echo defence needed here, because the WebRTC tap is inbound-only —
+  the avatar's own audio cannot enter it. The gate covers the acoustic path on a host with
+  speakers, not a software loop. See ``egress/media_sink.own_participant``.
+* ``leg_states()`` returns one state twice. One browser tab is the participant, so there is
+  no state in which Meet ingest works while Meet egress does not. Teams reports the same
+  shape for the same reason; Zoom's two legs genuinely differ.
+
+**One leg, three components in the health report.** ``leg_states`` collapses to a pair
+because ``derive_state`` takes a pair, but ``health()`` reports the bridge, the publisher and
+the watchdog separately — because an operator debugging a silent avatar needs to know
+*which* of those is unhappy, and the pair cannot carry that.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from contextlib import suppress
+from pathlib import Path
+
+from src.avatar.client import AvatarClient
+from src.avatar.ws_transport import WebSocketAvatarTransport
+from src.connectors.google_meet.audio_capture.audio_source import MeetAudioSource
+from src.connectors.google_meet.automation.selectors import MeetSelectors
+from src.connectors.google_meet.bridge.chromium_bridge import ChromiumBridge, DriverFactory
+from src.connectors.google_meet.browser.profile import ProfileManager
+from src.connectors.google_meet.config import GoogleMeetConnectorConfig
+from src.connectors.google_meet.egress.media_sink import ChromiumMediaSink
+from src.connectors.google_meet.monitoring.watchdog import MediaWatchdog
+from src.connectors.google_meet.virtual_camera.adapter import VirtualCameraAdapter
+from src.connectors.google_meet.virtual_microphone.adapter import VirtualMicrophoneAdapter
+from src.domain.context import FrameContext
+from src.domain.health import ComponentState, HealthReport
+from src.domain.media import AudioFormat, VideoFormat
+from src.domain.session import SessionContext
+from src.infrastructure.logging import get_logger
+from src.infrastructure.metrics import MetricsCollector
+from src.infrastructure.reconnect import ReconnectPolicy
+from src.protocols.audio_source import AudioSource
+from src.protocols.sink import MediaSink
+from src.services.media.clock import MediaClock
+from src.services.media.decode_pipeline import DecodePipeline
+from src.services.media.decoders.ffmpeg import FfmpegDecoder
+from src.services.media.echo_guard import EchoGuard
+from src.services.media.idle_source import IdleFrameSource
+from src.services.media.pacer import Pacer
+from src.services.media.router import MediaRouter
+
+logger = get_logger(__name__)
+
+
+class GoogleMeetSession:
+    """One avatar participating in one Google Meet conference."""
+
+    __slots__ = (
+        "_bridge",
+        "_clock",
+        "_publisher",
+        "_router",
+        "_session",
+        "_source",
+        "_task",
+        "_watchdog",
+    )
+
+    def __init__(
+        self,
+        *,
+        session: SessionContext,
+        clock: MediaClock,
+        bridge: ChromiumBridge,
+        source: AudioSource,
+        publisher: MediaSink,
+        router: MediaRouter,
+        watchdog: MediaWatchdog,
+    ) -> None:
+        self._session = session
+        self._clock = clock
+        self._bridge = bridge
+        self._source = source
+        self._publisher = publisher
+        self._router = router
+        self._watchdog = watchdog
+        self._task: asyncio.Task[None] | None = None
+
+    @property
+    def session(self) -> SessionContext:
+        return self._session
+
+    @property
+    def router(self) -> MediaRouter:
+        return self._router
+
+    @property
+    def bridge(self) -> ChromiumBridge:
+        return self._bridge
+
+    async def start(self) -> None:
+        """Join the meeting, then start routing.
+
+        One browser covers both directions, so — as with Teams and unlike Zoom — there is no
+        "publish first, ingest may still be waiting" ordering to get right, and no join race
+        to resolve: we navigate to the meeting rather than waiting for the platform to notify
+        us.
+
+        The bridge's first join runs **inline**, so a missing Chromium, an unsigned-in
+        profile, a bad meeting code, or a host who denies entry fails session creation with
+        the real reason instead of degrading a live session. The watchdog starts last,
+        because it has nothing to assess until media is flowing.
+        """
+        await self._bridge.start(self._session.meeting)
+        await self._source.start()
+        self._task = asyncio.create_task(self._router.run(), name="media-router")
+        await self._watchdog.start()
+
+    async def stop(self) -> None:
+        """Tear down in a fixed order. Idempotent.
+
+        The watchdog first, so it cannot report a fault caused by the teardown it is
+        watching. Then the router, so nothing is mid-publish. Then the bridge, which leaves
+        the meeting and closes the browser for both legs at once. Then the router's queues.
+        """
+        await self._watchdog.stop()
+
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+        await self._bridge.stop()
+        self._router.close()
+
+    def health(self) -> HealthReport:
+        """Component-level health.
+
+        The router's components (ingest, avatar, decoder) plus the publisher and the
+        watchdog. The watchdog is reported separately from the bridge on purpose: they can
+        disagree, and when they do — bridge healthy, watchdog degraded — that combination *is*
+        the diagnosis, because it means the browser is fine and the audio is not.
+        """
+        return HealthReport(
+            components=(
+                *self._router.health().components,
+                self._publisher.health(),
+                self._watchdog.health(),
+            )
+        )
+
+    def leg_states(self) -> tuple[ComponentState, ComponentState]:
+        """``(ingest, publish)`` health.
+
+        Both derive from the one browser, so the pair moves together. That is the platform
+        being reported accurately rather than an abstraction leaking: one tab is the
+        participant, and if it is gone the avatar is not in the meeting in either direction.
+
+        The watchdog's verdict is folded in, downgrading a healthy pair to degraded — because
+        a browser that is alive but no longer hearing anything is precisely the failure the
+        pair alone cannot express. It can only downgrade, never upgrade: an inference must
+        not be able to declare a broken bridge healthy.
+        """
+        state = self._bridge.health().state
+        if state is ComponentState.HEALTHY and self._watchdog.verdict.state is (
+            ComponentState.DEGRADED
+        ):
+            state = ComponentState.DEGRADED
+        return state, state
+
+
+class GoogleMeetSessionFactory:
+    """Builds a fully wired ``GoogleMeetSession``.
+
+    All concrete-type knowledge for the Meet feature lives here, so ``MeetingService``
+    composes sessions without naming Chromium, Playwright, a canvas, or an AudioWorklet.
+    """
+
+    __slots__ = (
+        "_config",
+        "_driver_factory",
+        "_metrics",
+        "_profiles",
+        "_selectors",
+        "_sink_override",
+        "_source_override",
+    )
+
+    def __init__(
+        self,
+        *,
+        config: GoogleMeetConnectorConfig,
+        metrics: MetricsCollector | None = None,
+        sink_override: MediaSink | None = None,
+        source_override: AudioSource | None = None,
+        driver_factory: DriverFactory | None = None,
+        selectors: MeetSelectors | None = None,
+        profiles: ProfileManager | None = None,
+    ) -> None:
+        self._config = config
+        self._metrics = metrics
+        # Overrides mirror ``ZoomSessionFactory``'s and ``TeamsSessionFactory``'s: they let
+        # the whole pipeline run into a ``FileSink`` for verification, and let tests
+        # substitute fakes, without a second code path. ``driver_factory`` additionally
+        # allows an in-process fake page — which is how this connector is testable with no
+        # Chromium, no Google account, and no meeting.
+        self._sink_override = sink_override
+        self._source_override = source_override
+        self._driver_factory = driver_factory
+        self._selectors = selectors
+        self._profiles = profiles
+
+    def build(self, session: SessionContext) -> GoogleMeetSession:
+        config = self._config
+        ctx = session.frame_context()
+        clock = MediaClock()
+
+        video_format = config.video_format
+        publish_audio_format = config.publish_audio_format
+
+        bridge = ChromiumBridge(
+            config=config,
+            ctx=ctx,
+            clock=clock,
+            driver_factory=self._driver_factory,
+            selectors=self._selectors,
+            profiles=self._profiles,
+        )
+
+        source = self._source_override or MeetAudioSource(bridge=bridge, metrics=self._metrics)
+        publisher = self._sink_override or ChromiumMediaSink(
+            bridge=bridge,
+            camera=VirtualCameraAdapter(
+                bridge=bridge,
+                video_format=video_format,
+                clock=clock,
+                metrics=self._metrics,
+            ),
+            microphone=VirtualMicrophoneAdapter(
+                bridge=bridge,
+                audio_format=publish_audio_format,
+                clock=clock,
+                metrics=self._metrics,
+            ),
+        )
+
+        echo_guard = EchoGuard(
+            # False, and structurally so: the capture graph mixes every remote track before
+            # sampling, so no inbound frame carries attribution. The guard's strict speaking
+            # gate is the correct fallback, and here it is also sufficient — see the module
+            # docstring. Capability as data, not a branch.
+            per_participant_audio=False,
+            hangover_ms=config.echo_gate_hangover_ms,
+            metrics=self._metrics,
+        )
+        # Deliberately no ``set_own_participant`` and no listener, where Zoom sets it from the
+        # publisher and Teams subscribes to the roster. There is no identity to set: the
+        # avatar's audio never enters the tap, so the identity filter would have nothing to
+        # match and arming it would only invite a false suppression.
+
+        avatar = AvatarClient(
+            transport=WebSocketAvatarTransport(
+                url=config.avatar_url,
+                ctx=ctx,
+                clock=clock,
+                send_queue_size=config.avatar_send_queue_size,
+                open_timeout_s=config.avatar_connect_timeout_s,
+                metrics=self._metrics,
+            ),
+            ctx=ctx,
+            policy=ReconnectPolicy(
+                initial_delay_s=config.avatar_reconnect_initial_delay_s,
+                max_delay_s=config.avatar_reconnect_max_delay_s,
+                max_attempts=config.avatar_reconnect_max_attempts,
+            ),
+            metrics=self._metrics,
+        )
+
+        decode = DecodePipeline(
+            decoder=FfmpegDecoder(
+                ctx=ctx,
+                clock=clock,
+                video_format=video_format,
+                audio_format=publish_audio_format,
+                metrics=self._metrics,
+            ),
+            ctx=ctx,
+            metrics=self._metrics,
+        )
+
+        idle = self._build_idle(ctx, video_format, publish_audio_format)
+
+        pacer = Pacer(
+            ctx=ctx,
+            clock=clock,
+            sink=publisher,
+            idle=idle,
+            video_format=video_format,
+            audio_format=publish_audio_format,
+            echo_guard=echo_guard,
+            video_queue_size=config.video_queue_size,
+            audio_queue_size=config.audio_queue_size,
+            metrics=self._metrics,
+        )
+
+        router = MediaRouter(
+            ctx=ctx,
+            clock=clock,
+            source=source,
+            avatar=avatar,
+            decode=decode,
+            pacer=pacer,
+            echo_guard=echo_guard,
+            metrics=self._metrics,
+        )
+
+        watchdog = MediaWatchdog(
+            bridge=bridge,
+            source=source,
+            interval_s=config.watchdog_interval_s,
+        )
+
+        return GoogleMeetSession(
+            session=session,
+            clock=clock,
+            bridge=bridge,
+            source=source,
+            publisher=publisher,
+            router=router,
+            watchdog=watchdog,
+        )
+
+    # -- component builders ------------------------------------------------
+
+    def _build_idle(
+        self, ctx: FrameContext, video_format: VideoFormat, audio_format: AudioFormat
+    ) -> IdleFrameSource:
+        """Idle media, so the avatar reads as a person between utterances.
+
+        Meet needs this for the same reason Zoom and Teams do, and arguably more visibly: the
+        synthetic camera track is driven frame by frame from the pacer, so if frames stop the
+        canvas stops changing and Meet publishes a still image. A frozen tile reads as a
+        broken connection rather than as someone listening.
+        """
+        clip_path = self._config.idle_clip_path
+        if clip_path is not None and Path(clip_path).exists():
+            return IdleFrameSource.from_raw_clip(
+                clip_path, ctx=ctx, video_format=video_format, audio_format=audio_format
+            )
+        return IdleFrameSource(ctx=ctx, video_format=video_format, audio_format=audio_format)

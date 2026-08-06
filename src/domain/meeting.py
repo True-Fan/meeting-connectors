@@ -22,10 +22,16 @@ class MeetingPlatform(StrEnum):
     into the code (doc 003 §0.1), and with two it is data. It is a *domain* enum
     rather than a connector concept precisely so that ``api/`` and ``services/`` can
     route on it without importing a connector.
+
+    A member carries **identity only** — no urls, no ports, no SDK hints — which is what
+    keeps "route on the enum" cheap and "reach for a connector" expensive.
+    ``tests/architecture/test_layering.py`` asserts that property, so adding a member is
+    the whole of what a new connector needs from the domain.
     """
 
     ZOOM = "zoom"
     TEAMS = "teams"
+    GOOGLE_MEET = "google_meet"
 
 
 @dataclass(frozen=True, slots=True)

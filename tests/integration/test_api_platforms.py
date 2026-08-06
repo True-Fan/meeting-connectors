@@ -68,8 +68,14 @@ class TestRequestContract:
         assert "meeting_url" in create["properties"]
         # The enum is the domain's, so the contract names platforms without exposing any
         # platform's mechanics.
+        #
+        # This list grows by one line per connector, and that is the *only* reason this
+        # assertion needed touching when Google Meet arrived: it enumerates the platform
+        # set, so a third platform cannot pass it unchanged. Nothing about Zoom's or Teams'
+        # behaviour moved — the two assertions that guard those are above and below, and
+        # both were untouched.
         platform_enum = schema["components"]["schemas"]["MeetingPlatform"]["enum"]
-        assert sorted(platform_enum) == ["teams", "zoom"]
+        assert sorted(platform_enum) == ["google_meet", "teams", "zoom"]
 
     def test_an_unknown_platform_is_a_422(self, client: TestClient) -> None:
         """Validation, not a 500: the enum is the contract."""

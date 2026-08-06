@@ -410,3 +410,180 @@ which is by design but should not be the steady state.
 | `MEDIA_PLATFORM_INIT` | The certificate does not match `--service-fqdn`, its private key is unreadable by the service account, or the internal port is in use. |
 | `AUDIO_FORMAT_MISMATCH` / `VIDEO_FORMAT_MISMATCH` | Sidecar negotiated something other than what was requested. Fatal deliberately — a silent mismatch produces pitch-shifted speech or garbled frames that read as avatar bugs. |
 | `cannot verify sidecar certificate` | `MC_TEAMS__SIDECAR_CA_FILE` does not chain to the sidecar's IPC certificate. Fatal, not retried. |
+
+---
+
+# 11. Google Meet
+
+Google Meet does **not** work like Zoom or Teams, and the setup reflects that.
+
+There is no app registration, no client id, no secret, and no SDK entitlement — because
+Google publishes no server-side way to send media into a Meet conference:
+
+> "All conference media streams are \"receive-only\". Currently, the Meet Media API does
+> not support sending of media from MediaApiClientInterface into a conference."
+> — [Meet Media API C++ reference](https://developers.google.com/workspace/meet/media-api/reference/cpp/namespace/meet)
+
+So the avatar joins as a **real signed-in Chromium**, driven by Playwright. The credential
+is therefore a **browser profile on disk**, and provisioning it is the whole of the setup.
+Full reasoning: `docs/design/007-google-meet-connector-architecture.md`.
+
+## 11.1 Install the browser
+
+Playwright is an optional extra, so a Zoom-only or Teams-only deployment pulls no browser.
+
+```bash
+poetry install --extras google-meet
+poetry run playwright install chromium
+```
+
+Skipping the second command produces `PlaywrightUnavailableError` at session start, naming
+the command — not an `ImportError` at boot.
+
+## 11.2 Authenticate the profile — once, interactively
+
+This is the only manual step, and it must not be automated. Google's sign-in can present a
+second factor, a device-verification challenge, or an outright "this browser may not be
+secure" refusal, and repeatedly scripting past those is what gets an automated account
+restricted.
+
+```bash
+mkdir -p /var/lib/meeting-connectors/meet-profile
+
+# Launch headed, sign in, then stop the process.
+MC_GOOGLE_MEET__PROFILE_DIR=/var/lib/meeting-connectors/meet-profile \
+MC_GOOGLE_MEET__HEADLESS=false \
+poetry run uvicorn src.main:app
+
+# Trigger one session so the browser opens, complete the Google sign-in in the window
+# including any second factor, then Ctrl-C.
+```
+
+The profile is treated as a **template** from then on: each session runs on a throwaway copy
+seeded from it, so sessions cannot corrupt each other's login and the template cannot be
+corrupted at all. Re-authentication is only ever needed because Google expired the session.
+
+Use an account that is a member of the organisation whose meetings the avatar joins.
+A guest cannot enter a meeting restricted to the host's org, and the resulting denial is
+terminal by design.
+
+## 11.3 `.env` checklist
+
+```env
+# The only required value. Everything else has a working default.
+MC_GOOGLE_MEET__PROFILE_DIR=/var/lib/meeting-connectors/meet-profile
+
+# Optional
+MC_GOOGLE_MEET__HEADLESS=true
+MC_GOOGLE_MEET__DISPLAY_NAME=AI Avatar        # only used if Meet asks for a name,
+                                              # which means the session was lost
+MC_GOOGLE_MEET__VIDEO_WIDTH=1280
+MC_GOOGLE_MEET__VIDEO_HEIGHT=720
+MC_GOOGLE_MEET__VIDEO_FPS=25
+MC_GOOGLE_MEET__PUBLISH_SAMPLE_RATE_HZ=48000   # 16000 | 24000 | 48000
+MC_GOOGLE_MEET__LOBBY_TIMEOUT_S=300            # a human has to click Admit
+MC_GOOGLE_MEET__REJOIN_MAX_ATTEMPTS=5
+MC_GOOGLE_MEET__WATCHDOG_INTERVAL_S=5
+
+# Not recommended. Only bootstraps an empty profile, and only works on an account with
+# no second factor — which is not a configuration for an account in customer meetings.
+# MC_GOOGLE_MEET__GOOGLE_EMAIL=avatar@example.com
+# MC_GOOGLE_MEET__GOOGLE_PASSWORD=...
+```
+
+Unlike Zoom and Teams there is **no passcode** — Meet admission is controlled by the host and
+by Workspace policy, never by a secret the joiner supplies. Supplying one is logged as a
+warning, because it usually means the request was written for another platform.
+
+Notes on two defaults:
+
+* **1080p is the ceiling.** Every frame crosses the page bridge as raw I420, so 1080p is
+  already 3.1 MB per frame; anything larger is refused at startup, and Meet downscales it
+  anyway.
+* **48 kHz publish rate** is Web Audio's native rate on desktop Chromium, so the synthetic
+  microphone needs no resampling stage. Only 16/24/48 kHz are accepted, because Web Audio
+  would resample anything else *silently* rather than fail — a pitch artefact nobody can
+  trace.
+
+## 11.4 Container requirements
+
+```dockerfile
+# Chromium needs a real /dev/shm; the 64 MB Docker default crashes a video-carrying renderer.
+# --shm-size=1g at run time, or the connector's own --disable-dev-shm-usage covers it.
+```
+
+If the runtime cannot grant `SYS_ADMIN` or a seccomp profile, add
+`MC_GOOGLE_MEET__EXTRA_BROWSER_ARGS='["--no-sandbox","--disable-setuid-sandbox"]'`. Prefer the
+capability where possible.
+
+## 11.5 Testing without a Google account or a browser
+
+Everything except Chromium itself is covered — the wire codec, the join flow with every
+terminal outcome, admission refusal, the media round trip over a **real** loopback
+WebSocket, rejoin, budget exhaustion, and the shared pipeline being reused:
+
+```bash
+poetry run pytest -k google_meet                 # 281 tests, no browser needed
+poetry run pytest tests/integration/test_google_meet_end_to_end.py
+```
+
+The browser is faked (`tests/fakes/meet_page.py::FakeBrowserDriver`) but the *page* is not:
+`FakePage` is a real WebSocket client speaking the real protocol, because a Python/JavaScript
+codec mismatch is the one fault that would otherwise stay invisible until a live meeting.
+
+## 11.6 Starting a Google Meet session
+
+```bash
+# By meeting code — the same request shape as Zoom and Teams
+curl -X POST localhost:8000/sessions -H 'content-type: application/json' \
+  -d '{"platform": "google_meet", "meeting_number": "abc-defg-hij"}'
+
+# Or by link
+curl -X POST localhost:8000/sessions -H 'content-type: application/json' \
+  -d '{"platform": "google_meet", "meeting_url": "https://meet.google.com/abc-defg-hij"}'
+```
+
+An undashed code (`abcdefghij`) is regrouped for you, and a link pasted into
+`meeting_number` is accepted. A Zoom meeting number is *rejected* with a named error rather
+than turned into a URL that 404s.
+
+## 11.7 Expected log lines, in order
+
+```
+connectors.registered            platforms=['google_meet', 'zoom']
+session.created                  platform=google_meet
+meet_bridge.listening            endpoint=ws://127.0.0.1:54321/bridge/<token>
+meet_profile.cloned              files=4
+meet_bridge.page_connected       generation=1
+meet_auth.signed_in              account=a***@example.com
+meet_join.navigating             target=abc-defg-hij
+meet_join.in_lobby                                   # only if the host gates entry
+meet_join.joined                 lobby_wait_s=12.4 join_button='//button[...Ask to join...]'
+meet_controls.unmuted
+meet_controls.camera_on
+meet_bridge.joined               capture_hz=16000 publish_hz=48000 audio_published=True
+```
+
+**`meet_controls.unmuted` and `meet_controls.camera_on` are the pair worth watching.** Meet
+does not publish tracks it was handed until told to, and nothing else in the system can
+observe that it did not — a browser that joined muted looks healthy at every layer and is
+silent in the meeting. `meet_bridge.page_connected` appearing twice is normal: the init
+script runs again after navigating from the sign-in probe to the meeting.
+
+## 11.8 Failures and what they mean
+
+| Symptom | Cause |
+|---|---|
+| `no connector registered for platform 'google_meet'` | `MC_GOOGLE_MEET__PROFILE_DIR` is unset. Check startup for `connectors.google_meet_not_registered`. |
+| `playwright is not installed` / `chromium is not installed` | §11.1. Fatal by design — no retry installs a browser. |
+| `the Chromium profile is not signed in to Google` | §11.2, and the message repeats the fix. Fatal: retrying a sign-in Google has challenged makes things worse. |
+| `Google is challenging this browser` | A second factor or device verification. A human must complete it once, headed. |
+| `google meet refused admission: the host denied the request` | Terminal, deliberately. The connector will **not** retry — an account that repeatedly asks to enter a meeting it was refused from looks like abuse. |
+| `the avatar was removed from the meeting` | Same, and same reason. |
+| `nobody admitted the avatar within 300s in the lobby` | The host never clicked Admit. Recoverable; raise `LOBBY_TIMEOUT_S` if hosts are slow. |
+| `no join button appeared … automation/selectors.py` | Meet's pre-join UI changed, or the code is invalid. Add the new selector to `MeetSelectors`; several candidates per concept coexist so old and new can both be listed. |
+| `the Chromium page did not connect to the bridge` | The injected script did not run. Distinct from a join timeout: the browser started but never reached the bridge. |
+| `the page built a 48000 Hz capture context but the avatar contract requires 16000` | A stale `js/bridge.js`. Fatal rather than resampled — the alternative is a chipmunk avatar that looks like an avatar-service bug. |
+| `no conference audio for 45s with 2 other participant(s) present` | The watchdog. The browser is alive and the capture graph has lost its inputs or been suspended — the one failure every other check reports as healthy. |
+| Avatar joins, is visible, but never speaks | Check `google_meet_publisher` in `GET /sessions/{id}`: `audio=0` with a healthy bridge means Meet is holding a track it was never told to publish. |
+| Renderer keeps crashing (`rejoins` climbing) | `/dev/shm` too small, or memory pressure. §11.4. |

@@ -168,14 +168,85 @@ def test_teams_sidecar_protocol_does_not_escape_the_teams_connector() -> None:
     )
 
 
+def test_meet_page_protocol_does_not_escape_the_google_meet_connector() -> None:
+    """The Google Meet half of the same rule.
+
+    The page bridge codec is a connector-private detail, like Zoom's and Teams' before it.
+    If this ever fails, browser vocabulary has reached shared code and the pipeline can no
+    longer be tested without Chromium.
+    """
+    _assert_wire_models_contained(
+        "src.connectors.google_meet.websocket.protocol",
+        "src.connectors.google_meet",
+        label="Google Meet page bridge wire codec",
+    )
+
+
+def test_playwright_is_confined_to_the_google_meet_connector() -> None:
+    """Browser automation must not leak out of the connector that needs it.
+
+    Zoom and Teams reach their platforms through SDKs; only Meet drives a browser, because
+    Google publishes no way to send media into a conference (see
+    ``connectors/google_meet/capabilities.py``). If ``playwright`` is ever imported outside
+    this connector, that asymmetry has started spreading and the shared pipeline has
+    acquired a browser dependency it does not need.
+
+    Narrower still: within the connector, the import belongs in ``automation/driver.py``
+    alone, so that ``BrowserDriver`` stays the only seam and the rest of the connector
+    remains testable with no Chromium installed.
+    """
+    offenders = [
+        f"{module} imports playwright"
+        for module, imports in _modules_under("src")
+        for imported in imports
+        if imported.startswith("playwright")
+    ]
+    assert not offenders, f"playwright must not be imported through src.*: {offenders}"
+
+    playwright_users = [
+        path
+        for path in sorted(SRC.rglob("*.py"))
+        if "playwright" in path.read_text(encoding="utf-8")
+        and "import" in path.read_text(encoding="utf-8")
+        and _imports_playwright(path)
+    ]
+    allowed = {SRC / "connectors" / "google_meet" / "automation" / "driver.py"}
+    unexpected = [str(p.relative_to(SRC)) for p in playwright_users if p not in allowed]
+    assert not unexpected, (
+        "playwright may only be imported by connectors/google_meet/automation/driver.py, "
+        f"which is the seam BrowserDriver exists to provide: {unexpected}"
+    )
+
+
+def _imports_playwright(path: Path) -> bool:
+    """True when ``path`` has a real ``playwright`` import, not just the word in prose.
+
+    Parsed rather than grepped: every module in the connector mentions Playwright in a
+    docstring, and a text match would flag all of them.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import) and any(
+            a.name.startswith("playwright") for a in node.names
+        ):
+            return True
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.module
+            and node.module.startswith("playwright")
+        ):
+            return True
+    return False
+
+
 def test_the_two_connectors_do_not_import_each_other() -> None:
     """Connector independence, made executable.
 
     The property the repository is organised around: a future connector must be addable
     without touching an existing one, which is only true if none of them depend on
-    another. Adding ``google_meet`` adds one line to this list.
+    another. Adding ``google_meet`` added one line to this list, as predicted.
     """
-    connectors = ("zoom", "teams")
+    connectors = ("zoom", "teams", "google_meet")
     offenders: list[str] = []
 
     for connector in connectors:
@@ -205,7 +276,7 @@ def test_shared_code_routes_on_the_domain_enum_not_on_a_connector() -> None:
     from src.domain.meeting import MeetingPlatform
 
     assert _modules_under("src.domain")  # guard against a silent path change
-    assert {p.value for p in MeetingPlatform} == {"zoom", "teams"}
+    assert {p.value for p in MeetingPlatform} == {"zoom", "teams", "google_meet"}
 
     # The enum carries identity only: no urls, no ports, no SDK hints. Anything more and
     # shared code would start making platform decisions from domain data.

@@ -159,6 +159,101 @@ class TeamsSettings(BaseModel):
         )
 
 
+class GoogleMeetSettings(BaseModel):
+    """Google Meet connector settings — a signed-in Chromium, driven by Playwright.
+
+    **Why the shape is so different from Zoom's and Teams'.** Those two hold API
+    credentials, because both platforms ship a server-side SDK that can publish media into
+    a conference. Google does not: its only real-time media API is receive-only and states
+    so explicitly, and there is no Meet equivalent of a Meeting SDK. The full evidence is
+    in ``connectors/google_meet/capabilities.py``.
+
+    So the avatar has to be a *client* — a real browser, signed into a real Google account,
+    joining like a person. That makes the credential a **browser profile on disk** rather
+    than a client id and secret, and it makes the rest of these settings browser lifecycle
+    rather than API parameters.
+
+    Nothing here is required for a Zoom-only or Teams-only deployment. ``profile_dir``
+    defaults to unset, ``is_configured()`` is then False, and ``build_connector_registry``
+    does not register the connector at all.
+    """
+
+    profile_dir: Path | None = None
+    """Persistent Chromium profile holding the avatar's Google session.
+
+    The one required setting, and the only durable state this connector has. Authenticate
+    it **once**, interactively — Google's sign-in can present a second factor or a
+    device-verification challenge that no script should be attempting on every session, and
+    repeatedly trying is what gets an automated account restricted. Treated as a template:
+    each session runs on a throwaway copy, so sessions cannot corrupt each other's login
+    (see ``connectors/google_meet/browser/profile.py``)."""
+
+    chromium_executable: Path | None = None
+    """Overrides Playwright's bundled Chromium. Normally unset."""
+
+    headless: bool = True
+    """Set False to perform the one-off interactive Google sign-in described above."""
+
+    browser_launch_timeout_s: float = Field(default=60.0, gt=0)
+    extra_browser_args: list[str] = Field(default_factory=list)
+    """Appended after the built-in flags, and Chromium takes the last occurrence of a
+    repeated switch — so this can override any of them. See
+    ``connectors/google_meet/browser/launcher.py`` for what the defaults are and why."""
+
+    google_email: str = ""
+    google_password: SecretStr = SecretStr("")
+    """Optional, and best-effort. Only bootstraps an empty profile on a deployment that
+    cannot run an interactive session, and only works on an account with no second factor —
+    which is not a configuration to recommend for an account that sits in customer
+    meetings."""
+
+    display_name: str = "AI Avatar"
+    """Used only if Meet asks for a name, which means the profile lost its Google session.
+    A signed-in profile joins under the account's own name."""
+
+    join_timeout_s: float = Field(default=120.0, gt=0)
+    lobby_timeout_s: float = Field(default=300.0, gt=0)
+    """Separate from ``join_timeout_s``, and much longer, because "Asking to join" is not a
+    failure: a human host has to notice a notification and click Admit. Charging that wait
+    against the join budget would abandon meetings that were about to let the avatar in."""
+
+    bridge_host: str = "127.0.0.1"
+    bridge_port: int = Field(default=0, ge=0, le=65535)
+    """The loopback WebSocket the page connects back on. ``0`` means "let the OS choose",
+    which is the default and the right one: one server is bound per session, so a fixed
+    port would make two concurrent sessions collide."""
+    bridge_ready_timeout_s: float = Field(default=60.0, gt=0)
+    bridge_send_queue_bytes: int = Field(default=4 * 1024 * 1024, ge=64 * 1024)
+
+    video_width: int = Field(default=1280, ge=2)
+    video_height: int = Field(default=720, ge=2)
+    video_fps: int = Field(default=25, ge=1, le=30)
+    """Geometry for the synthetic camera. Unlike Teams there is no enumerated format list
+    to match — a canvas-backed track takes any even geometry — but every frame crosses the
+    page bridge as raw I420, so ``connectors/google_meet/config.py`` caps it at 1080p."""
+
+    publish_sample_rate_hz: int = Field(default=48_000, ge=8_000)
+    """PCM rate for the synthetic microphone. 48 kHz because that is Web Audio's native
+    rate on desktop Chromium, so the track needs no resampling stage at all. Its own value
+    rather than the shared ``media.publish_sample_rate_hz`` because each platform's runtime
+    wants a different rate, and Zoom's is already set for Zoom."""
+
+    rejoin_max_attempts: int = Field(default=5, ge=1)
+    """Lower than the other connectors' 10 on purpose: a rejoin here relaunches a whole
+    browser and may sit in a lobby, so ten attempts would take many minutes during which
+    the avatar is visibly absent."""
+
+    watchdog_interval_s: float = Field(default=5.0, gt=0)
+    """How often to check that conference audio is still arriving. See
+    ``connectors/google_meet/monitoring/watchdog.py`` for the failure this catches — a
+    browser that is alive and connected while the audio has quietly stopped, which every
+    other health check reports as healthy."""
+
+    def is_configured(self) -> bool:
+        """True when the connector has a profile to launch from."""
+        return self.profile_dir is not None
+
+
 class AvatarSettings(BaseModel):
     """Streaming Avatar Agent connection settings."""
 
@@ -233,6 +328,7 @@ class Settings(BaseSettings):
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     zoom: ZoomSettings = Field(default_factory=ZoomSettings)
     teams: TeamsSettings = Field(default_factory=TeamsSettings)
+    google_meet: GoogleMeetSettings = Field(default_factory=GoogleMeetSettings)
     avatar: AvatarSettings = Field(default_factory=AvatarSettings)
     media: MediaSettings = Field(default_factory=MediaSettings)
     sidecar: SidecarSettings = Field(default_factory=SidecarSettings)

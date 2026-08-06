@@ -17,6 +17,8 @@ from collections.abc import Callable
 from dependency_injector import containers, providers
 
 from src.config.settings import Settings
+from src.connectors.google_meet.config import GoogleMeetConnectorConfig
+from src.connectors.google_meet.session.google_meet_session import GoogleMeetSessionFactory
 from src.connectors.teams.config import TeamsConnectorConfig
 from src.connectors.teams.session.teams_session import TeamsSessionFactory
 from src.connectors.zoom.auth.webhook_verifier import WebhookVerifier
@@ -41,6 +43,7 @@ def build_connector_registry(
     settings: Settings,
     zoom_factory: ZoomSessionFactory,
     teams_factory: Callable[[], TeamsSessionFactory],
+    google_meet_factory: Callable[[], GoogleMeetSessionFactory] | None = None,
 ) -> ConnectorRegistry:
     """Register every connector this deployment can serve.
 
@@ -51,38 +54,66 @@ def build_connector_registry(
     is today — therefore carries no Teams surface at all.
 
     Zoom registers unconditionally, exactly as it did before Teams existed. Preserving
-    that is worth more than symmetry between the two branches.
+    that is worth more than symmetry between the branches.
 
     **Two safeguards exist solely to protect Zoom**, because this function is on the
     startup path of a service that is already in production:
 
-    1. ``teams_factory`` is a *callable*, not an instance, so building the Teams
-       factory — and validating Teams config — only happens when Teams is configured.
+    1. Each optional factory arrives as a *callable*, not an instance, so building it —
+       and validating its config — only happens when that connector is configured.
        Passing an instance would make dependency-injection resolve it eagerly and put
-       Teams' config validation on Zoom's startup path.
-    2. A Teams failure is caught and logged. A malformed Teams setting must degrade to
-       "Teams unavailable", never to a service that will not boot. Zoom is already
-       registered by the time this can trigger.
+       another connector's config validation on Zoom's startup path.
+    2. A failure in an optional connector is caught and logged. A malformed setting must
+       degrade to "that platform unavailable", never to a service that will not boot.
+       Zoom is already registered by the time any of this can trigger.
 
-    Adding Google Meet is one more branch here and nothing else in ``services/``.
+    Adding Google Meet was one more branch here and nothing else in ``services/``, exactly
+    as this docstring predicted. ``google_meet_factory`` is keyword-only with a default so
+    that any caller written before it existed — including the tests that guard Zoom's
+    behaviour — keeps working unchanged.
     """
     registry = ConnectorRegistry()
     registry.register(MeetingPlatform.ZOOM, zoom_factory)
 
-    if not settings.teams.is_configured():
-        logger.info("connectors.teams_not_registered", reason="not configured")
-        return registry
-
-    try:
-        registry.register(MeetingPlatform.TEAMS, teams_factory())
-    except Exception as exc:
-        # Deliberately broad: whatever is wrong with the Teams configuration, the
-        # correct outcome is a Zoom-only service plus a loud log line.
-        logger.error("connectors.teams_registration_failed", error=str(exc))
-        return registry
+    _register_optional(
+        registry,
+        platform=MeetingPlatform.TEAMS,
+        configured=settings.teams.is_configured(),
+        factory=teams_factory,
+    )
+    _register_optional(
+        registry,
+        platform=MeetingPlatform.GOOGLE_MEET,
+        configured=settings.google_meet.is_configured(),
+        factory=google_meet_factory,
+    )
 
     logger.info("connectors.registered", platforms=sorted(registry.supported()))
     return registry
+
+
+def _register_optional(
+    registry: ConnectorRegistry,
+    *,
+    platform: MeetingPlatform,
+    configured: bool,
+    factory: Callable[[], object] | None,
+) -> None:
+    """Register one optional connector, absorbing any failure it brings.
+
+    Extracted when Google Meet arrived, because the alternative was a second copy of the
+    same guard-and-catch — and the two copies drifting is precisely how a broken Teams
+    config would start taking Zoom's startup with it.
+    """
+    if factory is None or not configured:
+        logger.info(f"connectors.{platform}_not_registered", reason="not configured")
+        return
+    try:
+        registry.register(platform, factory())  # type: ignore[arg-type]
+    except Exception as exc:
+        # Deliberately broad: whatever is wrong with this connector's configuration, the
+        # correct outcome is a service without it plus a loud log line.
+        logger.error(f"connectors.{platform}_registration_failed", error=str(exc))
 
 
 class Container(containers.DeclarativeContainer):
@@ -143,15 +174,33 @@ class Container(containers.DeclarativeContainer):
         metrics=metrics,
     )
 
+    # -- Google Meet connector ---------------------------------------------
+    #
+    # Structurally parallel to the two blocks above and sharing nothing with them. There is
+    # no credential provider here because there is no API credential: Google ships no way
+    # to publish media into a conference, so the avatar joins as a signed-in Chromium and
+    # the "credential" is a browser profile on disk. See
+    # connectors/google_meet/capabilities.py for the evidence behind that.
+
+    google_meet_config = providers.Singleton(GoogleMeetConnectorConfig.from_settings, settings)
+
+    google_meet_session_factory = providers.Singleton(
+        GoogleMeetSessionFactory,
+        config=google_meet_config,
+        metrics=metrics,
+    )
+
     # -- orchestration -----------------------------------------------------
 
     # ``Delegate`` passes the provider itself rather than its resolved value, which is
-    # what keeps Teams construction off Zoom's startup path — see the docstring above.
+    # what keeps Teams and Google Meet construction off Zoom's startup path — see the
+    # docstring above.
     connector_registry = providers.Singleton(
         build_connector_registry,
         settings=settings,
         zoom_factory=zoom_session_factory,
         teams_factory=providers.Delegate(teams_session_factory),
+        google_meet_factory=providers.Delegate(google_meet_session_factory),
     )
 
     meeting_service = providers.Singleton(
