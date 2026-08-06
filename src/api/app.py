@@ -76,5 +76,6 @@ def create_app(*, container: Container | None = None) -> FastAPI:
     # Platform-specific webhook, resolved from the container rather than imported, so
     # this module names no connector (doc 003 §1.5).
     app.include_router(container.zoom_webhook_router(), prefix="/webhooks/zoom")
+    app.include_router(container.zoom_oauth_router())
 
     return app

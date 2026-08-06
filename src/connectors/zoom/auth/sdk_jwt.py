@@ -23,8 +23,10 @@ from dataclasses import dataclass
 
 from pydantic import SecretStr
 
-DEFAULT_TTL_S = 300
-"""Five minutes: long enough to join, short enough that a leak expires quickly."""
+DEFAULT_TTL_S = 1800
+"""Zoom rejects a shorter window: both ``exp`` and ``tokenExp`` must be at least 1800s
+after ``iat`` (Meeting SDK auth spec). 30 minutes is the shortest valid — and therefore
+the safest against a leak — TTL, not a security margin we chose ourselves."""
 
 _ROLE_PARTICIPANT = 0
 _ROLE_HOST = 1

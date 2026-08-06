@@ -17,6 +17,7 @@ from dependency_injector import containers, providers
 from src.config.settings import Settings
 from src.connectors.zoom.auth.webhook_verifier import WebhookVerifier
 from src.connectors.zoom.config import ZoomConnectorConfig
+from src.connectors.zoom.oauth.router import build_router as build_zoom_oauth_router
 from src.connectors.zoom.session.zoom_session import ZoomSessionFactory
 from src.connectors.zoom.webhook.router import build_router as build_zoom_webhook_router
 from src.infrastructure.metrics import MetricsCollector
@@ -90,3 +91,7 @@ class Container(containers.DeclarativeContainer):
         verifier=zoom_webhook_verifier,
         meeting_service=meeting_service,
     )
+
+    # The app-install OAuth redirect target — see connectors/zoom/oauth/router.py for
+    # why this exists despite the bridge never exchanging the code it carries.
+    zoom_oauth_router = providers.Singleton(build_zoom_oauth_router)
