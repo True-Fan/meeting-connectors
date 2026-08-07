@@ -24,9 +24,11 @@ carry.
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 
 from src.avatar.client import AvatarClient
 from src.domain.context import FrameContext
+from src.domain.exceptions import AvatarProtocolMismatchError
 from src.domain.health import ComponentHealth, HealthReport
 from src.domain.media import AudioFrame
 from src.infrastructure.logging import get_logger
@@ -90,13 +92,72 @@ class MediaRouter:
         }
 
     async def run(self) -> None:
-        """Run every routing leg until cancelled or a leg fails."""
-        async with asyncio.TaskGroup() as group:
-            group.create_task(self._route_inbound(), name="route-inbound")
-            group.create_task(self._route_chunks(), name="route-chunks")
-            group.create_task(self._route_video(), name="route-video")
-            group.create_task(self._route_audio(), name="route-audio")
-            group.create_task(self._pacer.run(), name="pacer")
+        """Connect the avatar leg, then run every routing leg until cancelled or a failure.
+
+        **The avatar connect is not optional, and it did not used to happen at all.**
+        ``AvatarClient.start()`` performs the handshake, and nothing called it — not this
+        class, not any connector session, not any test. The result was that every session on
+        every platform published idle video and silence forever while the agent heard nothing:
+        ``WebSocketAvatarTransport.send_pcm`` only offers to a bounded queue, and the task that
+        drains that queue is created inside ``connect()``, so it never existed. Nothing failed
+        loudly because every layer was doing exactly what it had been told.
+
+        It belongs **here** rather than in the three session classes for the reason
+        ``DecodePipeline.wait_started()`` does: the fault is in shared code, the router already
+        owns the avatar for the session's lifetime, and one fix here means all three connectors
+        are correct with no connector changing. Regression coverage lives in
+        ``tests/unit/test_avatar_leg_startup.py``, which asserts against a real socket — the
+        ``AvatarTransport`` double could never catch this, because its ``send_pcm`` appends to a
+        list whether or not the transport was connected.
+
+        Before the task group, not inside it: ``_route_inbound`` calls ``avatar.send()`` and
+        ``_route_chunks`` iterates ``avatar.chunks()``, so both would touch an unconnected
+        transport on their first iteration.
+
+        **A connect failure degrades the session rather than killing it**, which is a
+        deliberate choice and the subtler half of this fix. Raising here would be a *new* way
+        for a session to die: an avatar-service blip would take live Zoom and Teams meetings
+        down, and because every session class creates this as a background task the death would
+        be silent. Degrading preserves exactly what an absent avatar did before — idle video
+        and silence, reported through ``health()`` — while the reachable case now works. The
+        failure is logged at ``error`` and the avatar component reports ``UNHEALTHY``, so it is
+        loud where an operator looks rather than fatal where they cannot see it.
+        """
+        await self._connect_avatar()
+        try:
+            async with asyncio.TaskGroup() as group:
+                group.create_task(self._route_inbound(), name="route-inbound")
+                group.create_task(self._route_chunks(), name="route-chunks")
+                group.create_task(self._route_video(), name="route-video")
+                group.create_task(self._route_audio(), name="route-audio")
+                group.create_task(self._pacer.run(), name="pacer")
+        finally:
+            # Symmetric with the connect above: whatever opens the socket closes it. The three
+            # session classes all document tearing down "the avatar" and none of them actually
+            # did — harmless while nothing ever connected, a leaked socket per session now that
+            # something does. Best-effort, because teardown must never mask why we are here.
+            with suppress(Exception):
+                await self._avatar.stop()
+
+    async def _connect_avatar(self) -> None:
+        """Complete the avatar handshake, degrading loudly if the agent is unreachable.
+
+        ``AvatarProtocolMismatchError`` is the one failure that still propagates: an
+        incompatible major version will not resolve itself, no retry or degraded mode helps,
+        and continuing would mean streaming PCM at an agent that cannot answer. Everything else
+        — refused connection, timeout, DNS — is a transient the session can outlive.
+        """
+        try:
+            await self._avatar.start()
+        except AvatarProtocolMismatchError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "router.avatar_unreachable",
+                error=str(exc),
+                note="the session will publish idle media and the avatar will hear nothing; "
+                "check the avatar agent and MC_AVATAR__URL",
+            )
 
     # -- inbound: Zoom → avatar -------------------------------------------
 
