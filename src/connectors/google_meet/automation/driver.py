@@ -158,17 +158,23 @@ class PlaywrightDriver:
         pages = self._context.pages
         self._page = pages[0] if pages else await self._context.new_page()
 
-        self._page.on("crash", self._on_crash)
-        self._page.on("close", self._on_close)
-        self._context.on("close", self._on_close)
+        # Lambdas rather than bound methods, and not a style choice: Playwright's handler
+        # wrapper stores bookkeeping on ``handler.__self__`` with ``setattr``, which raises
+        # ``AttributeError`` on a ``__slots__`` class like this one. Passing a bound method
+        # here fails at launch — before any page exists — so the whole connector would have
+        # died on its first real ``start()``. A lambda has no ``__self__``, so the wrapper
+        # takes its other path.
+        self._page.on("crash", lambda _page: self._on_crash())
+        self._page.on("close", lambda _page: self._on_close())
+        self._context.on("close", lambda _context: self._on_close())
 
         logger.info("meet_browser.launched", headless=plan.headless, args=len(plan.args))
 
-    def _on_crash(self, _page: object) -> None:
+    def _on_crash(self) -> None:
         self._crashed = True
         logger.error("meet_browser.page_crashed")
 
-    def _on_close(self, _target: object) -> None:
+    def _on_close(self) -> None:
         # Only interesting when we did not ask for it. During teardown this fires
         # normally and logging it as a fault would make every clean stop look like a
         # failure in the logs.

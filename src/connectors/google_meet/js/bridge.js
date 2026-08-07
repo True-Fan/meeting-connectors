@@ -148,6 +148,7 @@
     captureContext: null,
     captureNode: null,
     captureMix: null,
+    captureConnected: false,
     remoteTracks: new Map(), // track.id -> { node, element }
 
     playoutContext: null,
@@ -446,7 +447,7 @@
       state.audioSeq = (state.audioSeq + 1) >>> 0;
     };
 
-    mix.connect(node);
+    // Deliberately NOT connected to the worklet yet — see syncCaptureGraph().
 
     // A worklet whose output goes nowhere is not guaranteed to be pulled, so
     // the graph is terminated at the destination through a silent gain node.
@@ -464,6 +465,46 @@
     state.captureContext = context;
     state.captureNode = node;
     state.captureMix = mix;
+    syncCaptureGraph();
+  }
+
+  /*
+   * Connect the mix to the capture worklet only while a remote track exists.
+   *
+   * A GainNode with no upstream sources still presents its output to a
+   * connected worklet as a buffer of zeros, not as an absent input. So leaving
+   * the mix permanently wired meant the worklet emitted a continuous stream of
+   * digital silence from the moment the session started -- 50 frames a second
+   * of nothing, to an avatar agent that has no one to listen to.
+   *
+   * That was not merely wasteful. It defeated the media watchdog outright:
+   * `monitoring/watchdog.py` decides the capture graph has stalled by noticing
+   * that no frames are arriving, and frames were *always* arriving. The one
+   * failure the watchdog exists to catch was undetectable.
+   *
+   * Gating the connection makes "a frame arrived" mean "someone is in the call
+   * and audible", which is what every consumer of it already assumed.
+   */
+  function syncCaptureGraph() {
+    const mix = state.captureMix;
+    const node = state.captureNode;
+    if (!mix || !node) {
+      return;
+    }
+    const wanted = state.remoteTracks.size > 0;
+    if (wanted === state.captureConnected) {
+      return;
+    }
+    try {
+      if (wanted) {
+        mix.connect(node);
+      } else {
+        mix.disconnect(node);
+      }
+      state.captureConnected = wanted;
+    } catch (err) {
+      fail('CAPTURE_GRAPH', err, false);
+    }
   }
 
   async function attachRemoteTrack(track, stream) {
@@ -491,6 +532,7 @@
     });
 
     state.remoteTracks.set(track.id, { source, element });
+    syncCaptureGraph();
     report('remoteAudioAttached', { trackId: track.id, total: state.remoteTracks.size });
 
     track.addEventListener('ended', () => detachRemoteTrack(track.id));
@@ -509,6 +551,7 @@
     }
     entry.element.srcObject = null;
     entry.element.remove();
+    syncCaptureGraph();
     report('remoteAudioDetached', { trackId, total: state.remoteTracks.size });
   }
 
@@ -731,7 +774,13 @@
           user_agent: navigator.userAgent,
           url: location.href,
           has_video_frame: typeof VideoFrame === 'function',
-          has_audio_worklet: !!(window.AudioContext && AudioContext.prototype.audioWorklet !== undefined),
+          // `'audioWorklet' in prototype`, never `prototype.audioWorklet`. WebIDL
+          // attributes are accessor properties whose getters reject a non-instance
+          // receiver, so reading it off the prototype throws "Illegal invocation" --
+          // which, thrown from inside onopen, silently discarded this whole message.
+          // The socket stayed open and heartbeats kept flowing, so the only symptom
+          // was a HELLO that never arrived and no error anywhere.
+          has_audio_worklet: 'audioWorklet' in (window.AudioContext || {}).prototype,
         })
       );
     };
