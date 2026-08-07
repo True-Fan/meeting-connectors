@@ -11,7 +11,12 @@
       "Bash(.venv/bin/python tools/meet_inspect.py --settle 8)",
       "Bash(.venv/bin/python /private/tmp/claude-501/-Users-dev-work-meeting-connectors/9ddcc589-cff5-4953-a9bd-1a19f47db422/scratchpad/prejoin.py)",
       "Bash(.venv/bin/python -m pytest tests/unit/test_google_meet_controls.py tests/unit/test_google_meet_join.py -q --tb=line)",
-      "Bash(.venv/bin/python -m pytest --tb=line -rN -k \"not chromium_smoke\")"
+      "Bash(.venv/bin/python -m pytest --tb=line -rN -k \"not chromium_smoke\")",
+      "Bash(node --check src/connectors/google_meet/js/bridge.js)",
+      "Bash(.venv/bin/python /private/tmp/claude-501/-Users-dev-work-meeting-connectors/9ddcc589-cff5-4953-a9bd-1a19f47db422/scratchpad/fullchain.py)",
+      "Bash(.venv/bin/python -m pytest tests/integration/test_google_meet_end_to_end.py -q --tb=line)",
+      "Bash(.venv/bin/python -m ruff check src --fix --output-format=concise)",
+      "Bash(.venv/bin/python -m pytest -k \"zoom or teams\" --tb=no -rN)"
     ]
   }
 }

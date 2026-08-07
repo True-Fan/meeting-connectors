@@ -160,6 +160,8 @@
     cameraTrack: null,
     micTrack: null,
     videoFrames: 0,
+    cameraClones: 0,
+    micClones: 0,
 
     meetState: null,
     rosterSignature: '',
@@ -275,10 +277,12 @@
     if (state.cameraTrack && state.cameraTrack.readyState === 'live') {
       // Clone per request: Meet may stop a track it was handed, and a stopped
       // master would leave every later request with a dead device.
+      state.cameraClones += 1;
       return state.cameraTrack.clone();
     }
     const stream = state.canvas.captureStream(0);
     state.cameraTrack = stream.getVideoTracks()[0];
+    state.cameraClones += 1;
     return state.cameraTrack.clone();
   }
 
@@ -365,6 +369,7 @@
 
   function microphoneTrack() {
     if (state.micTrack && state.micTrack.readyState === 'live') {
+      state.micClones += 1;
       return state.micTrack.clone();
     }
     return null;
@@ -923,6 +928,44 @@
       /* onclose follows; nothing useful to add and nowhere to log it */
     };
   }
+
+  /*
+   * A read-only snapshot of the page's own view of the media path.
+   *
+   * `state` is closure-private, deliberately -- nothing outside this script may mutate it. But
+   * when an avatar joins a meeting and its tile stays blank, the question is *which* link
+   * broke, and every counter that answers it lives in here. The heartbeat carries some of them
+   * on a timer; this exposes all of them on demand, which is what a diagnostic needs.
+   *
+   * A getter, not the object: callers can read but cannot reach in and change anything.
+   */
+  window.__MC_BRIDGE_STATS__ = () => ({
+    videoFramesDrawn: state.videoFrames,
+    canvas: state.canvas
+      ? { width: state.canvas.width, height: state.canvas.height }
+      : null,
+    cameraTrack: state.cameraTrack
+      ? {
+          readyState: state.cameraTrack.readyState,
+          muted: state.cameraTrack.muted,
+          enabled: state.cameraTrack.enabled,
+          hasRequestFrame: typeof state.cameraTrack.requestFrame === 'function',
+          settings: state.cameraTrack.getSettings ? state.cameraTrack.getSettings() : null,
+        }
+      : null,
+    micTrack: state.micTrack
+      ? { readyState: state.micTrack.readyState, enabled: state.micTrack.enabled }
+      : null,
+    // How many clones Meet was handed. If this is 0 the getUserMedia patch never fired, which
+    // means Meet is publishing something other than our canvas.
+    cameraClonesIssued: state.cameraClones,
+    micClonesIssued: state.micClones,
+    remoteTracks: state.remoteTracks.size,
+    captureConnected: state.captureConnected,
+    playout: state.playoutStats,
+    socketOpen: !!(state.socket && state.socket.readyState === 1),
+    stages: stages.map((s) => s.stage + ':' + s.phase),
+  });
 
   // ------------------------------------------------------------ bootstrap
 

@@ -469,3 +469,74 @@ def _publish_counts(session: GoogleMeetSession) -> dict[str, int]:
         for key, _, value in (part.partition("=") for part in detail.split())
         if value.isdigit()
     }
+
+
+class TestADeadAvatarIsNotAHealthySession:
+    """Regression for a silent failure seen in a live run.
+
+    The log read:
+
+        router.avatar_unreachable   error='avatar handshake reply was not JSON'
+        session.transition          from_state=joining to_state=active
+
+    The avatar agent was unreachable — no audio in, and only grey idle frames out — and the
+    session reported ACTIVE four lines later, because ``leg_states`` looked only at the browser.
+    """
+
+    async def test_an_unhealthy_avatar_degrades_the_session(
+        self, meet_settings, session_context
+    ) -> None:
+        driver = joined_driver(auto_page=True)
+        session, transport, _ = _build_session(meet_settings, driver, session_context)
+        try:
+            await session.start()
+            await _wait_for(lambda: session.leg_states()[0] is ComponentState.HEALTHY)
+
+            # The avatar dies the way an unreachable agent does: the transport goes unhealthy.
+            transport.fail("handshake reply was not JSON")
+            session_context.state = SessionState.ACTIVE
+
+            assert session.leg_states() == (
+                ComponentState.DEGRADED,
+                ComponentState.DEGRADED,
+            )
+            from src.domain.session import derive_state
+
+            assert derive_state(*session.leg_states()) is SessionState.DEGRADED
+        finally:
+            await session.stop()
+
+    async def test_a_not_yet_started_avatar_is_not_treated_as_a_failure(
+        self, meet_settings, session_context
+    ) -> None:
+        """``UNKNOWN`` is the transport's "not started yet", which every session passes through
+        between ``start()`` creating the router task and that task completing its handshake.
+        Reading it as a fault would degrade the first tick of every healthy session."""
+        driver = joined_driver(auto_page=True)
+        session, _, _ = _build_session(meet_settings, driver, session_context)
+        try:
+            session_context.state = SessionState.ACTIVE
+            # Deliberately before start(): the avatar has not connected, so it reports UNKNOWN.
+            assert session.leg_states()[0] is not ComponentState.DEGRADED
+        finally:
+            await session.stop()
+
+    async def test_the_degrade_waits_until_the_session_leaves_joining(
+        self, meet_settings, session_context
+    ) -> None:
+        """``domain.session`` permits ``JOINING -> ACTIVE`` but not ``JOINING -> DEGRADED``, so
+        reporting a degraded pair too early raises inside the supervisor's poll loop."""
+        from src.domain.session import allowed_transitions
+
+        assert SessionState.DEGRADED not in allowed_transitions(SessionState.JOINING)
+
+        driver = joined_driver(auto_page=True)
+        session, transport, _ = _build_session(meet_settings, driver, session_context)
+        try:
+            await session.start()
+            transport.fail("dead")
+            session_context.state = SessionState.JOINING
+
+            assert session.leg_states()[0] is not ComponentState.DEGRADED
+        finally:
+            await session.stop()

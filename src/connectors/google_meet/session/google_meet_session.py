@@ -51,7 +51,7 @@ from src.connectors.google_meet.virtual_microphone.adapter import VirtualMicroph
 from src.domain.context import FrameContext
 from src.domain.health import ComponentState, HealthReport
 from src.domain.media import AudioFormat, VideoFormat
-from src.domain.session import SessionContext
+from src.domain.session import SessionContext, SessionState
 from src.infrastructure.logging import get_logger
 from src.infrastructure.metrics import MetricsCollector
 from src.infrastructure.reconnect import ReconnectPolicy
@@ -179,11 +179,53 @@ class GoogleMeetSession:
         not be able to declare a broken bridge healthy.
         """
         state = self._bridge.health().state
-        if state is ComponentState.HEALTHY and self._watchdog.verdict.state is (
-            ComponentState.DEGRADED
-        ):
+
+        # Two inferences are folded in, and both may only *downgrade*: a derived signal must
+        # never be able to declare a broken browser healthy.
+        #
+        # Neither applies while the session is still ``JOINING``, and that is a constraint of
+        # the shared state machine rather than a preference. ``domain.session`` permits
+        # ``JOINING -> ACTIVE`` but not ``JOINING -> DEGRADED``, so reporting a degraded pair
+        # before the session has ever been active raises ``IllegalStateTransitionError`` inside
+        # the supervisor's poll loop. Waiting costs one poll interval: the session reaches
+        # ACTIVE, then degrades on the next tick, and ``ACTIVE -> DEGRADED`` is legal.
+        joining = self._session.state is SessionState.JOINING
+        stalled = self._watchdog.verdict.state is ComponentState.DEGRADED
+        impaired = stalled or self._avatar_has_failed()
+        if state is ComponentState.HEALTHY and not joining and impaired:
             state = ComponentState.DEGRADED
         return state, state
+
+    def _avatar_has_failed(self) -> bool:
+        """Whether the avatar agent is known to be unreachable.
+
+        **Folded into the leg states because otherwise a dead avatar reads as a healthy
+        session.** ``leg_states`` used to report only the browser, so a session whose avatar
+        never completed its handshake still derived ``ACTIVE`` — the browser was in the meeting,
+        the pacer was publishing, and every layer agreed, while the avatar heard nothing and the
+        meeting showed grey idle frames. Observed exactly that way in a live run: the log carried
+        ``router.avatar_unreachable`` and then ``session.transition to_state=active`` four lines
+        later.
+
+        ``DEGRADED`` rather than ``UNHEALTHY`` on purpose. ``ComponentState.DEGRADED.is_serving``
+        is True, so the supervisor's grace window will not fail the session — which is right,
+        because an avatar blip is recoverable and the browser is genuinely still in the meeting.
+        It changes what the operator is told, not whether the session survives.
+
+        Only the Google Meet connector does this. Zoom's and Teams' ``leg_states`` have the same
+        gap, and closing it there means editing two deployed connectors — recorded in
+        ``docs/design/007`` §7 rather than done here.
+        """
+        avatar = self._router.health().component("avatar_client")
+        if avatar is None:
+            return False
+        # Only an explicit UNHEALTHY counts. ``UNKNOWN`` is the transport's "not started yet",
+        # which every session passes through in the moment between ``start()`` creating the
+        # router task and that task completing its handshake — treating it as a fault would
+        # report a degraded pair for the first tick of every healthy session. ``DEGRADED`` is
+        # impaired-but-serving, and the avatar client is the component entitled to decide that
+        # about itself; downgrading again on top of it would say nothing new.
+        return avatar.state is ComponentState.UNHEALTHY
 
 
 class GoogleMeetSessionFactory:

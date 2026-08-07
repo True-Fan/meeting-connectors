@@ -88,5 +88,18 @@ class FakeAvatarTransport:
                 return
             yield chunk
 
+    def fail(self, detail: str) -> None:
+        """Report unhealthy, the way the real transport does when its agent goes away.
+
+        Added for the Google Meet leg-state regression: a session must degrade when the avatar
+        dies, and the only way to assert that is to be able to kill the avatar.
+        """
+        self._state = ComponentState.UNHEALTHY
+        self._detail = detail
+
     def health(self) -> ComponentHealth:
-        return ComponentHealth(name="fake_avatar_transport", state=self._state)
+        return ComponentHealth(
+            name="fake_avatar_transport",
+            state=self._state,
+            detail=getattr(self, "_detail", None),
+        )

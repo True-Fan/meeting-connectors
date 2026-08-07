@@ -59,20 +59,24 @@ class MeetSelectors:
     expect to fill."""
 
     join_button: tuple[str, ...] = (
-        'button[jsname="Qx7uuf"]',
         '//button[contains(., "Join now")]',
         '//button[contains(., "Ask to join")]',
         '//button[contains(., "Join here too")]',
         '//button[contains(., "Switch here")]',
         'button[aria-label*="Join now" i]',
         'button[aria-label*="Ask to join" i]',
+        'button[jsname="Qx7uuf"]',
     )
     """Harvested from the live pre-join screen, and every entry earned its place.
 
-    ``jsname="Qx7uuf"`` first: it is Meet's own identifier for the primary join button and the
-    only thing on that element that is not either an icon ligature or localised prose.
+    **Text matches first, ``jsname`` last** — the reverse of how this was first written, and the
+    reordering matters. ``Qx7uuf`` was observed on the *same-account* pre-join screen's "Join here
+    too" button, and there is no guarantee Meet uses it for the primary button on every variant of
+    that screen. A jsname that resolves to the wrong control gets **clicked**, which fails silently
+    and confusingly; a text match that misses simply falls through to the next candidate and
+    eventually produces a named error. Prefer the failure mode you can diagnose.
 
-    Then ``contains()``, **not** exact text — which is the bug this replaced. Meet renders the
+    ``contains()``, **not** exact text — which is the bug this replaced. Meet renders the
     button as a Material icon ligature immediately followed by the label, with no separator and
     no wrapping element, so its text reads ``"add_to_queueJoin here too"``. The previous
     selectors required ``span[text()="Join now"]`` to match exactly, so they could never fire:
