@@ -173,6 +173,60 @@
     }
   }
 
+  /*
+   * Stage tracking.
+   *
+   * Bootstrap runs before the socket is open, so a stage that throws would otherwise be
+   * invisible: `send()` silently drops anything written before onopen. These are buffered and
+   * flushed on connect, which is what makes "the last stage that completed" recoverable after
+   * a renderer crash -- the case this was added for.
+   */
+  const stages = [];
+
+  function stage(name, phase, detail) {
+    stages.push({ stage: name, phase, detail: detail || null, t: Math.round(performance.now()) });
+    report('stage', { stage: name, phase, detail: detail || null });
+    // Out-of-band escape hatch, defined only by the diagnostic harness. The buffer above can
+    // only be flushed once the socket opens, so a fault during bootstrap -- or a renderer that
+    // dies before connecting -- would otherwise leave no trace at all. That is exactly the
+    // case this exists for. Absent in production, and wrapped because a hook that throws must
+    // not be able to break the stage it is reporting on.
+    const hook = window.__MC_STAGE__;
+    if (typeof hook === 'function') {
+      try {
+        hook(name + ':' + phase + (detail ? ' ' + String(detail).slice(0, 300) : ''));
+      } catch (err) {
+        /* diagnostics must never affect behaviour */
+      }
+    }
+  }
+
+  function runStage(name, fn) {
+    stage(name, 'begin');
+    try {
+      const result = fn();
+      stage(name, 'ok');
+      return result;
+    } catch (err) {
+      // Reported, then rethrown: bootstrap ordering matters and a failed stage must not look
+      // like a successful one, but the report has to escape first.
+      stage(name, 'threw', String((err && err.stack) || err));
+      throw err;
+    }
+  }
+
+  async function runStageAsync(name, fn) {
+    stage(name, 'begin');
+    try {
+      const result = await fn();
+      stage(name, 'ok');
+      return result;
+    } catch (err) {
+      stage(name, 'threw', String((err && err.stack) || err));
+      throw err;
+    }
+  }
+
   function report(event, detail) {
     // The only channel out for diagnostics. Deliberately not console.log: the
     // Python side owns logging, and a console message nobody collects is worse
@@ -768,6 +822,9 @@
     state.socket = socket;
 
     socket.onopen = () => {
+      // Replay everything that happened before the socket existed, so a crash during
+      // bootstrap still tells Python how far it got.
+      send(encodeJson(TYPE.PAGE_EVENT, { event: 'stages', detail: { stages } }));
       send(
         encodeJson(TYPE.HELLO, {
           wire_version: WIRE_VERSION,
@@ -798,9 +855,15 @@
         case TYPE.CONFIG:
           handleConfig(decodeJson(message.payload));
           try {
-            await ensureCapture();
-            await ensurePlayout();
-            ensureCanvas();
+            if (enabled('capture')) {
+              await runStageAsync('capture', ensureCapture);
+            }
+            if (enabled('playout')) {
+              await runStageAsync('playout', ensurePlayout);
+            }
+            if (enabled('canvas')) {
+              runStage('canvas', ensureCanvas);
+            }
           } catch (err) {
             fail('MEDIA_INIT', err, true);
             return;
@@ -863,9 +926,51 @@
 
   // ------------------------------------------------------------ bootstrap
 
-  installDevicePatches();
-  installPeerConnectionTap();
-  installObservers();
-  heartbeat();
-  connect();
+  // Each stage is individually skippable, so a renderer crash can be bisected to one
+  // component without editing this file. CONFIG.stages is a list of names; absent means all.
+  // See MC_GOOGLE_MEET__INJECT_STAGES.
+  const WANTED = CONFIG.stages || null;
+  const enabled = (name) => !WANTED || WANTED.indexOf(name) !== -1;
+
+  stage('bootstrap', 'begin', { wanted: WANTED });
+  if (enabled('devices')) {
+    runStage('devices', installDevicePatches);
+  }
+  if (enabled('rtc')) {
+    runStage('rtc', installPeerConnectionTap);
+  }
+  if (enabled('observers')) {
+    runStage('observers', installObservers);
+  }
+  if (enabled('heartbeat')) {
+    runStage('heartbeat', heartbeat);
+  }
+  stage('bootstrap', 'ok');
+  if (enabled('socket')) {
+    /*
+     * Deferred to DOMContentLoaded, and this is load-bearing rather than tidiness.
+     *
+     * Opening a WebSocket to loopback *synchronously from a document-start init script*
+     * SIGSEGVs the Chromium renderer on a real meet.google.com document -- "Aw, Snap!",
+     * error code 11. Isolated by bisecting the bootstrap stages: installing the device
+     * patches, the RTCPeerConnection tap and the DOM observers are all fine, and the crash
+     * lands on `socket:begin` and never reaches `socket:ok`.
+     *
+     * The same socket, to the same endpoint, from the same origin, opens without complaint a
+     * few seconds later once Meet has initialised. So the fault is the timing, not the
+     * connection: the init script runs before the document is set up, and the loopback path
+     * through Chromium's Local Network Access code is evidently not ready for it.
+     *
+     * A renderer crash is always a browser bug, not ours -- but we can stop provoking it, and
+     * waiting costs nothing: the Python side already waits up to bridge_ready_timeout_s for
+     * the page to attach, and the join flow takes far longer than this deferral.
+     */
+    const openSocket = () => runStage('socket', connect);
+    if (document.readyState === 'loading') {
+      stage('socket', 'deferred', 'waiting for DOMContentLoaded');
+      document.addEventListener('DOMContentLoaded', openSocket, { once: true });
+    } else {
+      openSocket();
+    }
+  }
 })();

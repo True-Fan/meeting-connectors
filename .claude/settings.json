@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python /private/tmp/claude-501/-Users-dev-work-meeting-connectors/9ddcc589-cff5-4953-a9bd-1a19f47db422/scratchpad/repro_min.py)",
+      "Bash(mv bisect.py stage_bisect.py)",
+      "Bash(.venv/bin/python /private/tmp/claude-501/-Users-dev-work-meeting-connectors/9ddcc589-cff5-4953-a9bd-1a19f47db422/scratchpad/stage_bisect.py)",
+      "Bash(.venv/bin/python /private/tmp/claude-501/-Users-dev-work-meeting-connectors/9ddcc589-cff5-4953-a9bd-1a19f47db422/scratchpad/socket_probe.py)",
+      "Bash(.venv/bin/python -c ' *)",
+      "Bash(.venv/bin/python -c \"import src.connectors.google_meet.bridge.chromium_bridge as m; print\\('imports OK'\\)\")",
+      "Bash(.venv/bin/python -m pytest -q --tb=short -k \"not chromium_smoke\")"
+    ]
+  }
+}

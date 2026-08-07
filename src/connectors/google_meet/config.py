@@ -119,6 +119,18 @@ class GoogleMeetConnectorConfig:
     avatar_reconnect_max_delay_s: float
     avatar_reconnect_max_attempts: int
 
+    # -- Debugging ---------------------------------------------------------
+    # Last, and defaulted, so every existing construction site is unchanged — a defaulted
+    # dataclass field cannot precede undefaulted ones.
+    inject_stages: tuple[str, ...] = ()
+    """Which bridge.js bootstrap stages to install; empty means all. See
+    ``GoogleMeetSettings.inject_stages``."""
+
+    disable_injection: bool = False
+    """Skip injecting ``js/bridge.js`` entirely. A session with this set **cannot carry media**
+    and fails fast rather than degrading silently. See
+    ``GoogleMeetSettings.disable_injection``."""
+
     def __post_init__(self) -> None:
         pixels = self.video_format.width * self.video_format.height
         if pixels > MAX_PUBLISH_PIXELS:
@@ -222,6 +234,8 @@ class GoogleMeetConnectorConfig:
             idle_clip_path=settings.media.idle_clip_path,
             rejoin_max_attempts=meet.rejoin_max_attempts,
             watchdog_interval_s=meet.watchdog_interval_s,
+            inject_stages=tuple(meet.inject_stages),
+            disable_injection=meet.disable_injection,
             avatar_url=settings.avatar.url,
             avatar_connect_timeout_s=settings.avatar.connect_timeout_s,
             avatar_send_queue_size=settings.avatar.send_queue_size,

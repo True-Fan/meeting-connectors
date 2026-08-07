@@ -243,6 +243,33 @@ class GoogleMeetSettings(BaseModel):
     browser and may sit in a lobby, so ten attempts would take many minutes during which
     the avatar is visibly absent."""
 
+    inject_stages: list[str] = Field(default_factory=list)
+    """Restrict which ``js/bridge.js`` bootstrap stages are installed. Empty means all.
+
+    Stages: ``devices`` (the ``getUserMedia`` patch), ``rtc`` (the peer-connection tap),
+    ``observers`` (roster and meeting state), ``heartbeat``, ``socket`` (the loopback channel),
+    then ``capture`` / ``playout`` / ``canvas`` once the channel is up.
+
+    A diagnostic, and it earned its place: a renderer SIGSEGV on real Meet was isolated to one
+    stage by walking this list — ``devices``, ``rtc`` and ``observers`` each cleared in turn,
+    and the crash landing on ``socket``. Every stage reports begin/ok/threw, so the last one to
+    complete is always visible. See ``docs/design/007`` §8."""
+
+    disable_injection: bool = False
+    """Launch and join without injecting ``js/bridge.js`` at all. **A session with this set
+    cannot carry media**, and fails immediately rather than degrading silently.
+
+    The injected script *is* the connector: it patches ``getUserMedia`` for the synthetic camera
+    and microphone (all egress), taps ``RTCPeerConnection`` for conference audio (all ingest),
+    observes the roster, and opens the channel that carries every frame.
+
+    Failing fast is deliberate. Without it, ``wait_for_page`` would block for
+    ``bridge_ready_timeout_s`` waiting for a page that has no script to connect with, and the
+    resulting ``BridgeUnavailableError`` is *recoverable* — so the bridge would relaunch the
+    browser and repeat until the rejoin budget was spent. Five launches to reach a conclusion
+    available at once. Prefer ``inject_stages`` for bisecting; this is the all-or-nothing
+    switch."""
+
     watchdog_interval_s: float = Field(default=5.0, gt=0)
     """How often to check that conference audio is still arriving. See
     ``connectors/google_meet/monitoring/watchdog.py`` for the failure this catches — a

@@ -49,6 +49,7 @@ from src.connectors.google_meet.exceptions import (
     BridgeProtocolError,
     BridgeUnavailableError,
     GoogleMeetError,
+    MeetConfigurationError,
 )
 from src.connectors.google_meet.js import load_assets
 from src.connectors.google_meet.meeting.controls import MeetControls
@@ -405,6 +406,21 @@ class ChromiumBridge:
         outcome = await joiner.join(target)
         self._meet_state = outcome.state
 
+        if self._config.disable_injection:
+            # Fail here rather than at ``wait_for_page``, and fail *fatally*. Otherwise the next
+            # line blocks for bridge_ready_timeout_s waiting for a page that has no script to
+            # connect with, and BridgeUnavailableError is classed recoverable — so the bridge
+            # would relaunch the browser once per rejoin attempt to reach the same conclusion.
+            # MeetConfigurationError is in FATAL_ERRORS, so this ends the session at once.
+            raise MeetConfigurationError(
+                "MC_GOOGLE_MEET__DISABLE_INJECTION is set, so js/bridge.js was not injected. "
+                f"The browser joined {target} successfully, but nothing can connect to the page "
+                "bridge: there is no synthetic camera or microphone, no conference-audio tap, "
+                "and no channel to carry frames. This session cannot publish an avatar or hear "
+                "anything, so it is failed now rather than left running and silent. Unset the "
+                "flag to carry media."
+            )
+
         channel = await server.wait_for_page(timeout_s=self._config.bridge_ready_timeout_s)
         await channel.send_json(MeetMessageType.CONFIG, self._page_config(server))
         ready = await channel.await_message(
@@ -440,6 +456,16 @@ class ChromiumBridge:
         each in a ``Blob`` and calls ``addModule`` on the object URL, so no HTTP server has
         to exist to serve them.
         """
+        if self._config.disable_injection:
+            # Warning, not info: this switch disables the entire media path, and it must be
+            # impossible to find a silent session later and wonder why nothing flowed.
+            logger.warning(
+                "meet_bridge.injection_disabled",
+                note="js/bridge.js was NOT injected, so this session cannot carry media in "
+                "either direction; unset MC_GOOGLE_MEET__DISABLE_INJECTION to publish an avatar",
+            )
+            return
+
         assets = load_assets()
         preamble = (
             f"window.__MC_BRIDGE_CONFIG__ = {json.dumps(self._page_config(server))};\n"
@@ -490,6 +516,13 @@ class ChromiumBridge:
             "heartbeatIntervalMs": HEARTBEAT_INTERVAL_MS,
             "scanIntervalMs": DOM_SCAN_INTERVAL_MS,
             "selectors": self._selectors.to_page_config(),
+            # Absent rather than empty when unrestricted: bridge.js reads a missing key as
+            # "install everything", and an empty list as "install nothing".
+            **(
+                {"stages": list(self._config.inject_stages)}
+                if self._config.inject_stages
+                else {}
+            ),
         }
 
     def _verify_page_media(self, ready: MeetMessage) -> PageReady:
