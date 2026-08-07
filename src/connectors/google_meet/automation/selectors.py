@@ -59,17 +59,28 @@ class MeetSelectors:
     expect to fill."""
 
     join_button: tuple[str, ...] = (
-        '//button[.//span[text()="Join now"]]',
-        '//button[.//span[text()="Ask to join"]]',
-        '//span[text()="Join now"]/ancestor::button',
-        '//span[text()="Ask to join"]/ancestor::button',
+        'button[jsname="Qx7uuf"]',
+        '//button[contains(., "Join now")]',
+        '//button[contains(., "Ask to join")]',
+        '//button[contains(., "Join here too")]',
+        '//button[contains(., "Switch here")]',
         'button[aria-label*="Join now" i]',
         'button[aria-label*="Ask to join" i]',
     )
-    """XPath first, because Meet's join button carries its label in a child ``span``
-    rather than an ``aria-label``, and matching the text is the only stable hook. Both
-    wordings appear: "Join now" for a meeting we may enter directly, "Ask to join" when
-    the meeting has admission control."""
+    """Harvested from the live pre-join screen, and every entry earned its place.
+
+    ``jsname="Qx7uuf"`` first: it is Meet's own identifier for the primary join button and the
+    only thing on that element that is not either an icon ligature or localised prose.
+
+    Then ``contains()``, **not** exact text — which is the bug this replaced. Meet renders the
+    button as a Material icon ligature immediately followed by the label, with no separator and
+    no wrapping element, so its text reads ``"add_to_queueJoin here too"``. The previous
+    selectors required ``span[text()="Join now"]`` to match exactly, so they could never fire:
+    the connector reached the pre-join screen, failed to find a join button, and gave up.
+
+    Four wordings, because Meet picks one from context: "Join now" when we may enter directly,
+    "Ask to join" when the meeting gates admission, and "Join here too" / "Switch here" when the
+    same account is already present in the call from another session."""
 
     dismiss_buttons: tuple[str, ...] = (
         'button[aria-label="Close"]',
@@ -85,11 +96,20 @@ class MeetSelectors:
     in_call: tuple[str, ...] = (
         'button[aria-label*="Leave call" i]',
         '[aria-label*="Leave call" i]',
-        'div[data-meeting-code]',
         'button[aria-label*="Chat with everyone" i]',
+        'button[aria-label*="Meeting tools" i]',
     )
-    """Presence of any of these means we are in the conference. The leave button is the
-    strongest signal — it cannot exist outside a call."""
+    """Presence of any of these means we are in the conference.
+
+    **``div[data-meeting-code]`` used to be in this list and was actively harmful.** It is
+    present on the *pre-join* screen too, so ``MeetJoiner._press_join`` took its
+    "already in the call" branch, never clicked Join, and then reported a successful join — a
+    browser parked on the pre-join screen while the session claimed to be active.
+
+    Every candidate here is a control that exists only once admitted: you cannot leave, chat, or
+    open meeting tools in a call you have not entered. Verified against a live pre-join screen
+    and a live in-call screen — the leave button matches in the second and not the first, which
+    is the property that makes it usable."""
 
     leave: tuple[str, ...] = (
         'button[aria-label*="Leave call" i]',

@@ -7,7 +7,11 @@
       "Bash(.venv/bin/python /private/tmp/claude-501/-Users-dev-work-meeting-connectors/9ddcc589-cff5-4953-a9bd-1a19f47db422/scratchpad/socket_probe.py)",
       "Bash(.venv/bin/python -c ' *)",
       "Bash(.venv/bin/python -c \"import src.connectors.google_meet.bridge.chromium_bridge as m; print\\('imports OK'\\)\")",
-      "Bash(.venv/bin/python -m pytest -q --tb=short -k \"not chromium_smoke\")"
+      "Bash(.venv/bin/python -m pytest -q --tb=short -k \"not chromium_smoke\")",
+      "Bash(.venv/bin/python tools/meet_inspect.py --settle 8)",
+      "Bash(.venv/bin/python /private/tmp/claude-501/-Users-dev-work-meeting-connectors/9ddcc589-cff5-4953-a9bd-1a19f47db422/scratchpad/prejoin.py)",
+      "Bash(.venv/bin/python -m pytest tests/unit/test_google_meet_controls.py tests/unit/test_google_meet_join.py -q --tb=line)",
+      "Bash(.venv/bin/python -m pytest --tb=line -rN -k \"not chromium_smoke\")"
     ]
   }
 }

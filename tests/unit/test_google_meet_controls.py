@@ -20,8 +20,10 @@ from tests.fakes.meet_page import (
     CAM_OFF_SELECTOR,
     CAM_ON_SELECTOR,
     IN_CALL_SELECTOR,
+    JOIN_NOW_SELECTOR,
     MIC_OFF_SELECTOR,
     MIC_ON_SELECTOR,
+    PREJOIN_ONLY_SELECTOR,
     FakeBrowserDriver,
     joined_driver,
 )
@@ -221,3 +223,57 @@ def _swap(driver: FakeBrowserDriver, selector: str) -> None:
     if replacement is not None:
         driver.hide(selector)
         driver.show(replacement)
+
+
+class TestInCallDetectionIsNotFooledByThePreJoinScreen:
+    """Regression: ``in_call`` used to match the pre-join screen.
+
+    ``div[data-meeting-code]`` is present *before* being admitted, and it was a candidate in
+    ``MeetSelectors.in_call``. So ``MeetJoiner._press_join`` took its "already in the call"
+    branch, returned without clicking Join, and ``_await_admission`` then agreed — reporting a
+    healthy joined session for a browser parked on the pre-join screen with no media at all.
+
+    Confirmed against the live DOM: the pre-join screen carries the meeting code, and the leave
+    button appears only once admitted.
+    """
+
+    async def test_the_meeting_code_alone_is_not_in_call(self) -> None:
+        driver = FakeBrowserDriver(visible={PREJOIN_ONLY_SELECTOR})
+
+        assert await _controls(driver).is_muted() is None
+        matched = await driver.wait_for_any(DEFAULT_SELECTORS.in_call, timeout_s=0.0)
+        assert matched is None, f"pre-join screen read as in-call via {matched!r}"
+
+    async def test_the_join_button_is_still_pressed_on_a_pre_join_screen(self) -> None:
+        """The behaviour the bug suppressed: Join must actually be clicked."""
+        from src.connectors.google_meet.meeting.join import MeetJoiner
+        from src.connectors.google_meet.meeting.meet_url import MeetJoinTarget, canonical_url
+
+        driver = FakeBrowserDriver(
+            # Exactly what the live pre-join screen presents: the meeting code and a join
+            # button, and no in-call controls.
+            visible={PREJOIN_ONLY_SELECTOR, JOIN_NOW_SELECTOR},
+            on_click=lambda d, sel: (d.hide(sel), d.show(IN_CALL_SELECTOR)),
+        )
+        joiner = MeetJoiner(
+            driver=driver,
+            selectors=DEFAULT_SELECTORS,
+            display_name="AI Avatar",
+            join_timeout_s=2.0,
+            lobby_timeout_s=2.0,
+        )
+        outcome = await joiner.join(
+            MeetJoinTarget(url=canonical_url("abc-defg-hij"), meeting_code="abc-defg-hij")
+        )
+
+        assert outcome.matched_join_button == JOIN_NOW_SELECTOR, "Join was never clicked"
+        assert JOIN_NOW_SELECTOR in driver.clicked
+
+    def test_the_harvested_join_selectors_do_not_require_exact_span_text(self) -> None:
+        """Meet renders an icon ligature glued to the label — ``"add_to_queueJoin here too"`` —
+        so an exact ``span[text()=...]`` match can never fire."""
+        for candidate in DEFAULT_SELECTORS.join_button:
+            assert 'text()="Join now"' not in candidate
+            assert 'text()="Ask to join"' not in candidate
+        assert any("Qx7uuf" in c for c in DEFAULT_SELECTORS.join_button)
+        assert any("contains(" in c for c in DEFAULT_SELECTORS.join_button)

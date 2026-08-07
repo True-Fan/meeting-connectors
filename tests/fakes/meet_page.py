@@ -51,8 +51,12 @@ from src.domain.avatar import AVATAR_INPUT_FORMAT
 # --------------------------------------------------------------------------- #
 
 IN_CALL_SELECTOR = 'button[aria-label*="Leave call" i]'
-JOIN_NOW_SELECTOR = '//button[.//span[text()="Join now"]]'
-ASK_TO_JOIN_SELECTOR = '//button[.//span[text()="Ask to join"]]'
+PREJOIN_ONLY_SELECTOR = "div[data-meeting-code]"
+"""Present on the *pre-join* screen as well as in-call, so it must never be treated as proof of
+being admitted. It was in ``MeetSelectors.in_call`` and caused the joiner to skip clicking Join
+entirely — see ``test_google_meet_controls.py``."""
+JOIN_NOW_SELECTOR = '//button[contains(., "Join now")]'
+ASK_TO_JOIN_SELECTOR = '//button[contains(., "Ask to join")]'
 LOBBY_SELECTOR = '[aria-label*="Asking to join" i]'
 MIC_ON_SELECTOR = 'button[aria-label*="Turn off microphone" i]'
 MIC_OFF_SELECTOR = 'button[aria-label*="Turn on microphone" i]'
