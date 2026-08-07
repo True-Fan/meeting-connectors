@@ -88,6 +88,24 @@ class BrowserDriver(Protocol):
         """The page's rendered text, for terminal-state detection."""
         ...
 
+    def current_url(self) -> str:
+        """The page's current URL, after any redirects.
+
+        Where a *redirect* is the signal rather than the markup — Google sending an
+        unauthenticated browser to a sign-in page is its own behaviour, not a DOM detail that
+        can be renamed. See ``auth/google_login.py``.
+        """
+        ...
+
+    async def cookies(self, urls: tuple[str, ...]) -> list[dict[str, Any]]:
+        """Cookies the browser holds for ``urls``.
+
+        The only way to read the authoritative signal for "is this profile signed in": a
+        Google session *is* its session cookies. Everything else — page text, ARIA labels — is
+        a rendering of that fact and can change without notice.
+        """
+        ...
+
     async def evaluate(self, script: str) -> Any:
         """Run a script in the page and return its result."""
         ...
@@ -315,6 +333,35 @@ class PlaywrightDriver:
             return await page.inner_text("body", timeout=2000)
         except Exception:
             return ""
+
+    def current_url(self) -> str:
+        """The page's URL after redirects. Empty when there is no page."""
+        page = self._page
+        if page is None:
+            return ""
+        try:
+            return page.url
+        except Exception:
+            return ""
+
+    async def cookies(self, urls: tuple[str, ...]) -> list[dict[str, Any]]:
+        """Cookies for ``urls``, as plain dicts.
+
+        Read from the *context*, not the page: cookies belong to the profile and survive
+        navigation, which is exactly the property that makes them a trustworthy session
+        signal.
+
+        Returns an empty list rather than raising when the context is gone — the caller reads
+        "no cookies" as "not signed in", which is the safe interpretation either way.
+        """
+        context = self._context
+        if context is None:
+            return []
+        try:
+            return [dict(cookie) for cookie in await context.cookies(list(urls))]
+        except Exception as exc:
+            logger.warning("meet_browser.cookies_unavailable", error=str(exc))
+            return []
 
     async def evaluate(self, script: str) -> Any:
         page = self._require_page()

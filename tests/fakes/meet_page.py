@@ -61,6 +61,23 @@ CAM_OFF_SELECTOR = 'button[aria-label*="Turn on camera" i]'
 
 SIGNED_IN_SCRIPT_RESULT = "avatar@example.com"
 
+GOOGLE_SESSION_COOKIES: tuple[dict[str, str], ...] = (
+    {"name": "SID", "value": "x", "domain": ".google.com"},
+    {"name": "__Secure-1PSID", "value": "x", "domain": ".google.com"},
+    {"name": "SAPISID", "value": "x", "domain": ".google.com"},
+)
+"""What an authenticated profile actually holds. These are the authoritative signal
+``auth/google_login.py`` reads, so a fake that omits them is a signed-out profile no matter
+what its page renders."""
+
+NO_SESSION_COOKIES: tuple[dict[str, str], ...] = (
+    {"name": "CONSENT", "value": "x", "domain": ".google.com"},
+    {"name": "NID", "value": "x", "domain": ".google.com"},
+)
+"""Cookies a *signed-out* browser still accumulates. Present so the signed-out fixtures are
+non-empty — a detector that merely counted cookies would pass against an empty list and fail
+here, which is the distinction worth testing."""
+
 
 class FakeBrowserDriver:
     """An in-memory ``BrowserDriver``.
@@ -89,6 +106,9 @@ class FakeBrowserDriver:
         script_result: object = SIGNED_IN_SCRIPT_RESULT,
         crash_after_goto: int | None = None,
         auto_page: bool = False,
+        cookies: tuple[dict[str, str], ...] = GOOGLE_SESSION_COOKIES,
+        url: str = "about:blank",
+        redirect_to: str | None = None,
     ) -> None:
         self.visible: set[str] = set(visible)
         self.text = text
@@ -96,6 +116,11 @@ class FakeBrowserDriver:
         self.script_result = script_result
         self._crash_after_goto = crash_after_goto
         self._auto_page = auto_page
+        self._cookies = list(cookies)
+        self._url = url
+        # Where a navigation actually lands. Google redirecting an auth-required page to its
+        # sign-in host is the signal the detector reads, so the fake has to be able to model it.
+        self._redirect_to = redirect_to
 
         self.plan: LaunchPlan | None = None
         self.init_scripts: list[str] = []
@@ -124,6 +149,7 @@ class FakeBrowserDriver:
         if self._crash_after_goto is not None and len(self.visited) > self._crash_after_goto:
             self.crashed = True
             raise BrowserCrashedError("fake page crashed on navigation")
+        self._url = self._redirect_to or url
         if self._auto_page and self.page is None:
             # A real init script opens the socket on first navigation. Doing the same here is
             # what makes the bridge's ordering testable: the page has to attach *after* the
@@ -165,6 +191,14 @@ class FakeBrowserDriver:
 
     async def page_text(self) -> str:
         return self.text
+
+    def current_url(self) -> str:
+        return self._url
+
+    async def cookies(self, urls: tuple[str, ...]) -> list[dict[str, object]]:
+        if self.crashed:
+            raise BrowserUnavailableError("fake page has crashed")
+        return [dict(c) for c in self._cookies]
 
     async def evaluate(self, script: str) -> object:
         if self.crashed:

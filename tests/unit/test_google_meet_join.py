@@ -30,6 +30,7 @@ from tests.fakes.meet_page import (
     IN_CALL_SELECTOR,
     JOIN_NOW_SELECTOR,
     LOBBY_SELECTOR,
+    NO_SESSION_COOKIES,
     FakeBrowserDriver,
 )
 
@@ -198,22 +199,24 @@ class TestTerminalOutcomes:
 
 class TestAuthentication:
     async def test_an_unsigned_in_profile_fails_before_navigating_to_the_meeting(self) -> None:
-        driver = FakeBrowserDriver(script_result=None, text="Sign in")
+        # Signed out is modelled by the *absence of session cookies*, which is what the
+        # detector actually reads. The old spelling of this test set script_result=None,
+        # encoding the brittle ARIA-label check that reported authenticated profiles as
+        # signed out — see test_google_meet_auth.py.
+        driver = FakeBrowserDriver(cookies=NO_SESSION_COOKIES, text="Sign in")
         with pytest.raises(GoogleAuthError, match="not signed in to Google"):
             await _joiner(driver).join(TARGET)
         assert canonical_url(CODE) not in driver.visited
 
     async def test_the_error_says_how_to_fix_it(self) -> None:
         """A deployment step was skipped; the message should name it."""
-        driver = FakeBrowserDriver(script_result=None, text="Sign in")
+        driver = FakeBrowserDriver(cookies=NO_SESSION_COOKIES, text="Sign in")
         with pytest.raises(GoogleAuthError, match=r"MC_GOOGLE_MEET__HEADLESS=false"):
             await _joiner(driver).join(TARGET)
 
     async def test_a_google_challenge_is_named_rather_than_reported_generically(self) -> None:
         """'Sign-in failed' sends an operator looking for a wrong password."""
-        driver = FakeBrowserDriver(
-            script_result=None, text="This browser or app may not be secure"
-        )
+        driver = FakeBrowserDriver(text="This browser or app may not be secure")
         with pytest.raises(GoogleAuthError, match="challenging this browser"):
             await _joiner(driver).join(TARGET)
 
