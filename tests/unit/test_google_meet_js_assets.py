@@ -244,3 +244,122 @@ class TestWorkletContract:
         """The bridge carries no metrics; it reports counters and Python decides."""
         playout = read_asset(PLAYOUT_WORKLET_ASSET)
         assert "type: 'stats'" in playout
+
+
+class TestOutboundAudioEnforcement:
+    """Putting the avatar's audio on the wire regardless of what Meet chose to publish.
+
+    ``getUserMedia`` interception is necessary and not sufficient. It only works if Meet asks
+    for a microphone, at a moment we can answer, and then publishes what we handed over —
+    and Meet fails all three in the field: it may acquire a device before the patch installs,
+    ask only for video, or route our track through its own processing graph and publish the
+    result instead. In every case the avatar is inaudible while each upstream signal reads
+    healthy: PCM delivered, worklet rendering, track live, microphone unmuted.
+
+    The RTP sender is downstream of all of it and is what actually decides what the meeting
+    hears, so that is what gets enforced. Verified in real Chromium over a loopback
+    PeerConnection pair: with the sender carrying silence the remote peer measured rms 0.0,
+    and after ``replaceTrack`` it measured rms 0.259 with the SDP unchanged and signalling
+    still ``stable`` — so the swap costs no renegotiation.
+    """
+
+    def test_the_bridge_forces_audio_onto_the_sender(self) -> None:
+        source = read_asset(BRIDGE_ASSET)
+        assert "forceOutboundAudio" in source
+        assert "replaceTrack" in source
+
+    def test_it_reconciles_rather_than_running_once(self) -> None:
+        """Meet's audio transceiver does not exist until negotiation, and Meet may swap the
+        track again later; a single pass at construction would miss both."""
+        source = read_asset(BRIDGE_ASSET)
+        assert "superviseOutboundAudio" in source
+        assert "setInterval" in source
+        assert "negotiationneeded" in source
+
+    def test_it_identifies_senders_by_transceiver_not_by_track(self) -> None:
+        """A sender whose track is null — which is what Meet has while muted — carries no
+        `kind` of its own, so the receiver's track has to supply it."""
+        source = read_asset(BRIDGE_ASSET)
+        assert "getTransceivers" in source
+        assert "transceiver.receiver" in source
+
+    def test_it_does_not_replace_its_own_track_repeatedly(self) -> None:
+        """Without an identity check every pass would replace the track it just installed."""
+        source = read_asset(BRIDGE_ASSET)
+        assert "ourAudioTracks" in source
+
+    def test_a_forced_track_starts_enabled(self) -> None:
+        """Meet mutes by clearing `enabled`; a freshly installed track must start audible or
+        the avatar stays silent until somebody toggles the button."""
+        source = read_asset(BRIDGE_ASSET)
+        assert "enabled = true" in source
+
+    def test_the_outcome_is_observable_from_python(self) -> None:
+        """Whether the avatar reached the wire must be a reading, not a deduction."""
+        source = read_asset(BRIDGE_ASSET)
+        assert "audioSendersForced" in source
+        assert "audioSendersSeen" in source
+
+    def test_the_enforcement_interval_is_configured_from_python(self) -> None:
+        """Timing belongs in settings, like every other cadence this connector uses."""
+        from src.connectors.google_meet.bridge.chromium_bridge import (
+            AUDIO_ENFORCE_INTERVAL_MS,
+        )
+
+        assert AUDIO_ENFORCE_INTERVAL_MS > 0
+        assert "audioEnforceIntervalMs" in read_asset(BRIDGE_ASSET)
+
+
+class TestGraphBuildersRunOnce:
+    """One media graph per page, whatever calls the builder.
+
+    ``if (state.playoutContext) return;`` looks like a guard and is not one: the flag is
+    assigned only after two awaits, so callers arriving in that window each build a complete
+    graph — AudioContext, worklet node, destination stream. The last assignment wins and
+    everything wired to the earlier graphs is orphaned, including the microphone track Meet is
+    already holding. Measured in real Chromium: **four concurrent callers built four
+    AudioContexts.**
+
+    Both directions have this shape. ``ensureCapture`` is called once per remote audio track
+    straight from the ``track`` event, so two participants arriving in one tick is enough;
+    ``ensurePlayout`` became racy the moment outbound enforcement started calling it from an
+    interval and from three connection events.
+
+    Extra contexts are not merely wasteful — Chromium caps how many a document may hold, so
+    the surplus can make a later ``new AudioContext()`` throw and take the *other* direction
+    down with it.
+    """
+
+    def test_both_builders_memoise_their_promise(self) -> None:
+        source = read_asset(BRIDGE_ASSET)
+        assert "playoutBuild" in source
+        assert "captureBuild" in source
+        assert "buildPlayout" in source
+        assert "buildCapture" in source
+
+    def test_a_failed_build_can_be_retried(self) -> None:
+        """A cached rejected promise would make one transient error permanent."""
+        source = read_asset(BRIDGE_ASSET)
+        assert "state.playoutBuild = null" in source
+        assert "state.captureBuild = null" in source
+
+    def test_the_outbound_track_is_cloned_once_not_per_pass(self) -> None:
+        """A reconciliation loop that mints a clone every two seconds leaks a live
+        MediaStreamTrack per tick for as long as Meet contests the sender."""
+        source = read_asset(BRIDGE_ASSET)
+        assert "ensureSendTrack" in source
+        assert "state.sendTrack" in source
+
+    def test_only_sending_transceivers_are_touched(self) -> None:
+        """A recvonly transceiver is how another participant's voice arrives; it is not ours
+        to put a track on, and skipping it keeps the enforcement to its own business.
+
+        The predicate must gate on *direction* rather than on kind alone, so it is checked for
+        both directions it accepts — a version testing only ``sendrecv`` would silently skip a
+        sendonly m-line and leave the avatar mute.
+        """
+        source = read_asset(BRIDGE_ASSET)
+        body = source.split("function sendsAudio(transceiver) {", 1)[1].split("\n  }", 1)[0]
+        assert "direction" in body
+        assert "'sendrecv'" in body
+        assert "'sendonly'" in body

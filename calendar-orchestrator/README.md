@@ -133,8 +133,15 @@ poll interval) don't fit.
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8100
+uvicorn app.main:app --reload --port 8200
 ```
+
+**Not 8100.** That port belongs to the avatar agent — `MC_AVATAR__URL` defaults to
+`ws://localhost:8100/stream`. Both were documented on 8100, and the collision does not
+announce itself: uvicorn binds `127.0.0.1:8100` while the avatar binds `0.0.0.0:8100`, macOS
+permits both, and the more specific bind wins every `localhost` connection. The bridge then
+gets `HTTP 403` from this app's `/stream`, logs `router.avatar_unreachable`, and publishes
+idle media — an avatar that joins the meeting and never speaks.
 
 On startup it runs an immediate sync, then every `ORCH_SCHEDULING__POLL_INTERVAL_S`
 afterward. Useful endpoints while it's running:

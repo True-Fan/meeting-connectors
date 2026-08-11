@@ -41,9 +41,14 @@ from src.domain.health import ComponentState
 class StubBridge:
     """The minimum surface the watchdog reads."""
 
-    def __init__(self, *, joined: bool = True, others: int = 1) -> None:
+    def __init__(
+        self, *, joined: bool = True, others: int = 1, page: dict | None = None
+    ) -> None:
         self.is_joined = joined
         self.meet_state = MeetState.JOINED if joined else None
+        # What ``window.__MC_BRIDGE_STATS__()`` would return. ``None`` is the honest default:
+        # a page that has not exposed the hook yet, which the watchdog must tolerate.
+        self.page = page
         self.roster = MeetRoster(
             participants=(
                 *(
@@ -54,6 +59,9 @@ class StubBridge:
             ),
             self_name="AI Avatar",
         )
+
+    async def page_stats(self) -> dict | None:
+        return self.page
 
 
 class StubSource:
@@ -230,3 +238,77 @@ class TestReconnectClassification:
         policy = build_policy(max_attempts=3)
         assert policy.exhausted(4) is True
         assert policy.exhausted(3) is False
+
+
+class TestUnpublishedMicrophone:
+    """The avatar that joins, unmutes, is fed every frame, and still cannot be heard.
+
+    Listed as a known failure mode in this module's docstring from the start — ``getUserMedia``
+    patched after Meet already acquired its tracks — and undiagnosable until now, because
+    nothing read the page's own account of which tracks Meet was handed. Every upstream counter
+    is perfect in this state: frames delivered on time, microphone unmuted, session ACTIVE.
+
+    ``micClonesIssued`` is the discriminator, and it is a *fact from the renderer* rather than
+    an inference from silence, so it needs neither a grace window nor another participant.
+    """
+
+    async def test_zero_mic_clones_is_reported_immediately(self) -> None:
+        watchdog = _watchdog(
+            StubBridge(page={"micClonesIssued": 0, "cameraClonesIssued": 1}), StubSource()
+        )
+        verdict = watchdog._assess({"micClonesIssued": 0, "cameraClonesIssued": 1})
+
+        assert verdict.state is ComponentState.DEGRADED
+        assert "microphone" in (verdict.detail or "")
+
+    async def test_it_does_not_wait_for_the_silence_grace_window(self) -> None:
+        """Distinct from the inbound-silence path, which needs both time and company."""
+        watchdog = _watchdog(StubBridge(others=0, page={"micClonesIssued": 0}), StubSource())
+        verdict = watchdog._assess({"micClonesIssued": 0})
+
+        # Alone in the meeting would otherwise report HEALTHY "alone in the meeting".
+        assert verdict.state is ComponentState.DEGRADED
+
+    async def test_a_published_microphone_is_not_a_fault(self) -> None:
+        watchdog = _watchdog(StubBridge(), StubSource())
+        verdict = watchdog._assess({"micClonesIssued": 1, "cameraClonesIssued": 1})
+
+        assert verdict.state is not ComponentState.DEGRADED
+
+    async def test_forcing_the_track_onto_the_sender_counts_as_published(self) -> None:
+        """The second route, and the one that rescues a session Meet never asked us for a
+        microphone. Reporting a fault here would flag a session that is working."""
+        watchdog = _watchdog(StubBridge(), StubSource())
+        verdict = watchdog._assess({"micClonesIssued": 0, "audioSendersForced": 1})
+
+        assert verdict.state is not ComponentState.DEGRADED
+
+    async def test_neither_route_is_the_fault(self) -> None:
+        watchdog = _watchdog(StubBridge(), StubSource())
+        verdict = watchdog._assess({"micClonesIssued": 0, "audioSendersForced": 0})
+
+        assert verdict.state is ComponentState.DEGRADED
+        assert "outbound sender" in (verdict.detail or "")
+
+    async def test_absent_page_stats_change_nothing(self) -> None:
+        """The hook is evidence when present, never a prerequisite — an older page, a
+        renderer mid-navigation, or ``--disable-injection`` must not manufacture a fault."""
+        watchdog = _watchdog(StubBridge(), StubSource())
+
+        assert watchdog._assess(None).state is not ComponentState.DEGRADED
+        assert watchdog._assess({}).state is not ComponentState.DEGRADED
+
+    async def test_a_page_stats_failure_never_breaks_the_loop(self) -> None:
+        """The component that notices silence must not be silenced by its own diagnostic."""
+
+        class ExplodingBridge(StubBridge):
+            async def page_stats(self) -> dict | None:
+                raise RuntimeError("page is gone")
+
+        watchdog = _watchdog(ExplodingBridge(), StubSource(), grace_s=0.01)
+        await watchdog.start()
+        try:
+            await asyncio.sleep(0.05)
+            assert watchdog.health().name == "google_meet_watchdog"
+        finally:
+            await watchdog.stop()

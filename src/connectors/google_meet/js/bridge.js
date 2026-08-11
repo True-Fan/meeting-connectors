@@ -155,6 +155,11 @@
     playoutNode: null,
     playoutStats: { underruns: 0, dropped: 0, buffered: 0 },
 
+    // In-flight graph builds. A boolean flag assigned *after* an await cannot stop a second
+    // caller entering, and two graphs mean the one Meet is attached to is the orphaned one.
+    captureBuild: null,
+    playoutBuild: null,
+
     canvas: null,
     canvasCtx: null,
     cameraTrack: null,
@@ -162,6 +167,18 @@
     videoFrames: 0,
     cameraClones: 0,
     micClones: 0,
+
+    // Outbound enforcement. `ourAudioTracks` is how a reconciliation pass tells a track it
+    // already installed from one Meet supplied itself, without which it would replace the
+    // track on every tick and renegotiate forever.
+    ourAudioTracks: new Set(),
+    // One clone reused for the session's outbound audio. Minting a new one per pass leaked a
+    // live track every two seconds whenever Meet contested ours.
+    sendTrack: null,
+    peerConnections: new Set(),
+    audioSendersForced: 0,
+    audioSendersSeen: 0,
+    forceErrors: 0,
 
     meetState: null,
     rosterSignature: '',
@@ -329,7 +346,32 @@
 
   // -------------------------------------------------- synthetic microphone
 
-  async function ensurePlayout() {
+  /*
+   * Build the playout graph once, even under concurrent callers.
+   *
+   * The obvious `if (state.playoutContext) return;` guard does not hold, because the flag is
+   * only assigned after two awaits. Two callers arriving in that window each build a whole
+   * graph: two AudioContexts, two worklet nodes, two destination streams. The last assignment
+   * wins, so `state.playoutNode` and `state.micTrack` come from the second graph -- while the
+   * track Meet was already handed belongs to the first, which nothing feeds any more. The
+   * avatar's first utterance plays and every one after it is silence.
+   *
+   * It only became likely when `superviseOutboundAudio` started calling this from an interval
+   * and from three connection events; before that the callers happened to be sequential.
+   * Memoising the promise makes concurrent callers await the same build, which is the property
+   * the flag was pretending to have. Cleared on failure so a transient error can be retried.
+   */
+  function ensurePlayout() {
+    if (!state.playoutBuild) {
+      state.playoutBuild = buildPlayout().catch((err) => {
+        state.playoutBuild = null;
+        throw err;
+      });
+    }
+    return state.playoutBuild;
+  }
+
+  async function buildPlayout() {
     if (state.playoutContext) {
       return;
     }
@@ -370,9 +412,153 @@
   function microphoneTrack() {
     if (state.micTrack && state.micTrack.readyState === 'live') {
       state.micClones += 1;
-      return state.micTrack.clone();
+      const clone = state.micTrack.clone();
+      state.ourAudioTracks.add(clone);
+      return clone;
     }
     return null;
+  }
+
+  /*
+   * Put the avatar's audio on the wire, whatever Meet decided to publish.
+   *
+   * `getUserMedia` interception is necessary but not sufficient. It only works if Meet asks
+   * us for the microphone, at a moment when we are ready to answer, and then keeps what we
+   * gave it. If Meet acquired a device before the patch installed, or asked only for video,
+   * or swapped our track out during a renegotiation, the avatar is inaudible and every other
+   * signal still reads healthy: PCM delivered, worklet rendering, track live, mic unmuted.
+   *
+   * The RTP sender is downstream of all of that and is the thing that actually decides what
+   * the meeting hears, so it is what gets enforced. `replaceTrack` needs no renegotiation
+   * when the kind is unchanged, so this is cheap and invisible to Meet's signalling.
+   *
+   * Transceivers rather than senders, because a sender whose track is null -- which is what
+   * Meet has while its microphone is muted -- carries no `kind` of its own. The receiver's
+   * track supplies it.
+   *
+   * **Only transceivers Meet intends to send on.** Direction is not a detail here. A
+   * `recvonly` audio transceiver is how another participant's voice arrives in this page, and
+   * attaching a send track to one flips it to `sendrecv`, which fires `negotiationneeded` and
+   * makes Meet renegotiate an m-line it never meant to send on -- taking the *receive*
+   * direction down with it. Doing that to every audio transceiver published the greeting once
+   * and then broke the conversation in both directions at once, which is the failure this
+   * filter exists to prevent.
+   */
+  function sendsAudio(transceiver) {
+    const direction = transceiver.direction || '';
+    if (direction !== 'sendrecv' && direction !== 'sendonly') {
+      return false;
+    }
+    const sent = transceiver.sender && transceiver.sender.track;
+    if (sent) {
+      return sent.kind === 'audio';
+    }
+    // A muted Meet leaves the sender's track null, so the kind has to come from the other
+    // half of the same m-line.
+    const received = transceiver.receiver && transceiver.receiver.track;
+    return !!received && received.kind === 'audio';
+  }
+
+  /*
+   * One clone for the session, reused.
+   *
+   * `microphoneTrack()` mints a fresh clone per call, which is right for `getUserMedia` and
+   * wrong for a loop that runs every two seconds: if Meet ever replaces our track back, a
+   * new live MediaStreamTrack is created on every pass and none are ever stopped. That grows
+   * without bound inside the renderer and starves the capture worklet, which is the other
+   * half of why audio stopped arriving from the meeting.
+   */
+  async function ensureSendTrack() {
+    await ensurePlayout();
+    const source = state.micTrack;
+    if (!source || source.readyState !== 'live') {
+      return null;
+    }
+    if (state.sendTrack && state.sendTrack.readyState === 'live') {
+      return state.sendTrack;
+    }
+    const clone = source.clone();
+    clone.enabled = true;
+    state.ourAudioTracks.add(clone);
+    state.sendTrack = clone;
+    return clone;
+  }
+
+  async function forceOutboundAudio(pc) {
+    if (!pc || pc.signalingState === 'closed' || typeof pc.getTransceivers !== 'function') {
+      return;
+    }
+
+    let seen = 0;
+    for (const transceiver of pc.getTransceivers()) {
+      const sender = transceiver.sender;
+      if (!sender || typeof sender.replaceTrack !== 'function' || !sendsAudio(transceiver)) {
+        continue;
+      }
+      seen += 1;
+
+      const current = sender.track;
+      // Already ours, and still usable. Replacing again would be churn.
+      if (current && state.ourAudioTracks.has(current) && current.readyState === 'live') {
+        continue;
+      }
+
+      const replacement = await ensureSendTrack();
+      if (!replacement) {
+        return;
+      }
+      try {
+        await sender.replaceTrack(replacement);
+        // Meet mutes by clearing `enabled` on the track it holds. It now holds ours, so its
+        // mute button keeps working -- but a track we just installed must start audible, or
+        // the avatar stays silent until someone toggles the button.
+        replacement.enabled = true;
+        state.audioSendersForced += 1;
+        report('audioSenderForced', {
+          replaced: current ? current.kind + ':' + current.id.slice(0, 8) : null,
+          hadTrack: !!current,
+          total: state.audioSendersForced,
+        });
+      } catch (err) {
+        state.forceErrors += 1;
+        report('audioSenderForceFailed', { error: String(err) });
+      }
+    }
+    // Assigned, not accumulated: this is how many sending audio transceivers exist right
+    // now, and a counter incremented by a loop that runs every two seconds would climb
+    // forever and mean nothing.
+    state.audioSendersSeen = seen;
+  }
+
+  /*
+   * Keep enforcing for the connection's life.
+   *
+   * One pass at creation is not enough: Meet's audio transceiver does not exist until
+   * negotiation, and Meet may replace the track again on a device change or an ICE restart.
+   * The events cover the normal cases and the interval covers the ones they miss, which is
+   * why both are here rather than either alone.
+   */
+  function superviseOutboundAudio(pc) {
+    const pump = () => {
+      forceOutboundAudio(pc).catch((err) => report('audioSenderForceFailed', {
+        error: String(err),
+      }));
+    };
+
+    for (const event of ['negotiationneeded', 'signalingstatechange', 'connectionstatechange']) {
+      pc.addEventListener(event, pump);
+    }
+
+    const timer = setInterval(() => {
+      if (pc.signalingState === 'closed') {
+        clearInterval(timer);
+        state.peerConnections.delete(pc);
+        return;
+      }
+      pump();
+    }, CONFIG.audioEnforceIntervalMs || 2000);
+
+    pump();
   }
 
   function pushPlayoutPcm(payload) {
@@ -467,7 +653,27 @@
 
   // ------------------------------------------------------- remote audio tap
 
-  async function ensureCapture() {
+  /*
+   * Same single-build guarantee as `ensurePlayout`, and needed for the same reason.
+   *
+   * `attachRemoteTrack` calls this once per remote audio track, straight from the `track`
+   * event. Two participants whose tracks arrive in the same tick both enter, both build a
+   * capture graph, and the first participant's source node stays connected to a mix that is no
+   * longer `state.captureMix` -- so that person is inaudible to the avatar with nothing
+   * reporting a fault. This race predates the outbound work; it is the inbound half of the same
+   * mistake.
+   */
+  function ensureCapture() {
+    if (!state.captureBuild) {
+      state.captureBuild = buildCapture().catch((err) => {
+        state.captureBuild = null;
+        throw err;
+      });
+    }
+    return state.captureBuild;
+  }
+
+  async function buildCapture() {
     if (state.captureContext) {
       return;
     }
@@ -570,7 +776,28 @@
     if (track.kind !== 'audio' || state.remoteTracks.has(track.id)) {
       return;
     }
-    await ensureCapture();
+    // Claimed before the await, not after it. The `has` check above and the `set` below used
+    // to sit on either side of `ensureCapture()`, which is the same check-then-await-then-
+    // assign shape as the graph builders had: two `track` events in one tick both pass the
+    // check, and the track ends up with two source nodes feeding the mix — double amplitude
+    // into a worklet that then clips, plus a duplicate <audio> sink. A placeholder makes the
+    // claim atomic with respect to the await.
+    state.remoteTracks.set(track.id, null);
+    try {
+      await ensureCapture();
+    } catch (err) {
+      state.remoteTracks.delete(track.id);
+      throw err;
+    }
+
+    // The track may have ended while the graph was being built, in which case `detach` already
+    // dropped our claim. Wiring it up now would leave a source node and an <audio> element for
+    // a dead track that no `ended` event will ever clean up.
+    if (!state.remoteTracks.has(track.id) || track.readyState === 'ended') {
+      state.remoteTracks.delete(track.id);
+      syncCaptureGraph();
+      return;
+    }
 
     const context = state.captureContext;
     const source = context.createMediaStreamSource(new MediaStream([track]));
@@ -598,11 +825,22 @@
   }
 
   function detachRemoteTrack(trackId) {
-    const entry = state.remoteTracks.get(trackId);
-    if (!entry) {
+    if (!state.remoteTracks.has(trackId)) {
       return;
     }
+    const entry = state.remoteTracks.get(trackId);
     state.remoteTracks.delete(trackId);
+
+    // A null entry is a claim staked by `attachRemoteTrack` before its await — a track that
+    // ended while its graph was still being built. There is nothing to unwire, and releasing
+    // the claim is the whole job. Returning early *without* deleting, as the `!entry` guard
+    // used to, left a phantom participant in `remoteTracks` for the rest of the session: the
+    // capture mix could then never be disconnected and the roster count never fell to zero.
+    if (!entry) {
+      syncCaptureGraph();
+      report('remoteAudioClaimReleased', { trackId, total: state.remoteTracks.size });
+      return;
+    }
     try {
       entry.source.disconnect();
     } catch (err) {
@@ -637,6 +875,12 @@
       pc.addEventListener('connectionstatechange', () =>
         report('pcState', { state: pc.connectionState })
       );
+
+      // The outbound half. Until this existed the tap was inbound-only, so nothing ever
+      // checked what Meet was actually sending — see `forceOutboundAudio`.
+      state.peerConnections.add(pc);
+      superviseOutboundAudio(pc);
+
       return pc;
     }
 
@@ -960,6 +1204,12 @@
     // means Meet is publishing something other than our canvas.
     cameraClonesIssued: state.cameraClones,
     micClonesIssued: state.micClones,
+    // The outbound truth, independent of whether Meet ever called getUserMedia:
+    // how many of Meet's audio senders we saw, and how many we put our track on.
+    audioSendersSeen: state.audioSendersSeen,
+    audioSendersForced: state.audioSendersForced,
+    peerConnections: state.peerConnections.size,
+    forceErrors: state.forceErrors,
     remoteTracks: state.remoteTracks.size,
     captureConnected: state.captureConnected,
     playout: state.playoutStats,

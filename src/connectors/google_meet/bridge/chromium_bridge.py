@@ -37,6 +37,7 @@ import contextlib
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from src.connectors.google_meet.audio_capture.mapping import to_audio_frame
 from src.connectors.google_meet.auth.google_login import attempt_password_login
@@ -89,6 +90,15 @@ wrong direction."""
 
 HEARTBEAT_INTERVAL_MS = 5_000
 DOM_SCAN_INTERVAL_MS = 2_000
+
+AUDIO_ENFORCE_INTERVAL_MS = 2_000
+"""How often the page re-checks that Meet's audio sender still carries the avatar's track.
+
+A reconciliation loop rather than a one-off, because Meet's audio transceiver does not exist
+until negotiation completes and Meet may swap the track again on a device change or an ICE
+restart. Each pass is a few property reads and replaces nothing when the track is already
+ours, so the interval is cheap; it exists to close the window between Meet creating a sender
+and anything noticing."""
 
 DriverFactory = Callable[[], BrowserDriver]
 RosterListener = Callable[[MeetRoster], None]
@@ -295,6 +305,36 @@ class ChromiumBridge:
             if self._live_channel() is None:
                 return ComponentHealth.unhealthy(COMPONENT_NAME, "page channel disconnected")
         return ComponentHealth(name=COMPONENT_NAME, state=self._state, detail=self._detail)
+
+    async def page_stats(self) -> dict[str, Any] | None:
+        """Read ``window.__MC_BRIDGE_STATS__()`` from the live page.
+
+        **The only window onto the outbound half of the media path.** Everything else this
+        connector reports is either upstream of the browser (frames delivered to the page) or
+        about inbound audio. Whether Meet is *publishing* our synthetic tracks is knowable
+        only from inside the renderer — and a headless browser has nothing to inspect.
+
+        ``bridge.js`` has exposed this hook since it was written and no Python code ever
+        called it, which left exactly one question unanswerable from the outside: an avatar
+        that joins, unmutes, is handed every frame on time, and cannot be heard. That is the
+        failure this returns the evidence for; ``micClonesIssued == 0`` means Meet never took
+        our microphone.
+
+        Returns ``None`` when the page is gone or the hook is absent, because a diagnostic
+        must never be the reason a session dies.
+        """
+        driver = self._driver
+        if driver is None:
+            return None
+        try:
+            stats = await driver.evaluate(
+                "(() => (typeof window.__MC_BRIDGE_STATS__ === 'function'"
+                " ? window.__MC_BRIDGE_STATS__() : null))()"
+            )
+        except Exception as exc:
+            logger.debug("meet_bridge.page_stats_unavailable", error=str(exc))
+            return None
+        return stats if isinstance(stats, dict) else None
 
     @property
     def meet_state(self) -> MeetState | None:
@@ -509,6 +549,7 @@ class ChromiumBridge:
             "captureFrameMs": CAPTURE_FRAME_MS,
             "publishSampleRateHz": self._config.publish_audio_format.sample_rate_hz,
             "playoutBufferSeconds": PLAYOUT_BUFFER_SECONDS,
+            "audioEnforceIntervalMs": AUDIO_ENFORCE_INTERVAL_MS,
             "videoWidth": video.width,
             "videoHeight": video.height,
             "videoFps": video.fps,
@@ -730,11 +771,7 @@ class ChromiumBridge:
                 # The page reports facts and never interprets them, so this is the layer
                 # that decides they are worth a log line at all.
                 body = message.json()
-                logger.debug(
-                    "meet_bridge.page_event",
-                    event=body.get("event"),
-                    detail=body.get("detail"),
-                )
+                self._log_page_event(body.get("event"), body.get("detail") or {})
             case MeetMessageType.READY:
                 # A second READY means the page rebuilt its media graph on its own — a
                 # same-page navigation, or a device revoked and reacquired. Adopt the new
@@ -745,6 +782,60 @@ class ChromiumBridge:
                 logger.warning(
                     "meet_bridge.unexpected_message", msg_type=message.msg_type.name
                 )
+
+    def _log_page_event(self, event: str | None, detail: dict[str, object]) -> None:
+        """Log one page diagnostic, promoting the one that explains a silent avatar.
+
+        ``getUserMedia`` is reported once per acquisition and is the only direct evidence of
+        whether **Meet is publishing our tracks at all**. Everything upstream of the browser
+        can look perfect — PCM delivered, worklet fed, microphone unmuted — while Meet
+        publishes a real (empty) device instead, because the patch is only installed after a
+        navigation and Meet may have already acquired media. The symptom is an avatar nobody
+        can hear, with no error anywhere.
+
+        At ``debug`` this sat alongside a roster line every two seconds and was easy to miss.
+        A once-per-join line earns ``info``, and a request that yielded no track of the kind
+        it asked for earns ``warning`` — that combination is the diagnosis, not a hint.
+        """
+        if event != "getUserMedia":
+            # ``page_event``, not ``event``. structlog's bound-logger methods take the message
+            # as a parameter literally named ``event``, so passing ``event=`` as a keyword
+            # raises ``TypeError: meth() got multiple values for argument 'event'``.
+            #
+            # It stayed hidden because a *disabled* level is replaced by a no-op that swallows
+            # any keywords — so at INFO this line was free, and at DEBUG it killed the bridge's
+            # read loop on the first page event. That is fatal well beyond a lost log line: the
+            # read loop is the media channel, so both directions stop, the session sits
+            # ``degraded`` with a live browser, and its teardown then raises the same
+            # ``TypeError`` — which is how a DELETE fails.
+            logger.debug("meet_bridge.page_event", page_event=event, detail=detail)
+            return
+
+        wanted_audio = bool(detail.get("audio"))
+        wanted_video = bool(detail.get("video"))
+        tracks = detail.get("tracks")
+        expected = int(wanted_audio) + int(wanted_video)
+
+        if isinstance(tracks, int) and tracks < expected:
+            logger.warning(
+                "meet_bridge.get_user_media_incomplete",
+                audio=wanted_audio,
+                video=wanted_video,
+                tracks=tracks,
+                expected=expected,
+                note="Meet asked for media and we handed back fewer tracks than it asked "
+                "for; it is publishing a real empty device instead, so the avatar will be "
+                "silent and/or blank. Check that the playout worklet started.",
+            )
+            return
+
+        logger.info(
+            "meet_bridge.get_user_media",
+            audio=wanted_audio,
+            video=wanted_video,
+            tracks=tracks,
+            note="Meet is publishing the avatar's synthetic tracks",
+        )
 
     def _on_audio(self, message: MeetMessage) -> None:
         try:

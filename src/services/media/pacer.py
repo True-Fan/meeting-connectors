@@ -39,6 +39,37 @@ VIDEO_LATE_TOLERANCE_US = 40_000
 AUDIO_LATE_TOLERANCE_US = 100_000
 """Audio is more tolerant than video: a gap is audible, a slightly late frame is not."""
 
+SILENCE_FLOOR = 512
+"""Peak ``|sample|`` at or above which published audio counts as sound, on int16's 32767
+scale (≈ -36 dBFS). Comfortably above lossy-decode noise — silence through AAC does not come
+back as exact zeros — and far below speech."""
+
+_ENERGY_STRIDE = 8
+"""Sample every eighth sample when testing for energy. 120 samples of a 20 ms frame at 48 kHz
+is ample to tell speech from silence, and the gate's hangover covers the one frame a
+missed onset could delay it by."""
+
+
+def _is_audible(pcm: bytes, *, floor: int = SILENCE_FLOOR, stride: int = _ENERGY_STRIDE) -> bool:
+    """Whether this PCM carries sound rather than silence.
+
+    Not a voice activity detector and not a speech decision — just "did we emit any energy",
+    which is the only question the echo gate needs answered. Returns on the first loud
+    sample, so speech costs almost nothing to detect.
+
+    Assumes native-endian int16, which ``SampleFormat.S16LE`` is on every supported
+    platform.
+    """
+    usable = len(pcm) - len(pcm) % 2
+    if not usable:
+        return False
+    samples = memoryview(pcm)[:usable].cast("h")
+    for index in range(0, len(samples), stride):
+        sample = samples[index]
+        if sample >= floor or sample <= -floor:
+            return True
+    return False
+
 
 class Pacer:
     """Paces decoded and idle media into a ``MediaSink``."""
@@ -232,11 +263,24 @@ class Pacer:
         started = self._clock.now_us()
         await self._sink.publish_audio(frame)
         self._published_audio += 1
-        self._speaking = not is_idle
 
-        # Close the echo loop: publishing real avatar audio arms the gate so the
+        # Close the echo loop: publishing *audible* avatar audio arms the gate so the
         # mixed-back copy arriving through RTMS is suppressed (doc 003 §3.3).
-        if not is_idle and self._echo_guard is not None:
+        #
+        # **The audibility test is what makes the gate reopen.** Arming on ``not is_idle``
+        # alone assumed the avatar streams only while speaking — but the contract in
+        # ``domain.avatar`` is a *continuously* streamed fMP4, so the decoder produces a frame
+        # every 20 ms forever, ``is_idle`` is never True, and the gate stayed armed for the
+        # rest of the session. Inbound audio was then suppressed permanently: the avatar
+        # heard the first couple of seconds of a meeting and nothing ever again. Observed
+        # exactly that way against a live agent — the router forwarded 124 frames and then
+        # froze there for two minutes while the meeting carried on.
+        #
+        # Silence cannot echo, so there is nothing to defend against while publishing it.
+        # That makes energy the correct trigger rather than mere frame arrival.
+        audible = not is_idle and _is_audible(frame.pcm)
+        self._speaking = audible
+        if audible and self._echo_guard is not None:
             self._echo_guard.note_publishing(self._clock.now_us())
 
         self._record_publish(frame.pts_us, started, kind="audio", is_idle=is_idle)
