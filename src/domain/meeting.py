@@ -72,6 +72,39 @@ class ChatMessage:
 
 
 @dataclass(frozen=True, slots=True)
+class HandRaise:
+    """One participant asking for the floor.
+
+    Platform-neutral for the same reason ``ChatMessage`` is: Meet renders a hand indicator in
+    the DOM, Zoom raises an SDK event, Teams reports it over Graph, and none of them agree on
+    the shape. What is common is *who* wants to speak and *when* we learned of it.
+
+    **Why this is not a ``ChatMessage`` with different text.** A chat message is a question
+    waiting its turn; a raised hand is a request to take the turn *now*, and the two produce
+    opposite behaviour in the router — one is forwarded and answered when the avatar next
+    pauses, the other interrupts whatever the avatar is saying. Modelling them as one type
+    would mean a boolean on ``ChatMessage`` that every consumer has to branch on, which is the
+    same thing with the distinction hidden.
+
+    ``prompt`` is what the agent is told, rendered by the connector rather than built here,
+    because the wording is deployment policy — see ``GoogleMeetSettings.hand_raise_prompt``.
+    """
+
+    participant: str | None = None
+    """Display name of whoever raised their hand, when the platform attributes it."""
+
+    prompt: str = ""
+    """What the agent receives. Empty is not forwarded — see ``AvatarClient.send_interrupt``."""
+
+    raised_at_us: int = 0
+    """Bridge-side receipt time, on the session's media clock."""
+
+    is_self: bool = False
+    """True when the avatar's own account raised it. Never forwarded: an avatar interrupting
+    itself is the barge-in version of an echo loop."""
+
+
+@dataclass(frozen=True, slots=True)
 class MeetingContext:
     """Everything needed to attach to one meeting."""
 

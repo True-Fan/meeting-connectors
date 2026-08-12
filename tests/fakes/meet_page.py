@@ -442,6 +442,17 @@ class FakePage:
             )
         )
 
+    async def send_hand_raise(
+        self, *, participant_id: str = "p1", name: str | None = "Priya", is_self: bool = False
+    ) -> None:
+        """Report a hand going up, the way the page's observer does on the edge."""
+        await self._send(
+            encode_json(
+                MeetMessageType.HAND_RAISE,
+                {"id": participant_id, "name": name, "isSelf": is_self},
+            )
+        )
+
     async def send_error(self, code: str, message: str, *, fatal: bool = False) -> None:
         await self._send(
             encode_json(

@@ -31,6 +31,7 @@ from src.connectors.google_meet.exceptions import (
     MeetConfigurationError,
     MeetUrlError,
 )
+from src.connectors.google_meet.meeting.hand_raise import MeetHandRaiseSource
 from src.connectors.google_meet.websocket.protocol import MeetState, encode_audio, encode_video
 from src.domain.context import FrameContext
 from src.domain.health import ComponentState
@@ -507,6 +508,51 @@ class TestRoster:
             await bridge.start(meeting)
             await driver.page.send_participants(["Alice"])  # type: ignore[union-attr]
             await _wait_for(lambda: seen == [1])
+        finally:
+            await bridge.stop()
+
+
+# --------------------------------------------------------------------------- #
+# Raised hands
+# --------------------------------------------------------------------------- #
+
+
+class TestHandRaise:
+    """The page → source plumbing, which nothing else covers.
+
+    ``MeetHandRaiseSource`` is unit-tested against payloads and the router leg is tested
+    against events. Between the two sits the read loop's dispatch, and a message type that
+    never reaches an attached source looks exactly like a meeting where nobody raised a hand.
+    """
+
+    async def test_a_reported_hand_reaches_the_attached_source(
+        self, meet_config, meeting, frame_ctx
+    ) -> None:
+        driver = joined_driver(auto_page=True)
+        bridge = _bridge(meet_config, driver, frame_ctx)
+        hands = MeetHandRaiseSource(clock=MediaClock())
+        bridge.attach_hand_raise(hands)
+        try:
+            await bridge.start(meeting)
+            await driver.page.send_hand_raise(name="Priya")  # type: ignore[union-attr]
+            await _wait_for(lambda: hands.received == 1)
+        finally:
+            await bridge.stop()
+
+    async def test_a_hand_with_no_source_attached_is_harmless(
+        self, meet_config, meeting, frame_ctx
+    ) -> None:
+        """A session with the feature disabled attaches nothing, and the read loop is the
+        media channel — dropping the message must cost it nothing."""
+        driver = joined_driver(auto_page=True)
+        bridge = _bridge(meet_config, driver, frame_ctx)
+        try:
+            await bridge.start(meeting)
+            await driver.page.send_hand_raise()  # type: ignore[union-attr]
+            await driver.page.send_participants(["Alice"])  # type: ignore[union-attr]
+            # The roster still lands, so the read loop survived the unhandled message.
+            await _wait_for(lambda: bridge.roster.count == 1)
+            assert bridge.health().state is not ComponentState.UNHEALTHY
         finally:
             await bridge.stop()
 

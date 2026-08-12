@@ -132,6 +132,18 @@ class MeetMessageType(IntEnum):
     makes no decision about whether the avatar should answer — that is the bridge's call, and
     it is where the self-message filter lives."""
 
+    HAND_RAISE = 0x0D
+    """Page → bridge. A participant just raised their hand.
+
+    **Edge-triggered, and that is the whole contract.** Meet renders a hand as a *state* — an
+    indicator that stays on the tile until it is lowered — and the page re-renders it on
+    nearly every mutation. What the avatar has to react to is the moment it goes up, so the
+    page reports transitions and holds the current set itself; a level signal would arrive
+    dozens of times per raised hand and the bridge would have to reconstruct the edge anyway.
+
+    The page reports ``{id, name, isSelf}`` and makes no decision about whether to interrupt.
+    Like ``CHAT_MESSAGE``, that judgement is the bridge's — see ``meeting/hand_raise.py``."""
+
     PAGE_EVENT = 0x0B
     """Page → bridge. Raw diagnostics — a track ended, the peer connection
     renegotiated, a device was revoked.

@@ -518,3 +518,193 @@ class TestChatCapture:
         guaranteed not to be stable."""
         assert "function chatMessageId(node, text)" in bridge_code
         assert "|${index}" not in bridge_code
+
+
+class TestHandRaiseCapture:
+    """Noticing that somebody wants to speak, so the avatar can stop and hand over.
+
+    Meet exposes no hand-raise API either, so this is the DOM again — but the failure mode is
+    the opposite of chat's. Chat fails silently by reading nothing; this fails *loudly*, by
+    reading the same raised hand on every re-render and interrupting the avatar continuously.
+    Everything here is about the edge.
+    """
+
+    def test_hand_scanning_is_driven_by_the_existing_observer(self, bridge_code: str) -> None:
+        """Reusing the coalesced mutation scan rather than adding a third timer."""
+        assert "scanHands()" in bridge_code
+
+    def test_a_raised_hand_is_reported_on_its_edge_not_its_presence(
+        self, bridge_code: str
+    ) -> None:
+        """Meet renders a hand as a state that persists until it is lowered, and re-renders it
+        constantly. Reporting presence would send the same hand dozens of times a second, and
+        every one of them would interrupt the avatar mid-sentence."""
+        scan = bridge_code.split("function scanHands()", 1)[1].split("function scanRoster", 1)[0]
+        assert "state.handsUp.has(candidate.key)" in scan, (
+            "a hand already up must not be re-reported"
+        )
+        assert "state.handsUp = current" in scan, (
+            "the current set must replace the old one, or a lowered hand could never be "
+            "raised again"
+        )
+
+    def test_a_hand_is_recognised_by_wording_rather_than_by_markup(
+        self, bridge_code: str
+    ) -> None:
+        """The fix for a live meeting where the attribute selectors matched nothing at all —
+        the same failure the chat button had, and the same remedy. Meet's class names and
+        `jsname` attributes are build artefacts; the words it shows a human are the most
+        durable thing on the page."""
+        assert "HAND_TRIGGERS" in bridge_code
+        assert "raised their hand" in bridge_code
+        assert "'[aria-label], [data-tooltip]'" in bridge_code
+
+    def test_the_text_of_the_page_is_read_and_not_only_its_labels(
+        self, bridge_code: str
+    ) -> None:
+        """**The second live run is what this encodes.** With a participant's hand up, the
+        page reported exactly one label containing "hand" — the avatar's own toolbar button.
+        Meet marks the raised hand with an icon-font glyph on the tile, and an icon glyph is a
+        *text node* holding the glyph's name. No label, no attribute, nothing a selector or a
+        label sweep can reach.
+        """
+        assert "HAND_ICONS" in bridge_code
+        assert "front_hand" in bridge_code
+        assert "createTreeWalker" in bridge_code
+        assert "NodeFilter.SHOW_TEXT" in bridge_code
+
+    def test_the_text_walk_does_not_force_layout_and_is_bounded(
+        self, bridge_code: str
+    ) -> None:
+        """It runs beside a live media path. ``innerText`` on the document would force a
+        reflow every sweep, and an unbounded walk over a page Meet is still building shows up
+        as dropped frames rather than as an error."""
+        # ``bridge_code`` has its comments stripped, so the next ``function`` is the boundary.
+        walk = bridge_code.split("function handTextWalk(", 1)[1].split("\n  function ", 1)[0]
+        assert "innerText" not in walk
+        assert "seen < 6000" in walk
+
+    def test_the_icon_glyph_only_counts_inside_a_participant(self, bridge_code: str) -> None:
+        """The identical glyph sits in our own "Raise hand" toolbar button, which exists in
+        every meeting from the moment we join. Requiring a participant container is the whole
+        difference between reading a raised hand and raising one at ourselves."""
+        block = bridge_code.split("handTextWalk((text, parent) => {", 1)[1].split(
+            "return found;", 1
+        )[0]
+        assert "HAND_ICONS.indexOf" in block
+        assert "handResolve(parent, null, 'icon'" in block
+        # handResolve returns null without a holder, which is what enforces it.
+        resolve = bridge_code.split("function handResolve(", 1)[1].split("\n  function ", 1)[0]
+        assert "if (!key) {" in resolve
+
+    def test_the_controls_and_the_panel_heading_cannot_trigger_it(
+        self, bridge_code: str
+    ) -> None:
+        """Each of these contains a trigger phrase as a substring and is present in every
+        meeting: "Raise hand" is the toolbar control, "Lower hand" is what it becomes, and
+        "Raised hands" is the people panel's heading. Matching any of them would interrupt the
+        avatar continuously, for a hand nobody raised."""
+        assert "HAND_EXCLUDE" in bridge_code
+        for phrase in ("'raise hand'", "'lower hand'", "'raised hands'"):
+            assert phrase in bridge_code, f"{phrase} must be excluded"
+
+    def test_an_unattributable_trigger_is_skipped_rather_than_keyed(
+        self, bridge_code: str
+    ) -> None:
+        """A label that reads like a raised hand but names nobody and sits in no participant
+        would otherwise get a constant key, reappear on every scan, and interrupt forever. A
+        missed hand is much cheaper than that."""
+        block = bridge_code.split("function handResolve(", 1)[1].split("\n  function ", 1)[0]
+        assert "if (!key) {" in block
+        assert "'anonymous'" not in block
+
+    def test_the_sweep_is_rate_limited_independently_of_the_scan(
+        self, bridge_code: str
+    ) -> None:
+        """It reads every labelled element on the page, and the scan is driven by Meet's
+        mutations — which never stop."""
+        from src.connectors.google_meet.bridge.chromium_bridge import HAND_RAISE_SWEEP_MS
+
+        assert HAND_RAISE_SWEEP_MS > 0
+        assert "handRaiseSweepMs" in bridge_code
+        assert "state.handsLastSweepAt" in bridge_code
+
+    def test_finding_nothing_is_reported_with_the_labels_the_page_does_have(
+        self, bridge_code: str
+    ) -> None:
+        """Silent failure is what made the first attempt useless in a live meeting: no hand
+        event, no error, nothing to read. Guessing Meet's wording from the outside cost the
+        chat button two rounds; reporting what is actually on the page replaces the next
+        guess with a reading."""
+        from src.connectors.google_meet.bridge.chromium_bridge import HAND_RAISE_DIAG_MS
+
+        assert HAND_RAISE_DIAG_MS > 0
+        assert "handRaiseNothingSeen" in bridge_code
+        assert "labelsWithHand" in bridge_code
+        # Bounded: a meeting where nobody raises a hand is the normal case.
+        assert "state.handsDiagnostics < 4" in bridge_code
+
+    def test_arming_is_announced_so_a_live_log_shows_the_feature_running(
+        self, bridge_code: str
+    ) -> None:
+        """The first question when a raised hand produces nothing is whether the code is even
+        installed, and a log with no line for it cannot answer that."""
+        assert "'handsArmed'" in bridge_code
+
+    def test_a_flickering_indicator_cannot_produce_a_burst(self, bridge_code: str) -> None:
+        """A hand that momentarily disappears during a re-render would otherwise read as a
+        lower followed by a raise, which is a new edge and a second interrupt."""
+        from src.connectors.google_meet.bridge.chromium_bridge import HAND_RAISE_COOLDOWN_MS
+
+        assert HAND_RAISE_COOLDOWN_MS > 0
+        assert "handsLastSentAt" in bridge_code
+        assert "handRaiseCooldownMs" in bridge_code
+
+    def test_hands_already_up_on_arrival_are_not_interruptions(
+        self, bridge_code: str
+    ) -> None:
+        """The avatar had not said anything yet, so there is nothing for them to interrupt.
+        Without this the avatar's first act would be to yield the floor to everyone at once."""
+        from src.connectors.google_meet.bridge.chromium_bridge import HAND_RAISE_BASELINE_MS
+
+        assert HAND_RAISE_BASELINE_MS > 0
+        assert "handsBaselineUntil" in bridge_code
+        assert "handRaiseBaselineMs" in bridge_code
+
+    def test_hands_are_only_scanned_once_admitted(self, bridge_code: str) -> None:
+        """The pre-join screen has no participants, and arming there would spend the baseline
+        window before anybody could raise anything — the bug chat had, not repeated."""
+        scan = bridge_code.split("function scanHands()", 1)[1].split("function scanRoster", 1)[0]
+        assert "state.meetState !== 'joined'" in scan
+
+    def test_hand_raises_can_be_switched_off_from_python(self, bridge_code: str) -> None:
+        """A meeting where the avatar should hold the floor — a presentation, a read-out."""
+        assert "CONFIG.handRaiseEnabled" in bridge_code
+
+    def test_the_page_reports_authorship_but_does_not_act_on_it(
+        self, bridge_code: str
+    ) -> None:
+        """Same split as chat: the page can see whose row it is, and Python decides what that
+        means. The self filter lives in ``MeetHandRaiseSource`` and ``send_interrupt``."""
+        scan = bridge_code.split("function scanHands()", 1)[1].split("function scanRoster", 1)[0]
+        assert "isSelf" in scan
+
+    def test_the_hand_selectors_reach_the_page(self) -> None:
+        """A selector defined in Python but absent from ``to_page_config`` is dead code that
+        looks live."""
+        from src.connectors.google_meet.automation.selectors import DEFAULT_SELECTORS
+
+        config = DEFAULT_SELECTORS.to_page_config()
+        assert config.get("handRaised"), "handRaised never reaches bridge.js"
+
+    def test_the_selectors_match_a_raised_hand_and_not_the_raise_button(self) -> None:
+        """Every meeting has a "Raise hand" button in its control bar. A selector that matched
+        it would fire in every meeting, immediately, for a hand nobody raised — Meet's labels
+        state the *action* on a control and the *state* on an indicator, which is the same
+        asymmetry ``mute_toggle`` depends on."""
+        from src.connectors.google_meet.automation.selectors import DEFAULT_SELECTORS
+
+        for selector in DEFAULT_SELECTORS.hand_raised:
+            lowered = selector.lower()
+            assert '"raise hand' not in lowered, selector
+            assert "*=\"raise " not in lowered, selector

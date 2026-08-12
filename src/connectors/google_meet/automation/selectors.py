@@ -201,6 +201,35 @@ class MeetSelectors:
     """Attribution, read from the message's own subtree. Optional: an unattributed question is
     still worth answering, so a miss here degrades to ``sender=None`` rather than dropping."""
 
+    # -- raised hands ------------------------------------------------------
+    hand_raised: tuple[str, ...] = (
+        "[data-participant-id][data-hand-raised]",
+        "[data-hand-raised='true']",
+        '[aria-label*="raised their hand" i]',
+        '[aria-label*="has their hand raised" i]',
+        '[aria-label*="hand is raised" i]',
+        '[aria-label*="hand raised" i]',
+        '[data-tooltip*="raised their hand" i]',
+    )
+    """Anything that says a participant's hand is up.
+
+    Deliberately several, and deliberately overlapping: Meet draws this in more than one place
+    at once — on the speaker tile, in the participant list, and as a notification — and which
+    of them exists depends on the layout, whether the people panel is open, and how many
+    participants there are. Matching the same hand from two selectors costs nothing, because
+    ``bridge.js`` keys hands by participant and reports each one's *transition* rather than its
+    presence.
+
+    The attribute candidates first because they are structural and carry the participant id.
+    The ARIA ones are the durable fallback: Meet has reworded this label, but every wording so
+    far has contained "hand raised" or "raised their hand", and a substring match survives a
+    rewording that an equality match does not.
+
+    **No candidate here matches the avatar's own hand-raise button.** That control is labelled
+    with the action ("Raise hand"), not the state, which is what keeps this from firing on a
+    button that is merely present in every meeting — the same asymmetry ``mute_toggle`` relies
+    on, and the reason "raise hand" is absent from this list while "raised hand" is in it."""
+
     # -- terminal states, by visible text ---------------------------------
     lobby_text: tuple[str, ...] = ("asking to join", "waiting for someone to let you in")
     denied_text: tuple[str, ...] = (
@@ -238,6 +267,7 @@ class MeetSelectors:
             "chatPanel": list(self.chat_panel),
             "chatMessage": list(self.chat_message),
             "chatSender": list(self.chat_sender),
+            "handRaised": list(self.hand_raised),
             "lobbyText": list(self.lobby_text),
             "deniedText": list(self.denied_text),
             "ejectedText": list(self.ejected_text),

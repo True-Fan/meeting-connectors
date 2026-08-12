@@ -55,6 +55,7 @@ from src.connectors.google_meet.exceptions import (
 from src.connectors.google_meet.js import load_assets
 from src.connectors.google_meet.meeting.chat import MeetChatSource
 from src.connectors.google_meet.meeting.controls import MeetControls
+from src.connectors.google_meet.meeting.hand_raise import MeetHandRaiseSource
 from src.connectors.google_meet.meeting.join import MeetJoiner
 from src.connectors.google_meet.meeting.meet_url import resolve_join_target
 from src.connectors.google_meet.meeting.participants import MeetRoster, parse_roster
@@ -119,6 +120,37 @@ CHAT_OPEN_RETRY_MS = 1_500
 Without it the mutation-driven scan would click many times a second, which fights Meet's own
 layout work and can toggle a panel back shut as fast as it opens."""
 
+HAND_RAISE_BASELINE_MS = 3_000
+"""How long after being admitted a hand that is already up counts as pre-existing.
+
+Somebody whose hand was up before the avatar walked in is not interrupting it — it had not
+said anything yet. Without this the first scan after joining would report every raised hand in
+the room at once and the avatar would open by yielding the floor to all of them."""
+
+HAND_RAISE_SWEEP_MS = 500
+"""How often the page sweeps every labelled element looking for a raised hand.
+
+The narrow selector pass runs on every scan; this is the broad one that actually finds it when
+Meet's markup has moved, and it reads a few hundred elements. Twice a second is far faster than
+anybody notices a hand going up and far cheaper than running it per animation frame — Meet
+mutates the DOM continuously, and the scan is driven by those mutations."""
+
+HAND_RAISE_DIAG_MS = 20_000
+"""How long to wait before reporting that no raised hand has been seen, and what the page does
+have.
+
+Emitted at most four times, and only while nothing has ever been detected. This is the lesson
+from the chat button, which cost two rounds of guessing Meet's ARIA labels from the outside:
+when a DOM-reading feature finds nothing, the useful artefact is the list of labels that *are*
+on the page. Silent failure is the one outcome worth spending log lines to avoid."""
+
+HAND_RAISE_COOLDOWN_MS = 5_000
+"""Minimum gap between reports of the *same* participant's hand, applied in the page.
+
+The page's floor, not the policy: ``MeetHandRaiseSource`` holds the real cooldown, because a
+rate limit that survives a rejoin has to live in Python. This one exists so a DOM re-render
+that momentarily drops the indicator cannot put a burst on the wire in the first place."""
+
 AUDIO_ENFORCE_INTERVAL_MS = 2_000
 """How often the page re-checks that Meet's audio sender still carries the avatar's track.
 
@@ -161,6 +193,7 @@ class ChromiumBridge:
         "_detail",
         "_driver",
         "_driver_factory",
+        "_hands",
         "_inbound",
         "_lease",
         "_malformed_audio",
@@ -217,6 +250,7 @@ class ChromiumBridge:
         # constructed, so a chat-disabled session carries no chat surface at all — the same
         # shape ``MeetingService`` uses for an unconfigured connector.
         self._chat: MeetChatSource | None = None
+        self._hands: MeetHandRaiseSource | None = None
 
         self._inbound: BoundedFrameQueue[AudioFrame] = BoundedFrameQueue(
             name="google_meet_inbound",
@@ -346,6 +380,14 @@ class ChromiumBridge:
         consumes chat, and so a session with chat disabled never creates the queue.
         """
         self._chat = chat
+
+    def attach_hand_raise(self, hands: MeetHandRaiseSource) -> None:
+        """Route observed raised hands into ``hands``.
+
+        Injected for the same reason chat is: the bridge stays ignorant of who consumes the
+        events, and a session with the feature off never creates the surface.
+        """
+        self._hands = hands
 
     async def page_stats(self) -> dict[str, Any] | None:
         """Read ``window.__MC_BRIDGE_STATS__()`` from the live page.
@@ -595,6 +637,11 @@ class ChromiumBridge:
             "chatOpenWindowMs": CHAT_OPEN_WINDOW_MS,
             "chatOpenRetryMs": CHAT_OPEN_RETRY_MS,
             "chatBaselineMs": CHAT_BASELINE_MS,
+            "handRaiseEnabled": self._config.hand_raise_enabled,
+            "handRaiseBaselineMs": HAND_RAISE_BASELINE_MS,
+            "handRaiseCooldownMs": HAND_RAISE_COOLDOWN_MS,
+            "handRaiseSweepMs": HAND_RAISE_SWEEP_MS,
+            "handRaiseDiagMs": HAND_RAISE_DIAG_MS,
             "videoWidth": video.width,
             "videoHeight": video.height,
             "videoFps": video.fps,
@@ -814,6 +861,8 @@ class ChromiumBridge:
                 self._on_error(message)
             case MeetMessageType.CHAT_MESSAGE:
                 self._on_chat(message)
+            case MeetMessageType.HAND_RAISE:
+                self._on_hand_raise(message)
             case MeetMessageType.PAGE_EVENT:
                 # The page reports facts and never interprets them, so this is the layer
                 # that decides they are worth a log line at all.
@@ -847,6 +896,21 @@ class ChromiumBridge:
         except Exception as exc:
             logger.warning("meet_bridge.chat_dropped", error=str(exc))
 
+    def _on_hand_raise(self, message: MeetMessage) -> None:
+        """Hand one observed raised hand to the hand-raise source.
+
+        Synchronous and total, like ``_on_chat``: this runs inside the read loop, and a
+        malformed payload must not cost the meeting its audio in both directions.
+        """
+        hands = self._hands
+        if hands is None:
+            return
+        try:
+            body = message.json()
+            hands.offer(body, event_id=str(body.get("id") or "") or None)
+        except Exception as exc:
+            logger.warning("meet_bridge.hand_raise_dropped", error=str(exc))
+
     def _log_page_event(self, event: str | None, detail: dict[str, object]) -> None:
         """Log one page diagnostic, promoting the one that explains a silent avatar.
 
@@ -861,6 +925,49 @@ class ChromiumBridge:
         A once-per-join line earns ``info``, and a request that yielded no track of the kind
         it asked for earns ``warning`` — that combination is the diagnosis, not a hint.
         """
+        if event == "handRaiseNothingSeen":
+            # **Warning, and the highest-value line in this file when it appears.** It means the
+            # page has been watching for a raised hand and has not recognised one — which is
+            # indistinguishable, from every other signal the connector produces, from a meeting
+            # where nobody raised their hand. The labels it carries are what Meet actually
+            # renders, so the fix is a selector edit made from a reading rather than a guess.
+            logger.warning(
+                "meet_bridge.hand_raise_not_seen",
+                seconds=detail.get("seconds"),
+                labels_with_hand=detail.get("labelsWithHand"),
+                # Text and icons as well as labels, and that is the lesson from the first live
+                # run: it reported one label — our own toolbar button — while a participant's
+                # hand was up, which is what proved the signal was not in the labels at all.
+                # Meet marks the tile with an icon-font glyph, and a glyph is a text node.
+                text_with_hand=detail.get("textWithHand"),
+                icons_seen=detail.get("iconsSeen"),
+                # Zero here means the tiles are not in the DOM at all, which is a different
+                # problem from a wording miss and would otherwise look identical.
+                participant_nodes=detail.get("participantNodes"),
+                note="no raised hand recognised yet; if somebody did raise one, this is "
+                "everything the page shows that mentions a hand",
+            )
+            return
+
+        if event == "handsArmed":
+            # Info rather than debug: this answers "is the feature even running", which is the
+            # first question when a raised hand produces nothing — asked at exactly the moment
+            # nobody wants to re-run the meeting at debug level.
+            logger.info("meet_bridge.hand_raise_armed", selectors=detail.get("selectors"))
+            return
+
+        if event == "handRaise":
+            # Fields named explicitly rather than splatted: ``detail`` is page-supplied, and a
+            # key called ``event`` would collide with structlog's own parameter and raise
+            # inside the read loop — the failure this file already documents once.
+            logger.info(
+                "meet_bridge.hand_raise_seen",
+                participant=detail.get("name"),
+                matched_by=detail.get("how"),
+                is_self=detail.get("self"),
+            )
+            return
+
         if event != "getUserMedia":
             # ``page_event``, not ``event``. structlog's bound-logger methods take the message
             # as a parameter literally named ``event``, so passing ``event=`` as a keyword

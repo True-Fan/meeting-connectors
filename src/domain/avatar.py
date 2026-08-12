@@ -68,7 +68,13 @@ AVATAR_PROTOCOL_VERSION = AvatarProtocolVersion(major=1, minor=1)
 Raised from ``1.0`` to add inbound chat (``AvatarChatMessage``), which is *additive*: the
 frame is new, nothing existing changed shape. That is precisely what the minor version is
 for, and why the compatibility rule above only pins the major. A ``1.0`` agent negotiates
-down, never receives a chat frame, and behaves exactly as it did before."""
+down, never receives a chat frame, and behaves exactly as it did before.
+
+**Raised hands did not raise this again, deliberately.** A dedicated ``interrupt`` frame was
+written first and reverted: it required the agent to learn a second frame kind before a raised
+hand could do anything at all, and the agent that exists today understands ``chat``. Delivering
+the hand as a chat message means the feature works against an unmodified agent — see
+``AvatarClient.send_hand_raise``."""
 
 AVATAR_CHAT_MIN_VERSION = AvatarProtocolVersion(major=1, minor=1)
 """The version that introduced chat. Below this, chat is withheld rather than sent and

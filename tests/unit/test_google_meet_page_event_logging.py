@@ -98,6 +98,9 @@ class TestEveryPageEventSurvivesDebugLogging:
             "audioSenderForceFailed",
             "stages",
             "getUserMedia",
+            "handsArmed",
+            "handRaise",
+            "handRaiseNothingSeen",
             None,
         ],
     )
@@ -116,6 +119,53 @@ class TestEveryPageEventSurvivesDebugLogging:
 
     def test_an_empty_detail_is_safe(self, debug_logging: None) -> None:
         ChromiumBridge._log_page_event(None, "pcState", {})  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        ("event", "detail"),
+        [
+            ("handsArmed", {"selectors": 7}),
+            ("handRaise", {"name": "Priya", "how": "live", "self": False}),
+            ("handRaiseNothingSeen", {"seconds": 20, "labelsWithHand": ["Raise hand"]}),
+        ],
+    )
+    def test_the_hand_raise_events_are_visible_above_debug(
+        self, event: str, detail: dict, capsys
+    ) -> None:
+        """They are promoted out of the debug stream deliberately.
+
+        Every other page event is a fact about the media path that only matters when
+        something is already being investigated. These three answer "is the feature running",
+        "did the page see the hand" and "it has seen nothing, and here is what the page
+        actually says" — questions asked precisely when a raised hand did nothing, which is
+        the worst moment to discover the answer needed a re-run at debug level.
+        """
+        configure_logging(
+            ObservabilitySettings(log_level="INFO", json_logs=True), env=Environment.LOCAL
+        )
+        try:
+            ChromiumBridge._log_page_event(None, event, detail)  # type: ignore[arg-type]
+            assert capsys.readouterr().out.strip(), f"{event} was swallowed at INFO"
+        finally:
+            configure_logging(
+                ObservabilitySettings(log_level="WARNING", json_logs=True),
+                env=Environment.LOCAL,
+            )
+
+    def test_finding_no_hands_is_a_warning_carrying_the_page_labels(self, capsys) -> None:
+        """A silent feature is the failure mode this whole diagnostic exists for, so it has to
+        clear a WARNING-level log — and it has to carry the labels, because without them the
+        next selector fix is another guess."""
+        configure_logging(
+            ObservabilitySettings(log_level="WARNING", json_logs=True), env=Environment.LOCAL
+        )
+        ChromiumBridge._log_page_event(  # type: ignore[arg-type]
+            None,
+            "handRaiseNothingSeen",
+            {"seconds": 20, "labelsWithHand": ["Raise hand", "Lower hand"]},
+        )
+        out = capsys.readouterr().out
+        assert "hand_raise_not_seen" in out
+        assert "Lower hand" in out
 
 
 def _logger_calls_passing_event(tree: ast.AST) -> list[int]:

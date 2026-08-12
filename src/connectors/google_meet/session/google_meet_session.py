@@ -46,6 +46,7 @@ from src.connectors.google_meet.browser.profile import ProfileManager
 from src.connectors.google_meet.config import GoogleMeetConnectorConfig
 from src.connectors.google_meet.egress.media_sink import ChromiumMediaSink
 from src.connectors.google_meet.meeting.chat import MeetChatSource
+from src.connectors.google_meet.meeting.hand_raise import MeetHandRaiseSource
 from src.connectors.google_meet.monitoring.watchdog import MediaWatchdog
 from src.connectors.google_meet.virtual_camera.adapter import VirtualCameraAdapter
 from src.connectors.google_meet.virtual_microphone.adapter import VirtualMicrophoneAdapter
@@ -76,6 +77,7 @@ class GoogleMeetSession:
         "_bridge",
         "_chat",
         "_clock",
+        "_hands",
         "_publisher",
         "_router",
         "_session",
@@ -95,6 +97,7 @@ class GoogleMeetSession:
         router: MediaRouter,
         watchdog: MediaWatchdog,
         chat: MeetChatSource | None = None,
+        hands: MeetHandRaiseSource | None = None,
     ) -> None:
         self._session = session
         self._clock = clock
@@ -104,6 +107,7 @@ class GoogleMeetSession:
         self._router = router
         self._watchdog = watchdog
         self._chat = chat
+        self._hands = hands
         self._task: asyncio.Task[None] | None = None
 
     @property
@@ -135,6 +139,8 @@ class GoogleMeetSession:
         await self._source.start()
         if self._chat is not None:
             await self._chat.start()
+        if self._hands is not None:
+            await self._hands.start()
         self._task = asyncio.create_task(self._router.run(), name="media-router")
         await self._watchdog.start()
 
@@ -155,6 +161,8 @@ class GoogleMeetSession:
 
         if self._chat is not None:
             await self._chat.stop()
+        if self._hands is not None:
+            await self._hands.stop()
 
         await self._bridge.stop()
         self._router.close()
@@ -393,6 +401,28 @@ class GoogleMeetSessionFactory:
             )
             chat = chat_source
 
+        # Raised hands, on the same terms and for the same reason: built only when enabled, so
+        # a session that should hold the floor carries no interrupt surface at all. Separate
+        # from ``chat_enabled`` because the two cost different things — chat opens a panel
+        # other participants can see the avatar using, this reads an indicator already on
+        # screen — and an operator may well want one without the other.
+        hands: MeetHandRaiseSource | None = None
+        if config.hand_raise_enabled:
+            hand_source = MeetHandRaiseSource(
+                clock=clock,
+                prompt=config.hand_raise_prompt,
+                cooldown_s=config.hand_raise_cooldown_s,
+                self_names=(config.display_name,),
+            )
+            bridge.attach_hand_raise(hand_source)
+            # The account's rendered name again, for the same reason chat learns it: it is the
+            # only way to recognise our own row, and ``display_name`` is not it on a signed-in
+            # profile.
+            bridge.add_roster_listener(
+                lambda roster: hand_source.observe_self_name(roster.self_name)
+            )
+            hands = hand_source
+
         router = MediaRouter(
             ctx=ctx,
             clock=clock,
@@ -403,6 +433,8 @@ class GoogleMeetSessionFactory:
             echo_guard=echo_guard,
             metrics=self._metrics,
             chat=chat,
+            hands=hands,
+            hand_raise_mute_ms=config.hand_raise_mute_ms,
         )
 
         watchdog = MediaWatchdog(
@@ -420,6 +452,7 @@ class GoogleMeetSessionFactory:
             router=router,
             watchdog=watchdog,
             chat=chat,
+            hands=hands,
         )
 
     # -- component builders ------------------------------------------------

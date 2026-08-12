@@ -35,6 +35,7 @@ from src.infrastructure.logging import get_logger
 from src.infrastructure.metrics import MetricName, MetricsCollector
 from src.protocols.audio_source import AudioSource
 from src.protocols.chat_source import ChatSource
+from src.protocols.hand_raise_source import HandRaiseSource
 from src.services.media.clock import MediaClock
 from src.services.media.decode_pipeline import DecodePipeline
 from src.services.media.echo_guard import EchoGuard
@@ -57,6 +58,9 @@ class MediaRouter:
         "_decode",
         "_echo_guard",
         "_forwarded",
+        "_hand_raise_mute_ms",
+        "_hands",
+        "_hands_forwarded",
         "_metrics",
         "_pacer",
         "_source",
@@ -75,6 +79,8 @@ class MediaRouter:
         echo_guard: EchoGuard,
         metrics: MetricsCollector | None = None,
         chat: ChatSource | None = None,
+        hands: HandRaiseSource | None = None,
+        hand_raise_mute_ms: int = 0,
     ) -> None:
         self._ctx = ctx
         self._clock = clock
@@ -88,9 +94,14 @@ class MediaRouter:
         # gain a feature only Meet implements. Absence means "this platform has no chat",
         # never a fault.
         self._chat = chat
+        # Optional for the same reason and on the same terms: only Meet reports raised hands
+        # today, and absence means "this platform has no such signal", never a fault.
+        self._hands = hands
+        self._hand_raise_mute_ms = hand_raise_mute_ms
         self._forwarded = 0
         self._suppressed = 0
         self._chat_forwarded = 0
+        self._hands_forwarded = 0
 
     @property
     def stats(self) -> dict[str, int]:
@@ -98,6 +109,7 @@ class MediaRouter:
             "forwarded": self._forwarded,
             "suppressed": self._suppressed,
             "chat_forwarded": self._chat_forwarded,
+            "hand_raises_forwarded": self._hands_forwarded,
             **self._pacer.stats,
         }
 
@@ -143,6 +155,8 @@ class MediaRouter:
                 group.create_task(self._pacer.run(), name="pacer")
                 if self._chat is not None:
                     group.create_task(self._route_chat(), name="route-chat")
+                if self._hands is not None:
+                    group.create_task(self._route_hand_raises(), name="route-hand-raises")
         finally:
             # Symmetric with the connect above: whatever opens the socket closes it. The three
             # session classes all document tearing down "the avatar" and none of them actually
@@ -225,6 +239,55 @@ class MediaRouter:
                     self._chat_forwarded += 1
             except Exception as exc:
                 logger.warning("router.chat_forward_failed", error=str(exc))
+
+    # -- inbound: a raised hand → stop talking -----------------------------
+
+    async def _route_hand_raises(self) -> None:
+        """Yield the floor when somebody puts their hand up.
+
+        Two actions, in this order and deliberately:
+
+        1. ``Pacer.interrupt`` — local, immediate, and unconditional. It drops the avatar
+           media already queued and holds the line for a moment while what is still in flight
+           drains, so the voice stops within a frame or two of the hand going up.
+        2. ``AvatarClient.send_hand_raise`` — the agent is told, as a chat message, that
+           somebody wants to speak. Only it can decide what to say back, and delivering this
+           as chat is what makes it work against an agent that was never modified for the
+           feature.
+
+        **The local step first, and it is not merely an optimisation.** The round trip to the
+        agent is a network hop plus however long that agent takes to react; the queues drain in
+        real time regardless. Doing it the other way round means the avatar talks over the
+        person for the length of that round trip — the exact failure the feature exists to
+        remove. Doing it locally *only* would be worse in the other direction: the sentence
+        resumes the moment the hold lapses, because the agent never learned to stop.
+
+        Unconditional on whether the avatar is currently speaking, which is the same request
+        either way: a silent avatar drops nothing, mutes nothing audible, and still tells the
+        agent that somebody wants the floor — which is what makes it say "go ahead" rather
+        than sit there.
+
+        Failures are contained, like the chat leg's: a raised hand that cannot be delivered
+        must not kill the task group and take the meeting's audio with it.
+        """
+        hands = self._hands
+        if hands is None:
+            return
+        async for event in hands.events():
+            try:
+                speaking = self._pacer.is_speaking
+                dropped = self._pacer.interrupt(hold_ms=self._hand_raise_mute_ms)
+                logger.info(
+                    "router.hand_raise",
+                    participant=event.participant,
+                    was_speaking=speaking,
+                    frames_dropped=dropped,
+                    hold_ms=self._hand_raise_mute_ms,
+                )
+                if await self._avatar.send_hand_raise(event):
+                    self._hands_forwarded += 1
+            except Exception as exc:
+                logger.warning("router.hand_raise_failed", error=str(exc))
 
     # -- avatar → decoder --------------------------------------------------
 

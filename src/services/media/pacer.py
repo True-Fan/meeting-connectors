@@ -84,7 +84,9 @@ class Pacer:
         "_idle",
         "_idle_audio",
         "_idle_video",
+        "_interrupted",
         "_metrics",
+        "_muted_until_us",
         "_published_audio",
         "_published_video",
         "_sink",
@@ -135,6 +137,8 @@ class Pacer:
         self._published_audio = 0
         self._idle_video = 0
         self._idle_audio = 0
+        self._muted_until_us = 0
+        self._interrupted = 0
 
     # -- submission --------------------------------------------------------
 
@@ -157,12 +161,66 @@ class Pacer:
             "idle_audio": self._idle_audio,
             "dropped_video": self._video_queue.dropped,
             "dropped_audio": self._audio_queue.dropped,
+            "interrupted": self._interrupted,
         }
 
     @property
     def is_speaking(self) -> bool:
         """True when real avatar media was published recently."""
         return self._speaking
+
+    @property
+    def is_muted(self) -> bool:
+        """True while an interrupt is still discarding avatar media."""
+        return self._clock.now_us() < self._muted_until_us
+
+    # -- barge-in ----------------------------------------------------------
+
+    def interrupt(self, *, hold_ms: int = 0) -> int:
+        """Stop the avatar mid-sentence: drop what is queued, and hold the line briefly.
+
+        Called when somebody in the meeting takes the floor — in Meet, by raising their hand.
+        Two effects, because either alone leaves the avatar audibly talking over them:
+
+        * **The queues are emptied.** Everything buffered here is the tail of a sentence
+          nobody wants finished, so it is discarded rather than published. That is a few
+          hundred milliseconds — the queues are deliberately shallow.
+        * **Media decoded during ``hold_ms`` is discarded too.** This is the part that
+          matters. The agent's audio is *already in flight* when the hand goes up: streamed
+          over the socket, sitting in the decoder, on its way to these queues. Emptying the
+          queues without a hold buys one queue-depth of silence and then the same sentence
+          resumes, which sounds like a glitch rather than like yielding.
+
+        Idle frames fill the gap, so the avatar returns to looking like it is listening —
+        which is exactly what it is doing — instead of freezing.
+
+        **Why a window rather than "until the agent's next utterance".** Nothing here can tell
+        the agent's new reply from the old sentence: a decoded frame carries no lineage back
+        to the chunk it came from, and adding one would mean threading an id through the
+        decoder for this alone. A window is the honest approximation, and its size is the
+        trade it makes: too short and the old sentence resumes, too long and the *reply*
+        ("go ahead") gets clipped. See ``GoogleMeetSettings.hand_raise_mute_ms``.
+
+        Returns the number of frames dropped, for the caller's log line. Safe to call when the
+        avatar is silent, where it drops nothing and mutes nothing audible.
+        """
+        dropped = self._video_queue.qsize() + self._audio_queue.qsize()
+        self._video_queue.clear()
+        self._audio_queue.clear()
+
+        if hold_ms > 0:
+            # Extended, never shortened: a second hand going up during the hold must not cut
+            # the window short, and ``max`` is what makes repeated calls monotonic.
+            self._muted_until_us = max(
+                self._muted_until_us, self._clock.now_us() + hold_ms * 1_000
+            )
+
+        # The gate is armed by *publishing* audible audio, and after this we publish silence.
+        # Clearing it here rather than waiting for the next publish means "is the avatar
+        # speaking" answers correctly to anything that asks in between.
+        self._speaking = False
+        self._interrupted += 1
+        return dropped
 
     # -- run ---------------------------------------------------------------
 
@@ -230,7 +288,13 @@ class Pacer:
 
     def _take_video(self) -> VideoFrame | None:
         """Take the freshest video frame that is not already stale."""
+        muted = self.is_muted
         while (frame := self._video_queue.get_nowait()) is not None:
+            if muted:
+                # Video as well as audio, so an interrupted avatar visibly returns to
+                # listening rather than mouthing a sentence nobody can hear.
+                self._count_drop("video", "interrupted")
+                continue
             if self._clock.is_late(frame.pts_us, tolerance_us=VIDEO_LATE_TOLERANCE_US):
                 self._count_drop("video", "stale")
                 continue
@@ -238,7 +302,11 @@ class Pacer:
         return None
 
     def _take_audio(self) -> AudioFrame | None:
+        muted = self.is_muted
         while (frame := self._audio_queue.get_nowait()) is not None:
+            if muted:
+                self._count_drop("audio", "interrupted")
+                continue
             if self._clock.is_late(frame.pts_us, tolerance_us=AUDIO_LATE_TOLERANCE_US):
                 self._count_drop("audio", "stale")
                 continue

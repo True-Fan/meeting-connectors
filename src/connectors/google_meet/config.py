@@ -33,6 +33,7 @@ from pydantic import SecretStr
 
 from src.config.settings import Settings
 from src.connectors.google_meet.exceptions import MeetConfigurationError
+from src.connectors.google_meet.meeting.hand_raise import DEFAULT_PROMPT as HAND_RAISE_PROMPT
 from src.domain.avatar import AVATAR_INPUT_FORMAT
 from src.domain.media import AudioFormat, SampleFormat, VideoFormat
 
@@ -139,6 +140,26 @@ class GoogleMeetConnectorConfig:
     chat_mention_names: tuple[str, ...] = ()
     """Extra names the avatar answers to after an ``@``, beyond the one Meet shows for its own
     account (learned from the roster) and the configured ``display_name``."""
+
+    hand_raise_enabled: bool = True
+    """Whether a participant raising their hand stops the avatar and takes the floor.
+
+    On by default: raising a hand is the one gesture Meet gives a person for "I would like to
+    speak", and an avatar that talks through it is the behaviour people complain about. Unlike
+    chat this needs no panel opened and changes nothing other participants see — the page only
+    reads an indicator that is already on screen."""
+
+    hand_raise_prompt: str = HAND_RAISE_PROMPT
+    """What the agent is told when a hand goes up. ``{name}`` is the raiser. See
+    ``GoogleMeetSettings.hand_raise_prompt``."""
+
+    hand_raise_cooldown_s: float = 10.0
+    """How long to ignore the same participant's hand after acting on it. See
+    ``GoogleMeetSettings.hand_raise_cooldown_s``."""
+
+    hand_raise_mute_ms: int = 800
+    """How long the pacer keeps discarding avatar media after an interrupt, so the sentence
+    already in flight does not simply resume. See ``GoogleMeetSettings.hand_raise_mute_ms``."""
 
     inject_stages: tuple[str, ...] = ()
     """Which bridge.js bootstrap stages to install; empty means all. See
@@ -255,6 +276,14 @@ class GoogleMeetConnectorConfig:
             chat_enabled=meet.chat_enabled,
             chat_require_mention=meet.chat_require_mention,
             chat_mention_names=tuple(meet.chat_mention_names),
+            hand_raise_enabled=meet.hand_raise_enabled,
+            # Empty means "the wording that ships with the connector". The default lives in
+            # ``meeting/hand_raise.py`` and cannot be repeated in ``settings.py`` — shared code
+            # may not import a connector — so the settings field carries the operator's
+            # override or nothing at all, and this is where the two meet.
+            hand_raise_prompt=meet.hand_raise_prompt or HAND_RAISE_PROMPT,
+            hand_raise_cooldown_s=meet.hand_raise_cooldown_s,
+            hand_raise_mute_ms=meet.hand_raise_mute_ms,
             inject_stages=tuple(meet.inject_stages),
             disable_injection=meet.disable_injection,
             avatar_url=settings.avatar.url,

@@ -317,6 +317,58 @@ class GoogleMeetSettings(BaseModel):
     and people will shorten it — an account called "TrueFan Interview Avatar" gets
     ``["Gunika", "bot"]`` so ``@Gunika`` and ``@bot`` are recognised too."""
 
+    hand_raise_enabled: bool = True
+    """Stop the avatar and hand over when a participant raises their hand in the meeting.
+
+    Raising a hand is the one gesture Meet gives a person for "I would like to speak", and an
+    avatar that keeps talking through it is the complaint this setting exists to answer. With
+    this on, the moment a hand goes up the avatar's audio is cut and the agent is told to yield
+    — so what the room hears is the avatar stopping mid-sentence and saying something like "of
+    course, go ahead".
+
+    Unlike ``chat_enabled`` this changes nothing other participants can see: the indicator is
+    already on screen and the page only reads it. Turn it off for a meeting where the avatar
+    should hold the floor — a presentation, or a scripted read-out."""
+
+    hand_raise_prompt: str = ""
+    """What the agent is told when a hand goes up. Empty uses the wording that ships with the
+    connector (``connectors/google_meet/meeting/hand_raise.py``), which asks it to stop and
+    hand over in a few words.
+
+    ``{name}`` is substituted with the raiser's name, or "Someone" when Meet renders an
+    indicator it does not attribute. Nothing else is substituted, and a template that fails to
+    render costs the wording rather than the feature — the default is used and a warning is
+    logged.
+
+    **This steers the avatar's reply; it is not the reply.** The bridge contains no AI and
+    speaks none of its own words — the agent composes what is said, and this is the instruction
+    it receives. Change it to change the register: an interview avatar might want
+    ``"{name} has a question. Stop talking and invite them to ask it."``"""
+
+    hand_raise_cooldown_s: float = Field(default=10.0, ge=0)
+    """How long the same participant's hand is ignored after the avatar has yielded to it.
+
+    Meet's indicator lives in a DOM that re-renders constantly, and somebody who feels ignored
+    will lower and re-raise. Either can produce a burst, and an avatar interrupted repeatedly
+    never gets far enough to say "go ahead" — which looks far more broken than a slightly late
+    reaction. Ten seconds is comfortably longer than a re-render storm and shorter than a turn
+    in a conversation. Zero disables it, which is only sensible with a very quiet room."""
+
+    hand_raise_mute_ms: int = Field(default=800, ge=0)
+    """How long avatar audio keeps being discarded after an interrupt.
+
+    **This is what makes barge-in audible rather than theoretical.** When the hand goes up the
+    agent's speech is already in flight — sent over the socket, sitting in the decoder — and
+    dropping only what is queued for publication buys a couple of hundred milliseconds before
+    the same sentence resumes. Holding the line while the rest drains is what turns that into
+    stopping.
+
+    The trade is in both directions: too short and the interrupted sentence comes back, too
+    long and the beginning of the agent's *reply* is clipped. 800 ms covers a typical
+    in-flight buffer and is shorter than the round trip the agent needs to answer, so the
+    "go ahead" lands intact. Raise it if the avatar audibly resumes; lower it if the reply
+    starts mid-word. Zero drops only what is already queued."""
+
     def is_configured(self) -> bool:
         """True when the connector has a profile to launch from."""
         return self.profile_dir is not None

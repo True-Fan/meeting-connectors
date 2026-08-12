@@ -33,7 +33,7 @@ from src.domain.context import FrameContext
 from src.domain.exceptions import AvatarProtocolMismatchError, InvalidFrameError
 from src.domain.health import ComponentHealth, ComponentState
 from src.domain.media import AudioFrame, MediaChunk
-from src.domain.meeting import ChatMessage
+from src.domain.meeting import ChatMessage, HandRaise
 from src.infrastructure.logging import get_logger
 from src.infrastructure.metrics import MetricName, MetricsCollector
 from src.infrastructure.reconnect import ReconnectPolicy
@@ -196,6 +196,40 @@ class AvatarClient:
             total=self._chat_sent,
         )
         return True
+
+    async def send_hand_raise(self, event: HandRaise) -> bool:
+        """Tell the agent that somebody in the meeting wants the floor.
+
+        **Delivered as a chat frame, on purpose.** A dedicated ``interrupt`` kind was written
+        first and reverted: it made the whole feature depend on the agent learning a second
+        frame kind, and against the agent that exists today a raised hand did nothing at all
+        while every layer here reported success. What the agent already understands is
+        ``chat`` — a line of text from a named participant — and "Priya raised their hand and
+        wants to say something" *is* that. So the bytes on this wire are byte-for-byte the
+        ones a typed question produces, and the feature works against an unmodified agent.
+
+        The barge-in itself does not travel over this socket: ``Pacer.interrupt`` cuts the
+        avatar's audio in the meeting directly, which is both faster than a round trip and
+        independent of what the agent chooses to do. This frame is what makes it *say*
+        something rather than just falling silent.
+
+        Returns True when the frame was handed to the transport. False means it was withheld,
+        which happens for the same three reasons chat is: our own hand, empty text, or an agent
+        that predates the text channel entirely.
+        """
+        logger.info(
+            "avatar.hand_raise_forwarded",
+            participant=event.participant,
+            note="delivered on the chat channel, which is the frame the agent already parses",
+        )
+        return await self.send_chat(
+            ChatMessage(
+                text=event.prompt,
+                sender=event.participant,
+                received_at_us=event.raised_at_us,
+                is_self=event.is_self,
+            )
+        )
 
     async def chunks(self) -> AsyncIterator[MediaChunk]:
         """Yield fMP4 chunks, caching the init segment as it passes."""

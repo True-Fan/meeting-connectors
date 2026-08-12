@@ -66,6 +66,7 @@
     MEET_STATE: 0x0a,
     PAGE_EVENT: 0x0b,
     CHAT_MESSAGE: 0x0c,
+    HAND_RAISE: 0x0d,
   };
 
   const FLAG = { NONE: 0x00, KEYFRAME: 0x01, SILENCE: 0x02, MIXED: 0x04 };
@@ -202,6 +203,26 @@
     // When the "everything here is history" window closes. Timed from the panel opening rather
     // than from the first message, which is what stopped the first message being answered.
     chatBaselineUntil: 0,
+
+    // Raised hands. `handsUp` is the set currently up, which is what makes this edge-triggered:
+    // a hand reports once when it appears in the set and again only after it has left it.
+    // Keyed by participant id where Meet gives one, by name where it does not.
+    handsUp: new Set(),
+    // key -> last report time. A hand that flickers off and on during a re-render must not
+    // interrupt the avatar twice, and Meet re-renders constantly.
+    handsLastSentAt: new Map(),
+    handsWasJoined: false,
+    // Hands already up when we walked in are not requests to interrupt us — we were not
+    // speaking yet. Timed from admission, for the reason the chat window is.
+    handsBaselineUntil: 0,
+    handsArmedAt: 0,
+    // The label sweep is rate limited independently of the scan: it reads every labelled
+    // element on the page, which is affordable twice a second and not sixty times.
+    handsLastSweepAt: 0,
+    // How many "nothing found" diagnostics have been emitted. Bounded, because a meeting where
+    // nobody raises a hand is the normal case and must not fill the log.
+    handsDiagnostics: 0,
+    handRaisesSent: 0,
   };
 
   function send(buffer) {
@@ -1262,6 +1283,402 @@
     }
   }
 
+  /*
+   * Raised hands, read from whatever Meet happens to render.
+   *
+   * Meet gives a participant no hand-raise API, so this is the DOM — and unlike chat there is
+   * no single place to look. The same raised hand shows up as a toast ("Dev raised their
+   * hand"), as a badge on the speaker tile, and as a row in the people panel, and which of
+   * those exist depends on the layout, the panel state and the participant count.
+   *
+   * **So this matches on wording, not on structure, and that is deliberate.** The first
+   * attempt used a list of attribute selectors and found nothing in a live meeting — the same
+   * failure the chat button had, fixed the same way: look at every label on the page and take
+   * the one that reads like a raised hand. Class names and `jsname` attributes are build
+   * artefacts that change without notice; the sentence Meet shows a human is the most durable
+   * thing on the page.
+   *
+   * **A hand is a state, and what matters is the edge.** Meet renders it for as long as it is
+   * up and re-renders constantly, so reporting what is currently raised would interrupt the
+   * avatar dozens of times per hand. `handsUp` holds the current set; only entering it is
+   * reported, and a hand must be lowered before it can be reported again.
+   *
+   * Nothing here decides whether a raised hand should interrupt the avatar, or what the agent
+   * is told. The page reports the edge; Python decides the rest.
+   */
+  const HAND_TRIGGERS = [
+    'raised their hand',
+    'raised your hand',
+    'raised a hand',
+    'has their hand raised',
+    'hand is raised',
+    'raised hand',
+    'hand raised',
+  ];
+
+  /*
+   * Labels and text that contain a trigger phrase and are not somebody raising a hand.
+   *
+   * Checked first, and each one is a false trigger that would otherwise fire continuously:
+   * "Raise hand" is the control in every meeting's toolbar — observed live as
+   * `Raise hand (ctrl + ⌘ + h)`, which is why the match is a substring and not an equality —
+   * "Lower hand" is what it becomes once pressed, and "Raised hands" is the people panel's
+   * section heading, present for as long as the panel is open.
+   */
+  const HAND_EXCLUDE = ['raise hand', 'lower hand', 'lower all hands', 'raised hands'];
+
+  /*
+   * Material icon ligatures Meet draws a raised hand with.
+   *
+   * **This is the signal that actually exists.** A live meeting reported exactly one label
+   * containing the word "hand" — the avatar's own toolbar button — while a participant's hand
+   * was up. Meet marks the raised hand on the participant's tile with an icon font, and an
+   * icon font glyph is a *text node* holding the glyph's name: `front_hand`. No aria-label, no
+   * data attribute, nothing a selector or a label sweep can see, and the whole reason the
+   * first two attempts found nothing.
+   *
+   * `pan_tool` is the older name and `back_hand` a sibling; all three cost nothing to check.
+   */
+  const HAND_ICONS = ['front_hand', 'pan_tool', 'back_hand'];
+
+  const SELF_WORDS = ['you', 'your hand', 'you (you)'];
+
+  function handTextMatches(text) {
+    if (!text) {
+      return null;
+    }
+    const lowered = text.toLowerCase();
+    for (const phrase of HAND_EXCLUDE) {
+      if (lowered.indexOf(phrase) !== -1) {
+        return null;
+      }
+    }
+    for (const phrase of HAND_TRIGGERS) {
+      const at = lowered.indexOf(phrase);
+      if (at !== -1) {
+        return { phrase, at };
+      }
+    }
+    return null;
+  }
+
+  /*
+   * The name in a label like "Dev Choudhary raised their hand" — the label with the phrase
+   * taken out, and its leftover punctuation trimmed.
+   */
+  function handNameFrom(text, match) {
+    if (!text || !match) {
+      return null;
+    }
+    const name = (text.slice(0, match.at) + ' ' + text.slice(match.at + match.phrase.length))
+      .replace(/[(),.;:•\-–—]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return name ? name.slice(0, 120) : null;
+  }
+
+  function handHolder(node) {
+    try {
+      return node.closest('[data-participant-id], [data-requested-participant-id]');
+    } catch (err) {
+      return null;
+    }
+  }
+
+  /*
+   * One signal, resolved to the participant it is about.
+   *
+   * Returns null when nothing names anybody — no participant container and no name in the
+   * text. **Skipped rather than keyed as "somebody",** because an unattributable trigger that
+   * reappears on every scan would interrupt the avatar forever, and a missed hand is a far
+   * cheaper mistake than that.
+   */
+  function handResolve(node, name, how, source) {
+    const holder = handHolder(node);
+    if (!name && holder) {
+      const label = (holder.getAttribute('aria-label') || holder.innerText || '')
+        .trim()
+        .split('\n')[0];
+      const holderMatch = handTextMatches(label);
+      name = holderMatch ? handNameFrom(label, holderMatch) : label.slice(0, 120) || null;
+    }
+
+    const id = holder
+      ? holder.getAttribute('data-participant-id') ||
+        holder.getAttribute('data-requested-participant-id') ||
+        ''
+      : '';
+    const key = id || (name ? 'name:' + name.toLowerCase() : '');
+    if (!key) {
+      return null;
+    }
+
+    const lowered = (name || '').toLowerCase();
+    const isSelf =
+      SELF_WORDS.indexOf(lowered) !== -1 ||
+      (source || '').toLowerCase().indexOf('raised your hand') !== -1 ||
+      (!!name && !!CONFIG.displayName && name === CONFIG.displayName);
+    return { key, name: name || null, isSelf, how };
+  }
+
+  function handCandidate(node, text, how) {
+    const match = handTextMatches(text);
+    if (!match) {
+      return null;
+    }
+    return handResolve(node, handNameFrom(text, match), how, text);
+  }
+
+  /*
+   * Walk the page's text, which is where the evidence turned out to live.
+   *
+   * A `TreeWalker` over text nodes rather than `querySelectorAll` plus `innerText`: it reads
+   * the DOM without forcing layout, which matters because this runs beside a live media path,
+   * and it reaches the icon glyphs and notification text that carry no attributes at all.
+   *
+   * Bounded, because an unbounded walk over a page Meet is still building is the kind of thing
+   * that shows up as dropped frames rather than as an error.
+   */
+  function handTextWalk(visit) {
+    let walker;
+    try {
+      walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    } catch (err) {
+      return;
+    }
+    let seen = 0;
+    let node = walker.nextNode();
+    while (node && seen < 6000) {
+      seen += 1;
+      const raw = node.nodeValue;
+      // Long runs are script bodies and inlined JSON, never a label a human reads.
+      if (raw && raw.length < 200) {
+        const text = raw.trim();
+        if (text) {
+          visit(text, node.parentElement);
+        }
+      }
+      node = walker.nextNode();
+    }
+  }
+
+  /*
+   * Every element that could be carrying the news, cheapest first.
+   *
+   * The configured selectors run on every scan because they are precise and narrow. The rest
+   * is what actually finds it, and it is rate limited: Meet mutates the DOM continuously, and
+   * a full sweep per animation frame would cost more than the media path.
+   */
+  function handCandidates(sweep) {
+    const s = CONFIG.selectors;
+    const found = [];
+    const seen = new Set();
+
+    const consider = (node, text, how) => {
+      if (!node || seen.has(node)) {
+        return;
+      }
+      seen.add(node);
+      const candidate = handCandidate(node, text, how);
+      if (candidate) {
+        found.push(candidate);
+      }
+    };
+
+    for (const selector of s.handRaised || []) {
+      try {
+        for (const node of document.querySelectorAll(selector)) {
+          const label =
+            node.getAttribute('aria-label') ||
+            node.getAttribute('data-tooltip') ||
+            (node.innerText || '').trim().split('\n')[0];
+          // A structural selector match is evidence in itself, so a node that carries no
+          // readable label is still resolved through its participant holder.
+          consider(node, label || 'hand raised', 'selector');
+        }
+      } catch (err) {
+        /* a malformed selector must not stop the scan */
+      }
+    }
+
+    if (!sweep) {
+      return found;
+    }
+
+    try {
+      for (const node of document.querySelectorAll('[aria-label], [data-tooltip]')) {
+        consider(
+          node,
+          node.getAttribute('aria-label') || node.getAttribute('data-tooltip'),
+          'label'
+        );
+      }
+    } catch (err) {
+      /* a hostile DOM must not stop the scan */
+    }
+
+    handTextWalk((text, parent) => {
+      if (!parent) {
+        return;
+      }
+      // The icon glyph on a participant's tile. **Only inside a participant container**, which
+      // is what separates it from the identical glyph in our own toolbar button — that button
+      // exists in every meeting and would otherwise raise a hand the moment we joined.
+      if (HAND_ICONS.indexOf(text.toLowerCase()) !== -1) {
+        if (seen.has(parent)) {
+          return;
+        }
+        seen.add(parent);
+        const candidate = handResolve(parent, null, 'icon', text);
+        if (candidate) {
+          found.push(candidate);
+        }
+        return;
+      }
+      // Meet's own announcement — the toast, and whatever the people panel renders. Plain
+      // text, no attributes, invisible to every selector.
+      consider(parent, text, 'text');
+    });
+
+    return found;
+  }
+
+  /*
+   * What the page has that mentions a hand, for diagnosis.
+   *
+   * Emitted while nothing has ever been detected, a bounded number of times. The first live
+   * run of this feature returned exactly one label — our own toolbar button — which is what
+   * proved the signal was not in the labels at all. Reporting the *text* and the icon glyphs
+   * as well is what makes the next miss diagnosable in one round instead of three.
+   */
+  function handDiagnostics() {
+    const labels = [];
+    const texts = [];
+    const icons = [];
+    try {
+      for (const node of document.querySelectorAll('[aria-label], [data-tooltip]')) {
+        const label = (
+          node.getAttribute('aria-label') ||
+          node.getAttribute('data-tooltip') ||
+          ''
+        ).trim();
+        if (label && label.toLowerCase().indexOf('hand') !== -1 && labels.length < 10) {
+          labels.push(label.slice(0, 80));
+        }
+      }
+    } catch (err) {
+      /* diagnostics must never throw into the scan */
+    }
+    try {
+      handTextWalk((text, parent) => {
+        const lowered = text.toLowerCase();
+        if (HAND_ICONS.indexOf(lowered) !== -1 && icons.length < 10) {
+          icons.push(text + (handHolder(parent || {}) ? ' [in participant]' : ' [loose]'));
+        } else if (lowered.indexOf('hand') !== -1 && texts.length < 10) {
+          texts.push(text.slice(0, 80));
+        }
+      });
+    } catch (err) {
+      /* as above */
+    }
+    let participants = 0;
+    try {
+      participants = document.querySelectorAll(
+        '[data-participant-id], [data-requested-participant-id]'
+      ).length;
+    } catch (err) {
+      /* as above */
+    }
+    return { labels, texts, icons, participants };
+  }
+
+  function scanHands() {
+    if (!CONFIG.handRaiseEnabled) {
+      return;
+    }
+
+    // Only in the call, for the reason chat is: the pre-join screen has no participants, and
+    // arming there would spend the baseline window before anybody could raise anything.
+    if (state.meetState !== 'joined') {
+      state.handsWasJoined = false;
+      state.handsUp.clear();
+      return;
+    }
+    if (!state.handsWasJoined) {
+      state.handsWasJoined = true;
+      state.handsUp.clear();
+      state.handsLastSentAt.clear();
+      state.handsArmedAt = Date.now();
+      state.handsBaselineUntil = Date.now() + (CONFIG.handRaiseBaselineMs || 3000);
+      state.handsLastSweepAt = 0;
+      state.handsDiagnostics = 0;
+      // So a log from a live meeting shows the feature is running at all — the first question
+      // to answer when nobody's raised hand produces anything.
+      report('handsArmed', { selectors: (CONFIG.selectors.handRaised || []).length });
+    }
+
+    const now = Date.now();
+    const sweepMs = CONFIG.handRaiseSweepMs || 500;
+    const sweep = now - state.handsLastSweepAt >= sweepMs;
+    if (sweep) {
+      state.handsLastSweepAt = now;
+    }
+
+    const candidates = handCandidates(sweep);
+    const baselining = now < state.handsBaselineUntil;
+    const cooldownMs = CONFIG.handRaiseCooldownMs || 0;
+    const current = new Set();
+
+    for (const candidate of candidates) {
+      current.add(candidate.key);
+      if (state.handsUp.has(candidate.key)) {
+        continue; // already up; this is a re-render, not a new request
+      }
+      if (baselining) {
+        continue; // up before we arrived, so not an interruption of anything
+      }
+      const last = state.handsLastSentAt.get(candidate.key) || 0;
+      if (cooldownMs && now - last < cooldownMs) {
+        continue; // the same hand flickering, or somebody tapping it repeatedly
+      }
+      state.handsLastSentAt.set(candidate.key, now);
+      send(
+        encodeJson(TYPE.HAND_RAISE, {
+          id: candidate.key,
+          name: candidate.name,
+          // Reported, not acted on: only the page can see whose row it is, and only Python
+          // knows the name the account actually joined under.
+          isSelf: candidate.isSelf,
+        })
+      );
+      state.handRaisesSent += 1;
+      report('handRaise', { name: candidate.name, how: candidate.how, self: candidate.isSelf });
+    }
+
+    // Replace rather than merge, so lowering a hand removes it and raising it again is a new
+    // edge. The cooldown, not this, is what stops a re-render from counting as a lower/raise.
+    state.handsUp = current;
+
+    // Nothing found yet: say what the page does have, a bounded number of times.
+    const diagMs = CONFIG.handRaiseDiagMs || 0;
+    if (
+      diagMs &&
+      state.handRaisesSent === 0 &&
+      state.handsDiagnostics < 4 &&
+      now - state.handsArmedAt >= diagMs * (state.handsDiagnostics + 1)
+    ) {
+      state.handsDiagnostics += 1;
+      const diag = handDiagnostics();
+      report('handRaiseNothingSeen', {
+        seconds: Math.round((now - state.handsArmedAt) / 1000),
+        labelsWithHand: diag.labels,
+        textWithHand: diag.texts,
+        iconsSeen: diag.icons,
+        participantNodes: diag.participants,
+      });
+    }
+  }
+
   function scanRoster() {
     const s = CONFIG.selectors;
     const participants = [];
@@ -1318,6 +1735,7 @@
         scanState();
         scanRoster();
         scanChat();
+        scanHands();
       });
     };
 
@@ -1534,6 +1952,8 @@
     chatPanelOpen: state.chatPanelOpened,
     chatOpenAttempts: state.chatOpenAttempts,
     chatMessagesSent: state.chatMessagesSent,
+    handsUp: state.handsUp.size,
+    handRaisesSent: state.handRaisesSent,
     playout: state.playoutStats,
     socketOpen: !!(state.socket && state.socket.readyState === 1),
     stages: stages.map((s) => s.stage + ':' + s.phase),
