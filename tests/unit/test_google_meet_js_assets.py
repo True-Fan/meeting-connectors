@@ -482,3 +482,39 @@ class TestChatCapture:
         assert "div[data-panel-id]" not in DEFAULT_SELECTORS.chat_panel
         # The message-entry box exists only while chat is open, which is the strong signal.
         assert any("Send a message" in s for s in DEFAULT_SELECTORS.chat_panel)
+
+    def test_the_history_window_is_timed_from_the_panel_opening(self, bridge_code: str) -> None:
+        """The bug where the avatar ignored the *first* message anybody typed.
+
+        Baselining meant "the first scan that finds any messages is history", and the scan
+        returned early when the panel held none. With an empty panel the flag was therefore never
+        set, so the user's opening message became the thing that got baselined away — replies
+        began only from the second message.
+
+        Timing the window from the panel opening fixes both cases at once: a real backlog renders
+        inside it and is skipped, and an empty panel lets it lapse so the first real message is
+        forwarded like any other.
+        """
+        from src.connectors.google_meet.bridge.chromium_bridge import CHAT_BASELINE_MS
+
+        assert CHAT_BASELINE_MS > 0
+        assert "chatBaselineUntil" in bridge_code
+        assert "chatBaselineMs" in bridge_code
+        # The flag must not be reachable only via a scan that found messages.
+        assert "const baselining = !state.chatBaselined" not in bridge_code
+
+    def test_an_empty_chat_panel_does_not_block_baselining(self, bridge_code: str) -> None:
+        """The early return that caused it: with no message nodes the function bailed out before
+        the flag was ever set, leaving the next message — the first real one — to be swallowed."""
+        scan = bridge_code.split("function scanChat()", 1)[1].split("function scanRoster", 1)[0]
+        assert "if (!nodes.length) {" not in scan, (
+            "scanChat must not return early on an empty panel; that is what deferred the "
+            "baseline onto the user's first message"
+        )
+
+    def test_message_identity_does_not_depend_on_position(self, bridge_code: str) -> None:
+        """Meet recycles chat list nodes, so a shifted index turns an already-answered message
+        into a new one and the avatar answers it twice. Position is the one part of a chat row
+        guaranteed not to be stable."""
+        assert "function chatMessageId(node, text)" in bridge_code
+        assert "|${index}" not in bridge_code

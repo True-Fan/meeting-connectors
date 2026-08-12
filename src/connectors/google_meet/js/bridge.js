@@ -199,6 +199,9 @@
     // Wall-clock, because the retry budget is a duration rather than a number of DOM scans.
     chatArmedAt: 0,
     chatLastAttemptAt: 0,
+    // When the "everything here is history" window closes. Timed from the panel opening rather
+    // than from the first message, which is what stopped the first message being answered.
+    chatBaselineUntil: 0,
   };
 
   function send(buffer) {
@@ -1107,11 +1110,15 @@
     return found;
   }
 
-  function chatMessageId(node, text, index) {
+  function chatMessageId(node, text) {
     // Meet's own id when it exposes one, because it is stable across re-renders. Otherwise a
     // content key, which is weaker: two identical messages from the same person collapse into
     // one. That is the right trade — answering a duplicate twice is worse than missing an
     // exact repeat, and a repeat is usually somebody re-sending because we did not answer.
+    //
+    // The message's position was in this key and has been removed: Meet recycles list nodes, so
+    // a shifted index turns an already-answered message into a new one and the avatar answers
+    // it again. Position is the one part of a chat row guaranteed *not* to be stable.
     const own =
       node.getAttribute('data-message-id') ||
       node.getAttribute('data-id') ||
@@ -1120,7 +1127,7 @@
       return own;
     }
     const sender = chatSender(node) || '';
-    return `${sender}|${text}|${index}`;
+    return `${sender}|${text}`;
   }
 
   function chatSender(node) {
@@ -1176,6 +1183,7 @@
       state.chatPanelOpened = false;
       state.chatArmedAt = Date.now();
       state.chatLastAttemptAt = 0;
+      state.chatBaselineUntil = 0;
       // A rejoin renders the panel's history again; re-baselining stops the avatar answering
       // messages it has already seen, and `chatSeen` still guards the individual ids.
       state.chatBaselined = false;
@@ -1199,19 +1207,29 @@
         /* a malformed selector must not stop the scan */
       }
     }
-    if (!nodes.length) {
-      return;
+    /*
+     * The history window starts when the panel opens, **not when a message first appears.**
+     *
+     * This is what swallowed the first message anybody typed. Baselining used to mean "the
+     * first scan that sees any messages is history", and the scan returned early when the panel
+     * was empty — so with an empty panel the flag was never set, and the *user's first message*
+     * became the thing that got baselined away. Replies only started from the second message.
+     *
+     * A short wall-clock window fixes both cases at once: a real backlog renders within it and
+     * is correctly skipped, and an empty panel simply lets the window lapse so the first real
+     * message is forwarded like any other.
+     */
+    if (!state.chatBaselineUntil) {
+      state.chatBaselineUntil = Date.now() + (CONFIG.chatBaselineMs || 3000);
     }
+    const baselining = Date.now() < state.chatBaselineUntil;
 
-    const baselining = !state.chatBaselined;
-    let index = 0;
     for (const node of nodes) {
-      index += 1;
       const text = (node.innerText || node.textContent || '').trim();
       if (!text) {
         continue;
       }
-      const id = chatMessageId(node, text, index);
+      const id = chatMessageId(node, text);
       if (state.chatSeen.has(id)) {
         continue;
       }
@@ -1235,7 +1253,10 @@
       state.chatMessagesSent += 1;
     }
 
-    if (baselining) {
+    // Reported once, when the window lapses — so the log shows the moment chat went live and
+    // how much backlog was skipped. `history: 0` is the normal case for an empty panel, and is
+    // exactly what the first-message bug never printed.
+    if (!baselining && !state.chatBaselined) {
       state.chatBaselined = true;
       report('chatBaselined', { history: state.chatSeen.size });
     }

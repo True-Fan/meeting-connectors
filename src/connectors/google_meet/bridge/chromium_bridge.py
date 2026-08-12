@@ -101,6 +101,18 @@ attempts elapsed in about a second and a half and the page gave up permanently b
 even drawn its in-call control bar. Ninety seconds of wall clock is what "keep trying while Meet
 finishes rendering" actually means."""
 
+CHAT_BASELINE_MS = 3_000
+"""How long after the chat panel opens its contents count as history rather than as questions.
+
+Timed from the panel opening, **not from the first message seen** — that distinction is the fix
+for a bug where the avatar ignored whatever anybody typed first and only began replying from the
+second message. Baselining used to mean "the first scan that finds any messages is history", and
+an empty panel produced no such scan, so the user's opening message became the baseline.
+
+Three seconds is comfortably longer than Meet takes to render an existing backlog and far shorter
+than anyone takes to read the room and type. A backlog is still skipped; an empty panel simply
+lets the window lapse."""
+
 CHAT_OPEN_RETRY_MS = 1_500
 """Minimum gap between attempts to open the chat panel.
 
@@ -582,6 +594,7 @@ class ChromiumBridge:
             "chatEnabled": self._config.chat_enabled,
             "chatOpenWindowMs": CHAT_OPEN_WINDOW_MS,
             "chatOpenRetryMs": CHAT_OPEN_RETRY_MS,
+            "chatBaselineMs": CHAT_BASELINE_MS,
             "videoWidth": video.width,
             "videoHeight": video.height,
             "videoFps": video.fps,
