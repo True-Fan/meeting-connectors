@@ -122,6 +122,14 @@ class GoogleMeetConnectorConfig:
     # -- Debugging ---------------------------------------------------------
     # Last, and defaulted, so every existing construction site is unchanged — a defaulted
     # dataclass field cannot precede undefaulted ones.
+    chat_enabled: bool = True
+    """Whether the page observes the meeting's chat and forwards it to the agent.
+
+    On by default: a participant typing a question expects an answer, and an avatar that
+    ignores the chat panel reads as broken. Turn it off for a meeting where the avatar should
+    only respond to voice, or where opening the chat panel is unwelcome — it changes the layout
+    other participants see nothing of, but it is still a visible action on the account."""
+
     inject_stages: tuple[str, ...] = ()
     """Which bridge.js bootstrap stages to install; empty means all. See
     ``GoogleMeetSettings.inject_stages``."""
@@ -234,6 +242,7 @@ class GoogleMeetConnectorConfig:
             idle_clip_path=settings.media.idle_clip_path,
             rejoin_max_attempts=meet.rejoin_max_attempts,
             watchdog_interval_s=meet.watchdog_interval_s,
+            chat_enabled=meet.chat_enabled,
             inject_stages=tuple(meet.inject_stages),
             disable_injection=meet.disable_injection,
             avatar_url=settings.avatar.url,

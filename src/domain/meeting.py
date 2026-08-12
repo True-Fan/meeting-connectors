@@ -48,6 +48,30 @@ class ParticipantRef:
 
 
 @dataclass(frozen=True, slots=True)
+class ChatMessage:
+    """One text message from a meeting's chat.
+
+    Platform-neutral on purpose: every platform this service targets has a chat, and none of
+    them agree on its shape. Meet renders a DOM list with display names, Zoom delivers chat
+    over its own event channel, Teams over Graph. What is common is a line of text, who
+    appeared to send it, and when we learned of it — so that is what crosses the boundary,
+    and each connector's adapter is responsible for reducing its platform to this.
+
+    ``sender`` is the display name rather than an id because that is what a conversational
+    agent can use: "Priya asks…" is meaningful to an LLM in a way a participant id is not.
+    Attribution is optional because a platform may not offer it, and a message with unknown
+    provenance is still worth answering.
+    """
+
+    text: str
+    sender: str | None = None
+    received_at_us: int = 0
+    is_self: bool = False
+    """True when the avatar's own account sent it. Never forwarded to the agent — an avatar
+    reacting to its own chat message is the text-channel version of an echo loop."""
+
+
+@dataclass(frozen=True, slots=True)
 class MeetingContext:
     """Everything needed to attach to one meeting."""
 

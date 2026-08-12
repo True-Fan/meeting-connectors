@@ -363,3 +363,122 @@ class TestGraphBuildersRunOnce:
         assert "direction" in body
         assert "'sendrecv'" in body
         assert "'sendonly'" in body
+
+
+class TestChatCapture:
+    """Reading the meeting's chat, so a typed question gets a spoken answer.
+
+    Meet exposes no chat API to a participant, so the rendered panel is the only source. Two
+    properties of that make or break the feature, and both are easy to get wrong in a way that
+    fails silently — an avatar that simply never answers anything typed.
+    """
+
+    def test_the_page_opens_the_chat_panel(self, bridge_code: str) -> None:
+        """With the panel closed a message is a transient popup that leaves nothing in the DOM,
+        so without this click the feature reads nothing at all."""
+        assert "ensureChatPanel" in bridge_code
+        assert "chatOpenButton" in bridge_code
+
+    def test_opening_is_bounded_by_time_not_by_scan_count(self, bridge_code: str) -> None:
+        """The second bug that stopped chat working, after the pre-join one.
+
+        A budget of ten *scans* sounds bounded and is not: scans are driven by DOM mutations, and
+        Meet mutates continuously. Observed in a live session — ``attempt 5`` through
+        ``attempt 10`` inside the same second and a half, then a permanent give-up, while Meet
+        had not yet drawn the in-call control bar holding the button. A wall-clock window with a
+        minimum gap between clicks is what the intent actually was.
+        """
+        from src.connectors.google_meet.bridge.chromium_bridge import (
+            CHAT_OPEN_RETRY_MS,
+            CHAT_OPEN_WINDOW_MS,
+        )
+
+        # Long enough for Meet to finish rendering, which is many seconds after "joined".
+        assert CHAT_OPEN_WINDOW_MS >= 30_000
+        assert CHAT_OPEN_RETRY_MS >= 500
+        assert "chatOpenWindowMs" in bridge_code
+        assert "chatOpenRetryMs" in bridge_code
+        assert "chatOpenMaxAttempts" not in bridge_code, "the scan-count budget must be gone"
+
+    def test_the_chat_button_is_also_found_by_its_label(self, bridge_code: str) -> None:
+        """Meet's exact label has moved more than once ("Chat with everyone", "Chat",
+        "Open chat"). A substring match on the rendered accessible name survives that; a list of
+        equality selectors survives none of it — every one of four candidates missed in a live
+        session, reported as ``clicked: False`` ten times."""
+        assert "findChatButtonByLabel" in bridge_code
+
+    def test_giving_up_reports_the_labels_actually_on_the_page(self, bridge_code: str) -> None:
+        """So the next selector fix is a reading rather than a third guess."""
+        assert "chatButtonLabels" in bridge_code
+        assert "buttonsSeen" in bridge_code
+
+    def test_history_is_baselined_rather_than_answered(self, bridge_code: str) -> None:
+        """Opening the panel renders the whole backlog. Answering it would have the avatar
+        reply to a conversation that happened before it joined."""
+        assert "chatBaselined" in bridge_code
+
+    def test_messages_are_deduplicated(self, bridge_code: str) -> None:
+        """Meet re-renders the chat list on almost every DOM mutation, so without identity one
+        question would be forwarded on every scan and answered repeatedly."""
+        assert "chatSeen" in bridge_code
+        assert "data-message-id" in bridge_code
+
+    def test_chat_scanning_is_driven_by_the_existing_observer(self, bridge_code: str) -> None:
+        """Reusing the coalesced mutation scan rather than adding a second timer — Meet mutates
+        the DOM continuously and a per-mutation scan would spend more time in the DOM than in
+        media."""
+        assert "scanChat()" in bridge_code
+
+    def test_chat_can_be_switched_off_from_python(self, bridge_code: str) -> None:
+        """Opening the panel is a visible action on the avatar's own account, so it is a
+        setting rather than unconditional behaviour."""
+        assert "CONFIG.chatEnabled" in bridge_code
+
+    def test_the_page_reports_authorship_but_does_not_act_on_it(self, bridge_code: str) -> None:
+        """The page can see which row is ours; whether to answer it is policy, and policy lives
+        in Python. So `isSelf` is reported and the filter is in AvatarClient.send_chat."""
+        assert "isSelf" in bridge_code
+
+    # The CHAT_MESSAGE wire value is already covered, and more strongly, by
+    # ``TestWireParity.test_every_message_type_matches`` — it compares the whole table.
+
+    def test_every_chat_selector_reaches_the_page(self) -> None:
+        """A selector defined in Python but absent from `to_page_config` is dead code that
+        looks live."""
+        from src.connectors.google_meet.automation.selectors import DEFAULT_SELECTORS
+
+        config = DEFAULT_SELECTORS.to_page_config()
+        for key in ("chatOpenButton", "chatPanel", "chatMessage", "chatSender"):
+            assert key in config, f"{key} never reaches bridge.js"
+            assert config[key], f"{key} has no candidates"
+
+    def test_chat_only_scans_once_admitted(self, bridge_code: str) -> None:
+        """The bug that made chat never work at all, in any meeting.
+
+        ``installObservers`` starts scanning at DOMContentLoaded — on the *pre-join* screen,
+        where Meet has no chat button, because you cannot chat in a call you have not entered.
+        Meet mutates the DOM continuously, so the ten-attempt budget was spent within seconds of
+        the page loading and ``ensureChatPanel`` had given up permanently before there was ever a
+        button to click. The budget is meant to bound attempts *in the call*.
+        """
+        assert "state.meetState !== 'joined'" in bridge_code
+        assert "chatWasJoined" in bridge_code
+
+    def test_giving_up_on_chat_is_reported(self, bridge_code: str) -> None:
+        """Silence was the real defect: the only report fired on attempt 1, before the socket
+        was open, so ``send`` dropped it and the feature failed with no line in any log."""
+        assert "chatOpenGaveUp" in bridge_code
+        assert "chatGaveUp" in bridge_code
+
+    def test_the_open_budget_resets_on_rejoin(self, bridge_code: str) -> None:
+        """A rejoin is a fresh call and deserves a fresh budget, or chat works exactly once."""
+        assert "state.chatOpenAttempts = 0" in bridge_code
+
+    def test_panel_detection_does_not_rely_on_a_generic_panel_attribute(self) -> None:
+        """Meet reuses ``data-panel-id`` for the people and activities panels, so it matched with
+        chat closed — the page reported the panel open, scanned, and found nothing, silently."""
+        from src.connectors.google_meet.automation.selectors import DEFAULT_SELECTORS
+
+        assert "div[data-panel-id]" not in DEFAULT_SELECTORS.chat_panel
+        # The message-entry box exists only while chat is open, which is the strong signal.
+        assert any("Send a message" in s for s in DEFAULT_SELECTORS.chat_panel)

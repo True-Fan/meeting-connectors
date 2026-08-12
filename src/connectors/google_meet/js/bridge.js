@@ -65,6 +65,7 @@
     PARTICIPANTS: 0x09,
     MEET_STATE: 0x0a,
     PAGE_EVENT: 0x0b,
+    CHAT_MESSAGE: 0x0c,
   };
 
   const FLAG = { NONE: 0x00, KEYFRAME: 0x01, SILENCE: 0x02, MIXED: 0x04 };
@@ -183,6 +184,21 @@
     meetState: null,
     rosterSignature: '',
     ready: false,
+
+    // Chat. `chatSeen` is the dedupe set: Meet re-renders the message list on almost every
+    // DOM mutation, so without identity one typed question is reported on every scan.
+    chatSeen: new Set(),
+    chatPanelOpened: false,
+    chatOpenAttempts: 0,
+    chatMessagesSent: 0,
+    chatBaselined: false,
+    // Whether the in-call arming has happened. Chat is only reachable once admitted, so the
+    // open-attempt budget is spent there rather than on the pre-join screen.
+    chatWasJoined: false,
+    chatGaveUp: false,
+    // Wall-clock, because the retry budget is a duration rather than a number of DOM scans.
+    chatArmedAt: 0,
+    chatLastAttemptAt: 0,
   };
 
   function send(buffer) {
@@ -944,6 +960,287 @@
     send(encodeJson(TYPE.MEET_STATE, { state: next, url: location.href }));
   }
 
+  /*
+   * Meeting chat, observed from the panel's DOM.
+   *
+   * Meet gives a participant no chat API, so the rendered panel is the only source. Two
+   * consequences shape everything here:
+   *
+   * - **The panel must be open.** With it closed, a message flashes past as a transient popup
+   *   and leaves nothing in the DOM. So this opens it, and keeps checking that it is open —
+   *   Meet closes it on some layout changes. Without the click the feature reads nothing at
+   *   all, which would look exactly like an avatar that ignores typed questions.
+   * - **Messages already present when we arrive are history, not questions.** Opening the panel
+   *   renders the whole backlog at once. Answering it would have the avatar respond to a
+   *   conversation that happened before it joined, so the first scan only records ids and
+   *   forwards nothing. `chatBaselined` is that one-shot.
+   */
+  /*
+   * Find the chat button by reading its label, not by matching a fixed selector.
+   *
+   * The selector list is tried first because it is precise and cheap. This is the fallback, and
+   * it is what a person does when the selector misses: look at every button and pick the one
+   * whose accessible name mentions chat. Meet's exact label has moved more than once
+   * ("Chat with everyone", "Chat", "Open chat"), and a substring match on the rendered label
+   * survives all of those where an equality match survives none.
+   *
+   * `aria-label` first, then the tooltip Meet attaches to some controls, then the visible text.
+   */
+  function findChatButtonByLabel() {
+    let nodes;
+    try {
+      nodes = document.querySelectorAll('button, div[role="button"]');
+    } catch (err) {
+      return null;
+    }
+    for (const node of nodes) {
+      const label = (
+        node.getAttribute('aria-label') ||
+        node.getAttribute('data-tooltip') ||
+        node.textContent ||
+        ''
+      ).toLowerCase();
+      if (!label || label.indexOf('chat') === -1) {
+        continue;
+      }
+      // "Chat with everyone" / "Chat" opens it. Skip anything that is plainly about something
+      // else the word appears in, so we do not toggle a setting instead.
+      if (label.indexOf('turn off') !== -1 || label.indexOf('close') !== -1) {
+        continue;
+      }
+      return node;
+    }
+    return null;
+  }
+
+  function ensureChatPanel() {
+    const s = CONFIG.selectors;
+    if (matchesAny(s.chatPanel)) {
+      if (!state.chatPanelOpened) {
+        state.chatPanelOpened = true;
+        report('chatPanelOpen', { attempts: state.chatOpenAttempts });
+      }
+      return true;
+    }
+
+    /*
+     * **Bounded by time, not by scan count — and that distinction is the whole bug.**
+     *
+     * The budget used to be ten *scans*, and scans are driven by DOM mutations. Meet mutates
+     * continuously, so ten attempts elapsed in about one and a half seconds: observed as
+     * `attempt 5` through `attempt 10` inside the same second, then a permanent give-up. Meet's
+     * in-call control bar does not even exist that early — the avatar had been "joined" for
+     * barely a moment — so the feature gave up before the button it wanted had rendered.
+     *
+     * A wall-clock window with a minimum gap between clicks is what "keep trying while Meet
+     * finishes drawing" actually means.
+     */
+    const now = Date.now();
+    const windowMs = CONFIG.chatOpenWindowMs || 90000;
+    const retryMs = CONFIG.chatOpenRetryMs || 1500;
+
+    if (now - state.chatArmedAt > windowMs) {
+      if (!state.chatGaveUp) {
+        state.chatGaveUp = true;
+        report('chatOpenGaveUp', {
+          attempts: state.chatOpenAttempts,
+          seconds: Math.round((now - state.chatArmedAt) / 1000),
+          panelSelectors: (s.chatPanel || []).length,
+          buttonSelectors: (s.chatOpenButton || []).length,
+          // The labels actually on the page, so a selector fix needs no guessing next time.
+          buttonsSeen: chatButtonLabels(),
+        });
+      }
+      return false;
+    }
+    if (now - state.chatLastAttemptAt < retryMs) {
+      return false;
+    }
+    state.chatLastAttemptAt = now;
+    state.chatOpenAttempts += 1;
+
+    let clicked = clickFirst(s.chatOpenButton);
+    let how = clicked ? 'selector' : null;
+    if (!clicked) {
+      const button = findChatButtonByLabel();
+      if (button) {
+        try {
+          button.click();
+          clicked = true;
+          how = 'label';
+        } catch (err) {
+          /* a control that refuses a synthetic click is reported as not clicked */
+        }
+      }
+    }
+    report('chatOpenAttempt', { attempt: state.chatOpenAttempts, clicked: !!clicked, how });
+    // The panel is not open yet even on a successful click — it animates in, and the next
+    // scan will see it.
+    return false;
+  }
+
+  /*
+   * Every button label containing "chat", for diagnosis.
+   *
+   * Emitted once, when opening is abandoned. Guessing Meet's ARIA labels from the outside cost
+   * two rounds of this; reporting what the page actually has replaces the guess with a reading.
+   */
+  function chatButtonLabels() {
+    const found = [];
+    try {
+      for (const node of document.querySelectorAll('button, div[role="button"]')) {
+        const label = (
+          node.getAttribute('aria-label') ||
+          node.getAttribute('data-tooltip') ||
+          ''
+        ).trim();
+        if (label && label.toLowerCase().indexOf('chat') !== -1) {
+          found.push(label.slice(0, 80));
+        }
+        if (found.length >= 10) {
+          break;
+        }
+      }
+    } catch (err) {
+      /* diagnostics must never throw into the scan */
+    }
+    return found;
+  }
+
+  function chatMessageId(node, text, index) {
+    // Meet's own id when it exposes one, because it is stable across re-renders. Otherwise a
+    // content key, which is weaker: two identical messages from the same person collapse into
+    // one. That is the right trade — answering a duplicate twice is worse than missing an
+    // exact repeat, and a repeat is usually somebody re-sending because we did not answer.
+    const own =
+      node.getAttribute('data-message-id') ||
+      node.getAttribute('data-id') ||
+      '';
+    if (own) {
+      return own;
+    }
+    const sender = chatSender(node) || '';
+    return `${sender}|${text}|${index}`;
+  }
+
+  function chatSender(node) {
+    const s = CONFIG.selectors;
+    const own = node.getAttribute('data-sender-name');
+    if (own) {
+      return own.trim();
+    }
+    for (const selector of s.chatSender || []) {
+      let found;
+      try {
+        found = node.querySelector(selector) || (node.parentElement
+          ? node.parentElement.querySelector(selector)
+          : null);
+      } catch (err) {
+        continue;
+      }
+      if (found) {
+        const name = (found.getAttribute('data-sender-name') || found.innerText || '').trim();
+        if (name) {
+          return name.slice(0, 120);
+        }
+      }
+    }
+    return null;
+  }
+
+  function scanChat() {
+    if (!CONFIG.chatEnabled) {
+      return;
+    }
+
+    /*
+     * Only once actually admitted, and this is the bug that made chat never work at all.
+     *
+     * `installObservers` starts scanning at DOMContentLoaded — on the **pre-join screen**, where
+     * Meet has no chat button because you cannot chat in a call you have not entered. Meet
+     * mutates the DOM continuously, so the ten-attempt budget was spent within seconds of the
+     * page loading, long before the avatar was admitted. By the time there was a chat button to
+     * click, `ensureChatPanel` had already given up permanently.
+     *
+     * The budget is meant to bound attempts *in the call*, so that is where it is spent. The
+     * counters reset on entry, which also covers a rejoin: a fresh call gets a fresh budget.
+     */
+    if (state.meetState !== 'joined') {
+      state.chatWasJoined = false;
+      return;
+    }
+    if (!state.chatWasJoined) {
+      state.chatWasJoined = true;
+      state.chatOpenAttempts = 0;
+      state.chatGaveUp = false;
+      state.chatPanelOpened = false;
+      state.chatArmedAt = Date.now();
+      state.chatLastAttemptAt = 0;
+      // A rejoin renders the panel's history again; re-baselining stops the avatar answering
+      // messages it has already seen, and `chatSeen` still guards the individual ids.
+      state.chatBaselined = false;
+      report('chatArmed', {});
+    }
+
+    if (!ensureChatPanel()) {
+      return;
+    }
+
+    const s = CONFIG.selectors;
+    let nodes = [];
+    for (const selector of s.chatMessage || []) {
+      try {
+        const found = document.querySelectorAll(selector);
+        if (found.length) {
+          nodes = Array.from(found);
+          break;
+        }
+      } catch (err) {
+        /* a malformed selector must not stop the scan */
+      }
+    }
+    if (!nodes.length) {
+      return;
+    }
+
+    const baselining = !state.chatBaselined;
+    let index = 0;
+    for (const node of nodes) {
+      index += 1;
+      const text = (node.innerText || node.textContent || '').trim();
+      if (!text) {
+        continue;
+      }
+      const id = chatMessageId(node, text, index);
+      if (state.chatSeen.has(id)) {
+        continue;
+      }
+      state.chatSeen.add(id);
+      if (baselining) {
+        continue; // history that predates the avatar
+      }
+
+      const sender = chatSender(node);
+      send(
+        encodeJson(TYPE.CHAT_MESSAGE, {
+          id,
+          text: text.slice(0, 4000),
+          sender,
+          // Compared against the name Meet shows for our own account. The bridge filters on
+          // this rather than trusting it blindly, but the page is the only side that can see
+          // which row is ours.
+          isSelf: !!sender && !!CONFIG.displayName && sender === CONFIG.displayName,
+        })
+      );
+      state.chatMessagesSent += 1;
+    }
+
+    if (baselining) {
+      state.chatBaselined = true;
+      report('chatBaselined', { history: state.chatSeen.size });
+    }
+  }
+
   function scanRoster() {
     const s = CONFIG.selectors;
     const participants = [];
@@ -999,6 +1296,7 @@
         scheduled = false;
         scanState();
         scanRoster();
+        scanChat();
       });
     };
 
@@ -1212,6 +1510,9 @@
     forceErrors: state.forceErrors,
     remoteTracks: state.remoteTracks.size,
     captureConnected: state.captureConnected,
+    chatPanelOpen: state.chatPanelOpened,
+    chatOpenAttempts: state.chatOpenAttempts,
+    chatMessagesSent: state.chatMessagesSent,
     playout: state.playoutStats,
     socketOpen: !!(state.socket && state.socket.readyState === 1),
     stages: stages.map((s) => s.stage + ':' + s.phase),

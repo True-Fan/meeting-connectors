@@ -21,11 +21,19 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 
-from src.domain.avatar import AVATAR_INPUT_FORMAT, AvatarClientHello
+from src.domain.avatar import (
+    AVATAR_CHAT_MIN_VERSION,
+    AVATAR_INPUT_FORMAT,
+    AvatarChatMessage,
+    AvatarClientHello,
+    AvatarProtocolVersion,
+    check_handshake,
+)
 from src.domain.context import FrameContext
 from src.domain.exceptions import AvatarProtocolMismatchError, InvalidFrameError
 from src.domain.health import ComponentHealth, ComponentState
 from src.domain.media import AudioFrame, MediaChunk
+from src.domain.meeting import ChatMessage
 from src.infrastructure.logging import get_logger
 from src.infrastructure.metrics import MetricName, MetricsCollector
 from src.infrastructure.reconnect import ReconnectPolicy
@@ -40,10 +48,13 @@ class AvatarClient:
     """Sends PCM to the avatar agent and yields the fMP4 it streams back."""
 
     __slots__ = (
+        "_chat_sent",
+        "_chat_unsupported_warned",
         "_connected",
         "_ctx",
         "_init_segment",
         "_metrics",
+        "_negotiated",
         "_policy",
         "_transport",
         "_transport_factory",
@@ -65,6 +76,9 @@ class AvatarClient:
         self._transport_factory = transport_factory
         self._init_segment: MediaChunk | None = None
         self._connected = False
+        self._negotiated: AvatarProtocolVersion | None = None
+        self._chat_sent = 0
+        self._chat_unsupported_warned = False
 
     @property
     def init_segment(self) -> MediaChunk | None:
@@ -88,8 +102,17 @@ class AvatarClient:
         hello = AvatarClientHello(
             session_id=self._ctx.session_id, correlation_id=self._ctx.correlation_id
         )
-        await self._transport.connect(hello)
+        reply = await self._transport.connect(hello)
+        # Retained because it decides what may be sent. ``check_handshake`` returns the lower
+        # of the two minors, so an agent that predates chat negotiates 1.0 and this stays
+        # below the chat threshold for the session's life.
+        self._negotiated = check_handshake(hello, reply)
         self._connected = True
+
+    @property
+    def supports_chat(self) -> bool:
+        """Whether the negotiated version includes inbound chat."""
+        return self._negotiated is not None and self._negotiated >= AVATAR_CHAT_MIN_VERSION
 
     async def stop(self) -> None:
         """Disconnect. Idempotent."""
@@ -125,6 +148,54 @@ class AvatarClient:
                 "RTMS should have been subscribed to the avatar's native format."
             )
         await self._transport.send_pcm(frame.pcm)
+
+    async def send_chat(self, message: ChatMessage) -> bool:
+        """Forward one chat message to the agent as a text frame.
+
+        Returns True when the frame was handed to the transport. False means the message was
+        deliberately withheld, which happens in two cases and neither is an error:
+
+        * the avatar's own account sent it — answering your own chat message is the text
+          equivalent of the feedback loop ``EchoGuard`` exists to prevent;
+        * the negotiated protocol predates chat, so the agent has no way to parse the frame.
+          Withheld rather than sent-and-ignored, because an old agent cannot tell us it did
+          not understand and the operator deserves to know why chat is doing nothing.
+
+        Empty or whitespace-only text is dropped too: a chat panel scrape can produce blank
+        strings from a UI element, and waking the agent to answer nothing would make the
+        avatar interrupt itself for no reason.
+        """
+        if message.is_self:
+            return False
+
+        text = message.text.strip()
+        if not text:
+            return False
+
+        if not self.supports_chat:
+            if not self._chat_unsupported_warned:
+                self._chat_unsupported_warned = True
+                logger.warning(
+                    "avatar.chat_unsupported",
+                    negotiated=str(self._negotiated) if self._negotiated else None,
+                    required=str(AVATAR_CHAT_MIN_VERSION),
+                    note="the agent predates chat support, so meeting chat will be ignored; "
+                    "upgrade the avatar agent to receive typed questions",
+                )
+            return False
+
+        frame = AvatarChatMessage(
+            text=text, sender=message.sender, sent_at_us=message.received_at_us
+        )
+        await self._transport.send_control(frame.model_dump_json())
+        self._chat_sent += 1
+        logger.info(
+            "avatar.chat_forwarded",
+            sender=message.sender,
+            chars=len(text),
+            total=self._chat_sent,
+        )
+        return True
 
     async def chunks(self) -> AsyncIterator[MediaChunk]:
         """Yield fMP4 chunks, caching the init segment as it passes."""

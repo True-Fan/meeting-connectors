@@ -45,6 +45,7 @@ from src.connectors.google_meet.bridge.chromium_bridge import ChromiumBridge, Dr
 from src.connectors.google_meet.browser.profile import ProfileManager
 from src.connectors.google_meet.config import GoogleMeetConnectorConfig
 from src.connectors.google_meet.egress.media_sink import ChromiumMediaSink
+from src.connectors.google_meet.meeting.chat import MeetChatSource
 from src.connectors.google_meet.monitoring.watchdog import MediaWatchdog
 from src.connectors.google_meet.virtual_camera.adapter import VirtualCameraAdapter
 from src.connectors.google_meet.virtual_microphone.adapter import VirtualMicrophoneAdapter
@@ -73,6 +74,7 @@ class GoogleMeetSession:
 
     __slots__ = (
         "_bridge",
+        "_chat",
         "_clock",
         "_publisher",
         "_router",
@@ -92,6 +94,7 @@ class GoogleMeetSession:
         publisher: MediaSink,
         router: MediaRouter,
         watchdog: MediaWatchdog,
+        chat: MeetChatSource | None = None,
     ) -> None:
         self._session = session
         self._clock = clock
@@ -100,6 +103,7 @@ class GoogleMeetSession:
         self._publisher = publisher
         self._router = router
         self._watchdog = watchdog
+        self._chat = chat
         self._task: asyncio.Task[None] | None = None
 
     @property
@@ -129,6 +133,8 @@ class GoogleMeetSession:
         """
         await self._bridge.start(self._session.meeting)
         await self._source.start()
+        if self._chat is not None:
+            await self._chat.start()
         self._task = asyncio.create_task(self._router.run(), name="media-router")
         await self._watchdog.start()
 
@@ -146,6 +152,9 @@ class GoogleMeetSession:
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+
+        if self._chat is not None:
+            await self._chat.stop()
 
         await self._bridge.stop()
         self._router.close()
@@ -362,6 +371,15 @@ class GoogleMeetSessionFactory:
             metrics=self._metrics,
         )
 
+        # Chat is the one capability here that is *configuration*, not platform shape: Meet can
+        # always do it, and an operator may not want the avatar opening the chat panel. Built
+        # only when enabled, so a disabled session carries no chat surface at all rather than an
+        # inert one.
+        chat: MeetChatSource | None = None
+        if config.chat_enabled:
+            chat = MeetChatSource(clock=clock)
+            bridge.attach_chat(chat)
+
         router = MediaRouter(
             ctx=ctx,
             clock=clock,
@@ -371,6 +389,7 @@ class GoogleMeetSessionFactory:
             pacer=pacer,
             echo_guard=echo_guard,
             metrics=self._metrics,
+            chat=chat,
         )
 
         watchdog = MediaWatchdog(
@@ -387,6 +406,7 @@ class GoogleMeetSessionFactory:
             publisher=publisher,
             router=router,
             watchdog=watchdog,
+            chat=chat,
         )
 
     # -- component builders ------------------------------------------------

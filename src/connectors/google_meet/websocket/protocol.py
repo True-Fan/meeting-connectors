@@ -124,6 +124,14 @@ class MeetMessageType(IntEnum):
     """Page → bridge. Admission and call-state transitions, so being denied or ejected
     surfaces as a health change rather than as silence."""
 
+    CHAT_MESSAGE = 0x0C
+    """Page → bridge. One message observed in the meeting's chat panel.
+
+    Page-observed rather than API-fetched because Meet exposes no chat API to a participant;
+    the panel's DOM is the only source. The page reports ``{id, text, sender, isSelf}`` and
+    makes no decision about whether the avatar should answer — that is the bridge's call, and
+    it is where the self-message filter lives."""
+
     PAGE_EVENT = 0x0B
     """Page → bridge. Raw diagnostics — a track ended, the peer connection
     renegotiated, a device was revoked.

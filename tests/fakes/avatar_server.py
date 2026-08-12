@@ -56,6 +56,8 @@ class StubAvatarServer:
 
         self.hellos: list[dict[str, Any]] = []
         self.received_pcm: list[bytes] = []
+        self.received_text: list[str] = []
+        """Control frames received after the handshake, in arrival order."""
         self.connections = 0
         self.pcm_arrived = asyncio.Event()
 
@@ -91,6 +93,11 @@ class StubAvatarServer:
 
             async for message in connection:
                 if isinstance(message, str):
+                    # Text after the handshake is a control frame — chat, so far. Recorded
+                    # rather than skipped, because "did the frame arrive intact" is only
+                    # answerable against a real socket, and interleaved writes corrupting each
+                    # other is the failure worth catching.
+                    self.received_text.append(message)
                     continue
                 self.received_pcm.append(message)
                 self.pcm_arrived.set()

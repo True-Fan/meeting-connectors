@@ -276,6 +276,19 @@ class GoogleMeetSettings(BaseModel):
     browser that is alive and connected while the audio has quietly stopped, which every
     other health check reports as healthy."""
 
+    chat_enabled: bool = True
+    """Forward the meeting's chat to the avatar agent as text, so a typed question gets a
+    spoken answer.
+
+    Reading chat requires **opening the chat panel** — Meet renders message history nowhere
+    else, and with the panel closed a message is a transient popup that leaves nothing in the
+    DOM. That is a visible UI action taken by the avatar's own account, which is the reason
+    this is a switch rather than unconditional behaviour.
+
+    Only messages arriving *after* the avatar joins are forwarded. The backlog rendered when
+    the panel opens is recorded and skipped, because answering it would mean replying to a
+    conversation that happened before the avatar was in the room."""
+
     def is_configured(self) -> bool:
         """True when the connector has a profile to launch from."""
         return self.profile_dir is not None

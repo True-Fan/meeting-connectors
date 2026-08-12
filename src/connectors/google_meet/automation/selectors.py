@@ -151,6 +151,56 @@ class MeetSelectors:
         'div[role="listitem"][aria-label]',
     )
 
+    # -- chat --------------------------------------------------------------
+    chat_open_button: tuple[str, ...] = (
+        'button[aria-label*="Chat with everyone" i]',
+        'button[aria-label="Chat" i]',
+        'button[aria-label*="Open chat" i]',
+        'button[jsname="A5il2e"]',
+    )
+    """Opens the chat panel, which has to be open for messages to exist in the DOM at all.
+
+    Meet renders chat history only inside the panel; with it closed a message appears as a
+    transient popup and is gone. So this is not a convenience — without clicking it the chat
+    feature reads nothing, and the avatar would silently ignore every typed question.
+
+    The ``jsname`` candidate last, and knowingly: it is a build artefact and the least durable
+    thing in this file. It is here because the ARIA label for this control has changed more
+    than once, so a structural fallback buys a release of grace."""
+
+    chat_panel: tuple[str, ...] = (
+        'textarea[aria-label*="Send a message" i]',
+        'textarea[aria-label*="Send a message to everyone" i]',
+        'div[aria-label*="Chat with everyone" i]',
+        'div[role="region"][aria-label*="chat" i]',
+    )
+    """The open panel. Matching it is how the page knows the click worked, rather than assuming
+    it did and then scraping nothing.
+
+    **The message-entry box first, and deliberately.** It exists only while the chat panel is
+    open, which makes it the strongest available proof. A generic ``div[data-panel-id]`` was
+    tried here and removed: Meet uses the same attribute for the people and activities panels, so
+    it matched with chat *closed* — the page would report the panel open, scan, find no messages,
+    and report nothing wrong. A false positive here is worse than a miss, because a miss is now
+    reported as ``chatOpenGaveUp``."""
+
+    chat_message: tuple[str, ...] = (
+        "div[data-message-id]",
+        'div[jsname="dTKtvb"]',
+        'div[role="listitem"] div[jsname="dTKtvb"]',
+    )
+    """One rendered message. ``data-message-id`` first because it is both a selector *and* the
+    dedupe key — Meet re-renders the list constantly, and identity is what stops one message
+    being answered five times."""
+
+    chat_sender: tuple[str, ...] = (
+        "div[data-sender-name]",
+        "[data-sender-name]",
+        'div[jsname="dTKtvb"] + div',
+    )
+    """Attribution, read from the message's own subtree. Optional: an unattributed question is
+    still worth answering, so a miss here degrades to ``sender=None`` rather than dropping."""
+
     # -- terminal states, by visible text ---------------------------------
     lobby_text: tuple[str, ...] = ("asking to join", "waiting for someone to let you in")
     denied_text: tuple[str, ...] = (
@@ -184,6 +234,10 @@ class MeetSelectors:
             "lobby": list(self.lobby),
             "leave": list(self.leave),
             "participant": list(self.participant),
+            "chatOpenButton": list(self.chat_open_button),
+            "chatPanel": list(self.chat_panel),
+            "chatMessage": list(self.chat_message),
+            "chatSender": list(self.chat_sender),
             "lobbyText": list(self.lobby_text),
             "deniedText": list(self.denied_text),
             "ejectedText": list(self.ejected_text),

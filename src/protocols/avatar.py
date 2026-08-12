@@ -41,6 +41,16 @@ class AvatarTransport(Protocol):
         """Send one PCM payload in ``AVATAR_INPUT_FORMAT``."""
         ...
 
+    async def send_control(self, payload: str) -> None:
+        """Send one JSON control frame — chat, and whatever later joins it.
+
+        Distinct from ``send_pcm`` because the two have opposite delivery requirements: PCM
+        is dropped under backpressure to stay in real time, and a control frame must not be
+        dropped at all. Implementations must serialise this against ``send_pcm`` rather than
+        writing to the socket concurrently.
+        """
+        ...
+
     def chunks(self) -> AsyncIterator[MediaChunk]:
         """Yield container chunks streamed back by the agent."""
         ...

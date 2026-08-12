@@ -53,6 +53,7 @@ from src.connectors.google_meet.exceptions import (
     MeetConfigurationError,
 )
 from src.connectors.google_meet.js import load_assets
+from src.connectors.google_meet.meeting.chat import MeetChatSource
 from src.connectors.google_meet.meeting.controls import MeetControls
 from src.connectors.google_meet.meeting.join import MeetJoiner
 from src.connectors.google_meet.meeting.meet_url import resolve_join_target
@@ -91,6 +92,21 @@ wrong direction."""
 HEARTBEAT_INTERVAL_MS = 5_000
 DOM_SCAN_INTERVAL_MS = 2_000
 
+CHAT_OPEN_WINDOW_MS = 90_000
+"""How long, after being admitted, the page keeps trying to open the chat panel.
+
+**A duration, not a number of scans, and the difference is the whole point.** The budget was
+originally ten *scans*, and scans are driven by DOM mutations — Meet mutates continuously, so ten
+attempts elapsed in about a second and a half and the page gave up permanently before Meet had
+even drawn its in-call control bar. Ninety seconds of wall clock is what "keep trying while Meet
+finishes rendering" actually means."""
+
+CHAT_OPEN_RETRY_MS = 1_500
+"""Minimum gap between attempts to open the chat panel.
+
+Without it the mutation-driven scan would click many times a second, which fights Meet's own
+layout work and can toggle a panel back shut as fast as it opens."""
+
 AUDIO_ENFORCE_INTERVAL_MS = 2_000
 """How often the page re-checks that Meet's audio sender still carries the avatar's track.
 
@@ -125,6 +141,7 @@ class ChromiumBridge:
 
     __slots__ = (
         "_channel",
+        "_chat",
         "_clock",
         "_config",
         "_controls",
@@ -184,6 +201,10 @@ class ChromiumBridge:
         self._lease: ProfileLease | None = None
         self._meeting: MeetingContext | None = None
         self._page_ready: PageReady | None = None
+        # Set by the session factory when chat is enabled. Optional rather than always
+        # constructed, so a chat-disabled session carries no chat surface at all — the same
+        # shape ``MeetingService`` uses for an unconfigured connector.
+        self._chat: MeetChatSource | None = None
 
         self._inbound: BoundedFrameQueue[AudioFrame] = BoundedFrameQueue(
             name="google_meet_inbound",
@@ -305,6 +326,14 @@ class ChromiumBridge:
             if self._live_channel() is None:
                 return ComponentHealth.unhealthy(COMPONENT_NAME, "page channel disconnected")
         return ComponentHealth(name=COMPONENT_NAME, state=self._state, detail=self._detail)
+
+    def attach_chat(self, chat: MeetChatSource) -> None:
+        """Route observed chat messages into ``chat``.
+
+        Injected rather than constructed here so the bridge keeps knowing nothing about who
+        consumes chat, and so a session with chat disabled never creates the queue.
+        """
+        self._chat = chat
 
     async def page_stats(self) -> dict[str, Any] | None:
         """Read ``window.__MC_BRIDGE_STATS__()`` from the live page.
@@ -550,6 +579,9 @@ class ChromiumBridge:
             "publishSampleRateHz": self._config.publish_audio_format.sample_rate_hz,
             "playoutBufferSeconds": PLAYOUT_BUFFER_SECONDS,
             "audioEnforceIntervalMs": AUDIO_ENFORCE_INTERVAL_MS,
+            "chatEnabled": self._config.chat_enabled,
+            "chatOpenWindowMs": CHAT_OPEN_WINDOW_MS,
+            "chatOpenRetryMs": CHAT_OPEN_RETRY_MS,
             "videoWidth": video.width,
             "videoHeight": video.height,
             "videoFps": video.fps,
@@ -767,6 +799,8 @@ class ChromiumBridge:
                 )
             case MeetMessageType.ERROR:
                 self._on_error(message)
+            case MeetMessageType.CHAT_MESSAGE:
+                self._on_chat(message)
             case MeetMessageType.PAGE_EVENT:
                 # The page reports facts and never interprets them, so this is the layer
                 # that decides they are worth a log line at all.
@@ -782,6 +816,23 @@ class ChromiumBridge:
                 logger.warning(
                     "meet_bridge.unexpected_message", msg_type=message.msg_type.name
                 )
+
+    def _on_chat(self, message: MeetMessage) -> None:
+        """Hand one observed chat message to the chat source.
+
+        Synchronous and total, like ``_on_audio``: this runs inside the read loop, which is the
+        media channel. A coroutine could stall it and an exception would tear it down — and a
+        dead read loop stops audio in both directions, which is a catastrophic price for a
+        malformed chat payload. So the sink is a plain method that swallows.
+        """
+        chat = self._chat
+        if chat is None:
+            return
+        try:
+            body = message.json()
+            chat.offer(body, message_id=str(body.get("id") or "") or None)
+        except Exception as exc:
+            logger.warning("meet_bridge.chat_dropped", error=str(exc))
 
     def _log_page_event(self, event: str | None, detail: dict[str, object]) -> None:
         """Log one page diagnostic, promoting the one that explains a silent avatar.

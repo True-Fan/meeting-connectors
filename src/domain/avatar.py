@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -62,8 +62,18 @@ class AvatarProtocolVersion:
 # Fixed contract constants
 # ---------------------------------------------------------------------------
 
-AVATAR_PROTOCOL_VERSION = AvatarProtocolVersion(major=1, minor=0)
-"""The protocol version this bridge speaks."""
+AVATAR_PROTOCOL_VERSION = AvatarProtocolVersion(major=1, minor=1)
+"""The protocol version this bridge speaks.
+
+Raised from ``1.0`` to add inbound chat (``AvatarChatMessage``), which is *additive*: the
+frame is new, nothing existing changed shape. That is precisely what the minor version is
+for, and why the compatibility rule above only pins the major. A ``1.0`` agent negotiates
+down, never receives a chat frame, and behaves exactly as it did before."""
+
+AVATAR_CHAT_MIN_VERSION = AvatarProtocolVersion(major=1, minor=1)
+"""The version that introduced chat. Below this, chat is withheld rather than sent and
+ignored — silently dropping frames a peer cannot parse is how a protocol becomes
+untrustworthy, and an old agent has no way to tell us it did not understand."""
 
 AVATAR_INPUT_FORMAT = AudioFormat(
     sample_rate_hz=16_000,
@@ -139,6 +149,35 @@ class AvatarServerHello(BaseModel):
 
     def version(self) -> AvatarProtocolVersion:
         return AvatarProtocolVersion.parse(self.protocol_version)
+
+
+class AvatarChatMessage(BaseModel):
+    """One chat message from the meeting, sent to the agent as a text frame.
+
+    **Why this is a frame and not synthesised audio.** The obvious alternative — speak the
+    chat aloud into the avatar's PCM input — would make the bridge do text-to-speech, and the
+    bridge contains no AI by construction (doc 003 §0). It would also be lossy in the way that
+    matters: the agent could no longer tell a typed question from a spoken one, and could not
+    attribute it to a sender. Text stays text until something whose job is speech decides
+    otherwise.
+
+    ``kind`` is a discriminator rather than an implied schema, so later control frames can
+    share the same channel without either side guessing.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["chat"] = "chat"
+    text: str
+    sender: str | None = None
+    """Display name as the meeting rendered it. Absent when the platform does not attribute."""
+    sent_at_us: int = 0
+    """Bridge-side receipt time. Not the platform's own timestamp, which Meet does not expose
+    to the page in a machine-readable form."""
+
+    def version(self) -> AvatarProtocolVersion:
+        """The minimum protocol version an agent must speak to receive this."""
+        return AVATAR_CHAT_MIN_VERSION
 
 
 def check_handshake(client: AvatarClientHello, server: AvatarServerHello) -> AvatarProtocolVersion:

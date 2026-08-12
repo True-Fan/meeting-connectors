@@ -34,6 +34,7 @@ from src.domain.media import AudioFrame
 from src.infrastructure.logging import get_logger
 from src.infrastructure.metrics import MetricName, MetricsCollector
 from src.protocols.audio_source import AudioSource
+from src.protocols.chat_source import ChatSource
 from src.services.media.clock import MediaClock
 from src.services.media.decode_pipeline import DecodePipeline
 from src.services.media.echo_guard import EchoGuard
@@ -49,6 +50,8 @@ class MediaRouter:
 
     __slots__ = (
         "_avatar",
+        "_chat",
+        "_chat_forwarded",
         "_clock",
         "_ctx",
         "_decode",
@@ -71,6 +74,7 @@ class MediaRouter:
         pacer: Pacer,
         echo_guard: EchoGuard,
         metrics: MetricsCollector | None = None,
+        chat: ChatSource | None = None,
     ) -> None:
         self._ctx = ctx
         self._clock = clock
@@ -80,14 +84,20 @@ class MediaRouter:
         self._pacer = pacer
         self._echo_guard = echo_guard
         self._metrics = metrics
+        # Optional, and last: Zoom and Teams pass nothing, so neither connector changed to
+        # gain a feature only Meet implements. Absence means "this platform has no chat",
+        # never a fault.
+        self._chat = chat
         self._forwarded = 0
         self._suppressed = 0
+        self._chat_forwarded = 0
 
     @property
     def stats(self) -> dict[str, int]:
         return {
             "forwarded": self._forwarded,
             "suppressed": self._suppressed,
+            "chat_forwarded": self._chat_forwarded,
             **self._pacer.stats,
         }
 
@@ -131,6 +141,8 @@ class MediaRouter:
                 group.create_task(self._route_video(), name="route-video")
                 group.create_task(self._route_audio(), name="route-audio")
                 group.create_task(self._pacer.run(), name="pacer")
+                if self._chat is not None:
+                    group.create_task(self._route_chat(), name="route-chat")
         finally:
             # Symmetric with the connect above: whatever opens the socket closes it. The three
             # session classes all document tearing down "the avatar" and none of them actually
@@ -185,6 +197,34 @@ class MediaRouter:
             self._metrics.observe(
                 MetricName.INGEST_TO_ROUTER_US, max(now_us - frame.pts_us, 0), ctx=frame.ctx
             )
+
+    # -- inbound: meeting chat → avatar ------------------------------------
+
+    async def _route_chat(self) -> None:
+        """Forward typed messages to the agent, so a chat question gets a spoken answer.
+
+        A separate leg rather than part of ``_route_inbound`` because the two share nothing
+        operationally: audio is continuous and dropped when late, chat is rare and must not be
+        dropped. Running them together would mean one loop with a branch and two incompatible
+        backpressure policies.
+
+        **No echo guard on this path, deliberately.** The guard exists to stop the avatar
+        hearing its own *voice* mixed back through the meeting, which cannot happen to text —
+        the avatar never types. The one self-reference that does exist, the avatar's own account
+        posting a message, is filtered by ``AvatarClient.send_chat`` on the ``is_self`` flag.
+
+        Failures are contained: a chat message that cannot be delivered must not kill the task
+        group and take the meeting's audio with it.
+        """
+        chat = self._chat
+        if chat is None:
+            return
+        async for message in chat.messages():
+            try:
+                if await self._avatar.send_chat(message):
+                    self._chat_forwarded += 1
+            except Exception as exc:
+                logger.warning("router.chat_forward_failed", error=str(exc))
 
     # -- avatar → decoder --------------------------------------------------
 

@@ -53,6 +53,7 @@ class WebSocketAvatarTransport:
         "_framer",
         "_metrics",
         "_open_timeout_s",
+        "_send_lock",
         "_send_queue",
         "_state",
         "_url",
@@ -92,6 +93,8 @@ class WebSocketAvatarTransport:
             metrics=metrics,
         )
         self._framer = Fmp4Framer(ctx=ctx)
+        # Serialises the PCM writer against control frames. One socket, two producers.
+        self._send_lock = asyncio.Lock()
         self._connection: ClientConnection | None = None
         self._writer: asyncio.Task[None] | None = None
         self._state = ComponentState.UNKNOWN
@@ -164,6 +167,32 @@ class WebSocketAvatarTransport:
             self._state = ComponentState.DEGRADED
             self._detail = "send queue saturated"
 
+    async def send_control(self, payload: str) -> None:
+        """Send one JSON control frame, serialised against the PCM writer.
+
+        **Sent directly rather than queued, and that is the point of the lock.** The PCM queue
+        drops its oldest entry when full, which is right for audio and wrong for a question
+        somebody typed: dropping it looks, to them, exactly like an avatar that ignored them.
+        So chat bypasses the queue.
+
+        Bypassing it means two tasks could call ``connection.send`` at once, and a WebSocket
+        connection is not safe for concurrent sends — interleaved frames would corrupt the
+        stream for both. The lock makes the two paths mutually exclusive while leaving the
+        queue's own drop policy intact for audio.
+
+        Failures are logged and swallowed. A chat message that cannot be delivered must not
+        take down a session that is otherwise carrying a conversation.
+        """
+        connection = self._connection
+        if connection is None:
+            logger.warning("avatar.control_dropped", reason="not connected")
+            return
+        try:
+            async with self._send_lock:
+                await connection.send(payload)
+        except (WebSocketException, OSError) as exc:
+            logger.warning("avatar.control_send_failed", error=str(exc))
+
     async def chunks(self) -> AsyncIterator[MediaChunk]:
         """Yield fMP4 chunks streamed back by the agent."""
         reader = asyncio.create_task(self._read_loop(), name="avatar-reader")
@@ -204,7 +233,10 @@ class WebSocketAvatarTransport:
                 return
             started = self._clock.now_us()
             try:
-                await connection.send(pcm)
+                # Held only for the write itself, so a control frame waits microseconds
+                # rather than for the queue to drain.
+                async with self._send_lock:
+                    await connection.send(pcm)
             except (WebSocketException, OSError) as exc:
                 self._fail(f"send failed: {exc}")
                 return

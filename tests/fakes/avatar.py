@@ -12,7 +12,11 @@ import asyncio
 from collections.abc import AsyncIterator
 
 from src.avatar.framing import Fmp4Framer
-from src.domain.avatar import AvatarClientHello, AvatarServerHello
+from src.domain.avatar import (
+    AVATAR_PROTOCOL_VERSION,
+    AvatarClientHello,
+    AvatarServerHello,
+)
 from src.domain.context import FrameContext
 from src.domain.health import ComponentHealth, ComponentState
 from src.domain.media import MediaChunk
@@ -39,12 +43,18 @@ class FakeAvatarTransport:
         echo_after: int = 1,
     ) -> None:
         self._ctx = ctx
-        self._reply = reply or AvatarServerHello(protocol_version="1.0")
+        # The bridge's own version by default, so the fake stands in for a *current* agent and
+        # negotiates every feature. Pass an explicit older reply to exercise the paths where a
+        # feature must be withheld.
+        self._reply = reply or AvatarServerHello(protocol_version=str(AVATAR_PROTOCOL_VERSION))
         self._response = response if response is not None else mp4.stream(3)
         self._fail_on_connect = fail_on_connect
         self._echo_after = echo_after
 
         self.sent_pcm: list[bytes] = []
+        self.sent_control: list[str] = []
+        """JSON control frames — chat, so far. Kept as raw strings so a test asserts on what
+        actually went over the wire rather than on a re-parsed object."""
         self.hellos: list[AvatarClientHello] = []
         self.connect_calls = 0
         self.closed = False
@@ -71,6 +81,9 @@ class FakeAvatarTransport:
         self.sent_pcm.append(pcm)
         if len(self.sent_pcm) == self._echo_after:
             self.emit(self._response)
+
+    async def send_control(self, payload: str) -> None:
+        self.sent_control.append(payload)
 
     def emit(self, data: bytes) -> None:
         """Push raw fMP4 bytes through the framer and queue the resulting chunks."""

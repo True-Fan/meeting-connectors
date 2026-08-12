@@ -120,5 +120,8 @@ class TestHandshake:
 
     def test_hello_serialises_to_json(self, frame_ctx: FrameContext) -> None:
         payload = self._hello(frame_ctx).model_dump_json()
-        assert '"protocol_version":"1.0"' in payload
+        # Derived from the constant, not written out: the version is expected to rise as
+        # additive frames are introduced, and a literal here turns every bump into a
+        # failing test that says nothing about whether serialisation works.
+        assert f'"protocol_version":"{AVATAR_PROTOCOL_VERSION}"' in payload
         assert frame_ctx.session_id in payload
