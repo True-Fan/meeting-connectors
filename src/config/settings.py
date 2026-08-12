@@ -401,7 +401,23 @@ class MediaSettings(BaseModel):
 
     inbound_queue_size: int = Field(default=50, ge=1)
     video_queue_size: int = Field(default=3, ge=1)
-    audio_queue_size: int = Field(default=10, ge=1)
+
+    audio_queue_size: int = Field(default=50, ge=1)
+    """Decoded avatar audio chunks the pacer may hold, at 20 ms each.
+
+    **Fifty, because ten was ten times too few and it cost the avatar its voice.** The number
+    is a jitter budget, and the jitter it has to absorb is the agent's: an utterance is
+    synthesised faster than it is spoken, and delivery stalls and catches up. A live session
+    showed the agent's own ffmpeg pausing about half a second and resuming at 1.05x, roughly
+    every ten seconds. Ten chunks is 200 ms of headroom against half-second bursts — every one
+    of them overflowed, and the overflow is speech.
+
+    One second is enough for the bursts observed and cheap: 20 ms chunks of 48 kHz mono are
+    96 KB in total. It is a *ceiling*, not a target — the queue sits near empty whenever the
+    agent is keeping pace, and ``AUDIO_BACKLOG_TRIM_US`` gives back whatever a burst leaves
+    behind during the next pause, so the latency does not accumulate.
+
+    Raise it if ``pacer.audio_lost`` still appears; that warning names this setting."""
 
     echo_gate_hangover_ms: int = Field(default=200, ge=0)
     """How long after the avatar stops publishing the echo gate stays shut."""
