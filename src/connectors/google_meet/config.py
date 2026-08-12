@@ -161,6 +161,18 @@ class GoogleMeetConnectorConfig:
     """How long the pacer keeps discarding avatar media after an interrupt, so the sentence
     already in flight does not simply resume. See ``GoogleMeetSettings.hand_raise_mute_ms``."""
 
+    speech_interrupt_enabled: bool = True
+    """Whether somebody speaking hands them the floor exactly as raising a hand would.
+
+    The response *is* the hand-raise handover — ``MediaRouter._yield_floor`` — so
+    ``hand_raise_prompt`` and ``hand_raise_mute_ms`` govern both triggers and there is nothing
+    of its own to drift. See ``GoogleMeetSettings.speech_interrupt_enabled``."""
+
+    speech_interrupt_threshold: int = 350
+    """Floor under the speech trigger in int16 RMS, not the trigger itself: the detector
+    applies ``max(this, learned_noise_floor * 3)``. See
+    ``GoogleMeetSettings.speech_interrupt_threshold``."""
+
     inject_stages: tuple[str, ...] = ()
     """Which bridge.js bootstrap stages to install; empty means all. See
     ``GoogleMeetSettings.inject_stages``."""
@@ -284,6 +296,8 @@ class GoogleMeetConnectorConfig:
             hand_raise_prompt=meet.hand_raise_prompt or HAND_RAISE_PROMPT,
             hand_raise_cooldown_s=meet.hand_raise_cooldown_s,
             hand_raise_mute_ms=meet.hand_raise_mute_ms,
+            speech_interrupt_enabled=meet.speech_interrupt_enabled,
+            speech_interrupt_threshold=meet.speech_interrupt_threshold,
             inject_stages=tuple(meet.inject_stages),
             disable_injection=meet.disable_injection,
             avatar_url=settings.avatar.url,

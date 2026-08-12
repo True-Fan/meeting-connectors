@@ -369,6 +369,44 @@ class GoogleMeetSettings(BaseModel):
     "go ahead" lands intact. Raise it if the avatar audibly resumes; lower it if the reply
     starts mid-word. Zero drops only what is already queued."""
 
+    speech_interrupt_enabled: bool = True
+    """**Treat somebody starting to speak exactly as if they had raised their hand.**
+
+    That is the whole feature, and it deliberately has no behaviour of its own: when speech is
+    detected the connector runs the same handover ``hand_raise_enabled`` runs — the avatar's
+    queued audio is dropped and the agent is sent ``hand_raise_prompt``, so it stops
+    mid-sentence and says "ok, go ahead" before listening to the question.
+
+    Both halves matter and neither is sufficient. Dropping the queued audio disposes of speech
+    that already exists, but the agent goes on *generating* the rest of its sentence and
+    resumes the moment the hold lapses; telling the agent stops that but takes a round trip,
+    during which the avatar would talk over the person. A raised hand has always done both,
+    which is why this does nothing else.
+
+    ``hand_raise_mute_ms`` and ``hand_raise_prompt`` therefore govern this too — one handover,
+    two ways in. Requires the echo gate to be open, which it is on this connector: a shut gate
+    drops the interrupting voice along with the echo, and there is nothing for it to catch
+    here anyway (``connectors/google_meet/egress/media_sink.own_participant``).
+
+    Turn it off for a meeting where the avatar should hold the floor through noise — a
+    presentation into a room with an open microphone — and a raised hand still interrupts."""
+
+    speech_interrupt_threshold: int = Field(default=350, ge=0)
+    """The floor under the speech trigger, in int16 RMS amplitude — **not the trigger**.
+
+    The trigger actually applied is ``max(this, noise_floor * 3)``, where the noise floor is
+    learned from the meeting while nobody is speaking. That is the answer to a fixed threshold
+    being wrong in every room but the one it was tuned in: a quiet room gets a low bar and a
+    loud one a high bar, with nothing to set. This value only keeps a near-silent meeting from
+    setting a bar low enough that line noise takes the floor.
+
+    ``router.speech_detected`` logs the measured ``rms``, ``noise_floor`` and ``trigger_level``
+    on every trigger. Tune against those numbers rather than guessing.
+
+    **One thing no threshold can fix.** A participant listening on *speakers* has an echo
+    canceller that suppresses their own voice while the avatar is talking — measured at 20-100x
+    quieter than the same person speaking into silence. A headset removes it entirely."""
+
     def is_configured(self) -> bool:
         """True when the connector has a profile to launch from."""
         return self.profile_dir is not None

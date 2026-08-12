@@ -257,6 +257,27 @@ class Pacer:
         self._interrupted += 1
         return dropped
 
+    def extend_hold(self, *, ms: int) -> None:
+        """Keep an interruption alive without recording a new one.
+
+        **For an interruption that has a duration**, which a raised hand does not and a voice
+        does: somebody talking holds the floor until they stop, and how long that is is not
+        known when they start. ``interrupt`` takes a fixed window because a click is
+        instantaneous; this lets the caller renew that window while the person is still
+        speaking, so the avatar stays down for the *question* rather than for a guess at how
+        long a question lasts.
+
+        Separate from ``interrupt`` rather than a repeated call to it for two reasons that
+        both show up in operations: ``interrupt`` counts, so calling it fifty times a second
+        would report one sentence as fifty interruptions, and it clears queues, which is
+        pointless once the hold is already discarding everything as it is dequeued.
+
+        Monotonic, like ``interrupt``'s own hold: this only ever pushes the window later.
+        """
+        if ms <= 0:
+            return
+        self._muted_until_us = max(self._muted_until_us, self._clock.now_us() + ms * 1_000)
+
     # -- run ---------------------------------------------------------------
 
     async def run(self) -> None:

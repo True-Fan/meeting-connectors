@@ -40,6 +40,7 @@ class EchoGuard:
     """Decides whether an inbound audio frame should reach the avatar."""
 
     __slots__ = (
+        "_gate_enabled",
         "_hangover_us",
         "_last_publish_pts_us",
         "_metrics",
@@ -54,10 +55,12 @@ class EchoGuard:
         *,
         per_participant_audio: bool,
         hangover_ms: int = DEFAULT_HANGOVER_MS,
+        gate_enabled: bool = True,
         metrics: MetricsCollector | None = None,
     ) -> None:
         self._per_participant = per_participant_audio
         self._hangover_us = max(hangover_ms, 0) * 1_000
+        self._gate_enabled = gate_enabled
         self._metrics = metrics
         self._own_user_id: int | None = None
         self._last_publish_pts_us: int | None = None
@@ -65,7 +68,14 @@ class EchoGuard:
 
         # Without per-participant attribution the gate is the only defence, so it
         # must run in strict mode rather than as a backstop.
-        self._strict = not per_participant_audio
+        self._strict = not per_participant_audio and gate_enabled
+        if not gate_enabled:
+            logger.warning(
+                "echo_guard.gate_disabled",
+                reason="inbound audio is never withheld, so a participant can interrupt "
+                "the avatar by speaking",
+                identity_filter=per_participant_audio,
+            )
         if self._strict:
             logger.warning(
                 "echo_guard.strict_mode",
@@ -105,8 +115,17 @@ class EchoGuard:
             self._last_publish_pts_us = pts_us
 
     def is_gate_open(self, now_us: int) -> bool:
-        """True when the gate is currently withholding audio."""
-        if self._last_publish_pts_us is None:
+        """True when the gate is currently withholding audio.
+
+        Always False when the gate is disabled. **Disabling it is what makes interrupting by
+        voice possible at all**: the gate drops every inbound frame while the avatar speaks,
+        and it cannot tell the avatar's echo from a person talking over it, so a shut gate
+        suppresses the interruption along with the echo. On a connector where the echo loop
+        cannot close in software — Google Meet, whose capture tap is inbound-only — it is
+        catching nothing and costing that. ``note_publishing`` still records what was
+        published, so nothing else that reads publish state changes.
+        """
+        if not self._gate_enabled or self._last_publish_pts_us is None:
             return False
         return now_us - self._last_publish_pts_us <= self._hangover_us
 

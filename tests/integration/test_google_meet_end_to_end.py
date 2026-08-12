@@ -358,13 +358,24 @@ class TestSessionSemantics:
 
 
 class TestEchoSuppression:
-    async def test_the_guard_runs_in_strict_mode(self, meet_settings, session_context) -> None:
-        """The capture graph mixes every remote track, so no inbound frame carries
-        attribution and the speaking gate is the only usable defence."""
+    async def test_the_speaking_gate_is_open_so_the_avatar_can_be_interrupted(
+        self, meet_settings, session_context
+    ) -> None:
+        """The gate would suppress the interruption along with the echo, and there is no echo.
+
+        It drops *every* inbound frame while the avatar publishes and cannot tell its own echo
+        from a person talking over it. On this connector the WebRTC tap is inbound-only, so
+        the avatar's audio never enters it — the gate is catching nothing and would cost the
+        interruption. Not strict either: strict means "the gate is the only defence", which an
+        open gate is not.
+        """
         driver = joined_driver(auto_page=True)
         session, _, _ = _build_session(meet_settings, driver, session_context)
         guard = session.router._echo_guard
-        assert guard.is_strict is True
+
+        assert guard.is_strict is False
+        guard.note_publishing(1_000_000)
+        assert guard.is_gate_open(1_000_000) is False
 
     async def test_no_own_participant_is_ever_set(
         self, meet_settings, session_context

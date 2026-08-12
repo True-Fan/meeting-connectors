@@ -31,6 +31,7 @@ from src.domain.context import FrameContext
 from src.domain.exceptions import AvatarProtocolMismatchError
 from src.domain.health import ComponentHealth, HealthReport
 from src.domain.media import AudioFrame
+from src.domain.meeting import HandRaise
 from src.infrastructure.logging import get_logger
 from src.infrastructure.metrics import MetricName, MetricsCollector
 from src.protocols.audio_source import AudioSource
@@ -40,10 +41,15 @@ from src.services.media.clock import MediaClock
 from src.services.media.decode_pipeline import DecodePipeline
 from src.services.media.echo_guard import EchoGuard
 from src.services.media.pacer import Pacer
+from src.services.media.speech_detector import SpeechDetector
 
 logger = get_logger(__name__)
 
 COMPONENT_NAME = "media_router"
+
+ANONYMOUS_SPEAKER = "Someone"
+"""Who a voice interruption is attributed to. The inbound mix carries no attribution, and
+the prompt has to name somebody — the same stand-in ``meeting/hand_raise.py`` uses."""
 
 
 class MediaRouter:
@@ -64,7 +70,9 @@ class MediaRouter:
         "_metrics",
         "_pacer",
         "_source",
+        "_speech",
         "_suppressed",
+        "_voice_prompt",
     )
 
     def __init__(
@@ -81,6 +89,8 @@ class MediaRouter:
         chat: ChatSource | None = None,
         hands: HandRaiseSource | None = None,
         hand_raise_mute_ms: int = 0,
+        speech: SpeechDetector | None = None,
+        voice_prompt: str = "",
     ) -> None:
         self._ctx = ctx
         self._clock = clock
@@ -98,6 +108,12 @@ class MediaRouter:
         # today, and absence means "this platform has no such signal", never a fault.
         self._hands = hands
         self._hand_raise_mute_ms = hand_raise_mute_ms
+        # Optional on the same terms as chat and hands: a connector that passes nothing has
+        # an inbound leg byte-for-byte identical to what it had before.
+        self._speech = speech
+        # What the agent is told when a voice takes the floor, already rendered. The same
+        # wording a raised hand sends, because it is the same request.
+        self._voice_prompt = voice_prompt
         self._forwarded = 0
         self._suppressed = 0
         self._chat_forwarded = 0
@@ -198,6 +214,22 @@ class MediaRouter:
             self._suppressed += 1
             return
 
+        # Before the send, not after: stopping the avatar is the half of an interruption that
+        # has to be immediate, and ``avatar.send`` awaits a transport that can be slow.
+        taking_floor = self._note_speech(frame)
+        if taking_floor is not None:
+            try:
+                await self._yield_floor(taking_floor, trigger="voice")
+            except Exception as exc:
+                # Contained exactly like the hand-raise leg's: an interruption that could not
+                # be delivered must not take the meeting's audio down with it.
+                logger.warning("router.speech_interrupt_failed", error=str(exc))
+        elif self._speech is not None and self._speech.is_speaking:
+            # Still talking. Renew the hold so the sentence still arriving from the agent
+            # keeps being discarded rather than resuming between their words — a fixed window
+            # fits a click, not a question.
+            self._pacer.extend_hold(ms=self._hand_raise_mute_ms)
+
         started = self._clock.now_us()
         await self._avatar.send(frame)
         self._forwarded += 1
@@ -269,25 +301,69 @@ class MediaRouter:
 
         Failures are contained, like the chat leg's: a raised hand that cannot be delivered
         must not kill the task group and take the meeting's audio with it.
+
+        The leg is only a reader. ``_yield_floor`` does both actions, and does them
+        identically for a participant who takes the floor by *speaking* — see
+        ``_note_speech``.
         """
         hands = self._hands
         if hands is None:
             return
         async for event in hands.events():
             try:
-                speaking = self._pacer.is_speaking
-                dropped = self._pacer.interrupt(hold_ms=self._hand_raise_mute_ms)
-                logger.info(
-                    "router.hand_raise",
-                    participant=event.participant,
-                    was_speaking=speaking,
-                    frames_dropped=dropped,
-                    hold_ms=self._hand_raise_mute_ms,
-                )
-                if await self._avatar.send_hand_raise(event):
-                    self._hands_forwarded += 1
+                await self._yield_floor(event, trigger="hand")
             except Exception as exc:
                 logger.warning("router.hand_raise_failed", error=str(exc))
+
+    async def _yield_floor(self, event: HandRaise, *, trigger: str) -> None:
+        """Stop the avatar and hand the floor over. The two actions above, in that order."""
+        speaking = self._pacer.is_speaking
+        dropped = self._pacer.interrupt(hold_ms=self._hand_raise_mute_ms)
+        logger.info(
+            "router.floor_yielded",
+            trigger=trigger,
+            participant=event.participant,
+            was_speaking=speaking,
+            frames_dropped=dropped,
+            hold_ms=self._hand_raise_mute_ms,
+        )
+        if await self._avatar.send_hand_raise(event):
+            self._hands_forwarded += 1
+
+    # -- inbound: a voice → stop talking -----------------------------------
+
+    def _note_speech(self, frame: AudioFrame) -> HandRaise | None:
+        """Report a participant starting to speak as the raised hand it amounts to.
+
+        **A voice and a hand are the same request — "stop, I want to speak" — so they get the
+        same answer, from the same method, with the same wording.** Nothing here is a second
+        interrupt mechanism: this only decides *when*, and returns the event the hand-raise
+        path already knows how to act on.
+
+        That matters because the local half is not sufficient on its own. Dropping the pacer's
+        queues disposes of speech that already exists; the agent goes on *generating* the rest
+        of its sentence and resumes the moment the hold lapses. Only ``send_hand_raise`` stops
+        that, and it is what makes the avatar say "ok, go ahead" rather than fall silent for a
+        second and carry on. A raised hand has always done both. Now so does a voice.
+
+        Returns None when nobody has just started — which is almost every frame.
+        """
+        detector = self._speech
+        if detector is None or not detector.observe(frame):
+            return None
+        logger.info(
+            "router.speech_detected",
+            rms=round(detector.last_rms),
+            noise_floor=round(detector.noise_floor),
+            trigger_level=round(detector.trigger_level),
+        )
+        return HandRaise(
+            # The inbound mix carries no attribution and the prompt has to name somebody —
+            # the same stand-in the hand-raise source uses for an unattributed indicator.
+            participant=ANONYMOUS_SPEAKER,
+            prompt=self._voice_prompt,
+            raised_at_us=self._clock.now_us(),
+        )
 
     # -- avatar → decoder --------------------------------------------------
 

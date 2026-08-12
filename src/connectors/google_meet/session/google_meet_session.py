@@ -46,7 +46,7 @@ from src.connectors.google_meet.browser.profile import ProfileManager
 from src.connectors.google_meet.config import GoogleMeetConnectorConfig
 from src.connectors.google_meet.egress.media_sink import ChromiumMediaSink
 from src.connectors.google_meet.meeting.chat import MeetChatSource
-from src.connectors.google_meet.meeting.hand_raise import MeetHandRaiseSource
+from src.connectors.google_meet.meeting.hand_raise import MeetHandRaiseSource, render_prompt
 from src.connectors.google_meet.monitoring.watchdog import MediaWatchdog
 from src.connectors.google_meet.virtual_camera.adapter import VirtualCameraAdapter
 from src.connectors.google_meet.virtual_microphone.adapter import VirtualMicrophoneAdapter
@@ -66,6 +66,7 @@ from src.services.media.echo_guard import EchoGuard
 from src.services.media.idle_source import IdleFrameSource
 from src.services.media.pacer import Pacer
 from src.services.media.router import MediaRouter
+from src.services.media.speech_detector import SpeechDetector
 
 logger = get_logger(__name__)
 
@@ -322,11 +323,16 @@ class GoogleMeetSessionFactory:
 
         echo_guard = EchoGuard(
             # False, and structurally so: the capture graph mixes every remote track before
-            # sampling, so no inbound frame carries attribution. The guard's strict speaking
-            # gate is the correct fallback, and here it is also sufficient — see the module
-            # docstring. Capability as data, not a branch.
+            # sampling, so no inbound frame carries attribution. Capability as data, not a
+            # branch.
             per_participant_audio=False,
             hangover_ms=config.echo_gate_hangover_ms,
+            # ...and the speaking gate is *open* on this connector, which is what makes the
+            # avatar interruptible. The gate cannot tell the avatar's echo from a person
+            # talking over it, so a shut gate suppresses the interruption too — and here there
+            # is no echo for it to catch: the WebRTC tap is inbound-only, so the avatar's own
+            # audio never enters it (``egress/media_sink.own_participant``).
+            gate_enabled=False,
             metrics=self._metrics,
         )
         # Deliberately no ``set_own_participant`` and no listener, where Zoom sets it from the
@@ -423,6 +429,17 @@ class GoogleMeetSessionFactory:
             )
             hands = hand_source
 
+        # Speech as a trigger for the hand-raise handover — built only when enabled, on the
+        # same terms as chat and hands, so a session that should hold the floor carries no
+        # detector at all rather than an inert one. The wording is the hand's, rendered here
+        # because the inbound mix carries no name: a voice and a hand are the same request, so
+        # the avatar should answer both with "ok, go ahead".
+        speech: SpeechDetector | None = None
+        voice_prompt = ""
+        if config.speech_interrupt_enabled:
+            speech = SpeechDetector(rms_threshold=config.speech_interrupt_threshold)
+            voice_prompt = render_prompt(config.hand_raise_prompt, None)
+
         router = MediaRouter(
             ctx=ctx,
             clock=clock,
@@ -435,6 +452,8 @@ class GoogleMeetSessionFactory:
             chat=chat,
             hands=hands,
             hand_raise_mute_ms=config.hand_raise_mute_ms,
+            speech=speech,
+            voice_prompt=voice_prompt,
         )
 
         watchdog = MediaWatchdog(
