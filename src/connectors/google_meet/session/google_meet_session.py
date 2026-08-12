@@ -377,8 +377,21 @@ class GoogleMeetSessionFactory:
         # inert one.
         chat: MeetChatSource | None = None
         if config.chat_enabled:
-            chat = MeetChatSource(clock=clock)
-            bridge.attach_chat(chat)
+            chat_source = MeetChatSource(
+                clock=clock,
+                require_mention=config.chat_require_mention,
+                mention_names=(config.display_name, *config.chat_mention_names),
+            )
+            bridge.attach_chat(chat_source)
+            # The name participants actually see — and therefore the one they type when they
+            # want an answer — belongs to the signed-in Google account, not to
+            # ``display_name``, which Meet only asks for when the profile has lost its session.
+            # The roster is the only place that name appears, so the source learns it from
+            # there and treats the configured name as the fallback until it does.
+            bridge.add_roster_listener(
+                lambda roster: chat_source.observe_self_name(roster.self_name)
+            )
+            chat = chat_source
 
         router = MediaRouter(
             ctx=ctx,

@@ -130,6 +130,16 @@ class GoogleMeetConnectorConfig:
     only respond to voice, or where opening the chat panel is unwelcome — it changes the layout
     other participants see nothing of, but it is still a visible action on the account."""
 
+    chat_require_mention: bool = True
+    """Answer only the chat messages that ``@``-tag the avatar. See
+    ``GoogleMeetSettings.chat_require_mention`` for what counts as a tag, and
+    ``meeting/chat.py`` for where the decision is made — in Python, like every other policy
+    the page could have been asked to apply and deliberately is not."""
+
+    chat_mention_names: tuple[str, ...] = ()
+    """Extra names the avatar answers to after an ``@``, beyond the one Meet shows for its own
+    account (learned from the roster) and the configured ``display_name``."""
+
     inject_stages: tuple[str, ...] = ()
     """Which bridge.js bootstrap stages to install; empty means all. See
     ``GoogleMeetSettings.inject_stages``."""
@@ -243,6 +253,8 @@ class GoogleMeetConnectorConfig:
             rejoin_max_attempts=meet.rejoin_max_attempts,
             watchdog_interval_s=meet.watchdog_interval_s,
             chat_enabled=meet.chat_enabled,
+            chat_require_mention=meet.chat_require_mention,
+            chat_mention_names=tuple(meet.chat_mention_names),
             inject_stages=tuple(meet.inject_stages),
             disable_injection=meet.disable_injection,
             avatar_url=settings.avatar.url,

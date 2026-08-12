@@ -289,6 +289,34 @@ class GoogleMeetSettings(BaseModel):
     the panel opens is recorded and skipped, because answering it would mean replying to a
     conversation that happened before the avatar was in the room."""
 
+    chat_require_mention: bool = True
+    """Answer only chat messages that ``@``-tag the avatar, ignoring the rest of the conversation.
+
+    Meeting chat is a conversation between people — links, greetings, participants answering
+    each other — and an avatar that replies to every line is interrupting a room that was not
+    talking to it. With this on, "@AI Avatar what is the notice period?" is answered while
+    "sounds good, thanks!" and "did the AI avatar join?" are not.
+
+    Meet has no mention feature: no autocomplete, no participant token, nothing structural in
+    the DOM. The ``@`` is therefore the only deliberate signal a participant can give, and it
+    is **required** — it is what separates talking to the avatar from talking about it. What
+    follows it is matched loosely, ignoring case and optional separators, so ``@AI Avatar``,
+    ``@ai_avatar``, ``@ai-avatar`` and ``@AIAvatar`` all count; the name must still stand as
+    whole words, so ``@Aisha`` does not trigger an avatar named "AI". The mention is stripped
+    before the text reaches the agent.
+
+    Set false to go back to answering every message — reasonable for a one-to-one meeting,
+    where everything typed is addressed to the avatar anyway."""
+
+    chat_mention_names: list[str] = Field(default_factory=list)
+    """Extra names the avatar answers to after an ``@``, on top of the one Meet shows for its
+    own account.
+
+    Usually unnecessary: the rendered name is read from the roster, so whatever participants
+    see is already matched. Worth setting when the account's name is long or awkward to type
+    and people will shorten it — an account called "TrueFan Interview Avatar" gets
+    ``["Gunika", "bot"]`` so ``@Gunika`` and ``@bot`` are recognised too."""
+
     def is_configured(self) -> bool:
         """True when the connector has a profile to launch from."""
         return self.profile_dir is not None

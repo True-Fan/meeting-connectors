@@ -10,7 +10,9 @@ The decisions worth testing are the ones where the obvious behaviour is wrong:
   loop ``EchoGuard`` exists to prevent;
 * history rendered when the chat panel opens is not a set of new questions;
 * an agent that predates chat must be told nothing rather than sent frames it cannot parse;
-* one message must be answered once, however many times Meet re-renders its list.
+* one message must be answered once, however many times Meet re-renders its list;
+* a message between two participants is not a question for the avatar — only a message that
+  names it is, because Meet offers no mention feature to key on.
 """
 
 from __future__ import annotations
@@ -20,7 +22,12 @@ import asyncio
 import pytest
 
 from src.avatar.client import AvatarClient
-from src.connectors.google_meet.meeting.chat import MAX_CHARS, MeetChatSource, parse_chat_message
+from src.connectors.google_meet.meeting.chat import (
+    MAX_CHARS,
+    MeetChatSource,
+    parse_chat_message,
+    strip_mention,
+)
 from src.domain.avatar import (
     AVATAR_CHAT_MIN_VERSION,
     AVATAR_PROTOCOL_VERSION,
@@ -81,11 +88,22 @@ class TestParsing:
 
 
 class TestMeetChatSource:
+    """Queueing mechanics, tested with the mention requirement off.
+
+    Every message here is addressed to the avatar by construction — what is under test is the
+    queue, the dedupe and the overflow policy, and mixing the addressing decision in would only
+    make a failure ambiguous. ``TestMentionPolicy`` covers the filter itself.
+    """
+
+    @staticmethod
+    def _source(**kwargs: object) -> MeetChatSource:
+        return MeetChatSource(clock=MediaClock(), require_mention=False, **kwargs)  # type: ignore[arg-type]
+
     def test_it_satisfies_the_port(self) -> None:
         assert isinstance(MeetChatSource(clock=MediaClock()), ChatSource)
 
     async def test_offered_messages_are_yielded(self) -> None:
-        source = MeetChatSource(clock=MediaClock())
+        source = self._source()
         await source.start()
         assert source.offer({"text": "first"}, message_id="m1")
 
@@ -96,7 +114,7 @@ class TestMeetChatSource:
     async def test_the_same_message_id_is_only_accepted_once(self) -> None:
         """Meet re-renders the chat list on almost every DOM mutation. Without identity one
         typed question is forwarded on every scan and answered repeatedly."""
-        source = MeetChatSource(clock=MediaClock())
+        source = self._source()
         await source.start()
 
         assert source.offer({"text": "how long is the process?"}, message_id="m1") is True
@@ -108,7 +126,7 @@ class TestMeetChatSource:
     async def test_a_full_queue_drops_the_newest(self) -> None:
         """The opposite of the audio policy, and correct for the same reason it is wrong there:
         a conversation must stay coherent, so an earlier question keeps its place."""
-        source = MeetChatSource(clock=MediaClock(), maxsize=2)
+        source = self._source(maxsize=2)
         await source.start()
         assert source.offer({"text": "one"}, message_id="a") is True
         assert source.offer({"text": "two"}, message_id="b") is True
@@ -121,7 +139,7 @@ class TestMeetChatSource:
     async def test_offer_never_raises(self) -> None:
         """It is called from the bridge's read loop, which is the media channel. An exception
         there stops audio in both directions — a catastrophic price for a bad chat payload."""
-        source = MeetChatSource(clock=MediaClock())
+        source = self._source()
         await source.start()
         for body in ({}, {"text": None}, {"text": ""}):
             assert source.offer(body) is False
@@ -134,6 +152,162 @@ class TestMeetChatSource:
         source = MeetChatSource(clock=MediaClock())
         await source.start()
         assert source.health().state is ComponentState.HEALTHY
+
+
+class TestMentionMatching:
+    """``strip_mention`` — what counts as tagging the bot, and what the agent then sees.
+
+    Meet has no mention feature: no autocomplete, no participant token, nothing structural in
+    the DOM. The ``@`` is the only deliberate signal a participant can give, so it is required
+    — it is what separates talking *to* the avatar from talking *about* it. What follows it is
+    matched loosely, because people type a name however they like.
+    """
+
+    NAMES = ("AI Avatar",)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "@AI Avatar what is the notice period?",
+            "@ai avatar what is the notice period?",
+            "@AIAvatar what is the notice period?",
+            "@ai_avatar what is the notice period?",
+            "@ai-avatar what is the notice period?",
+            "@AI Avatar, what is the notice period?",
+        ],
+    )
+    def test_a_tagged_message_is_addressed_and_the_tag_removed(self, text: str) -> None:
+        """The remainder becomes an LLM prompt, so the vocative goes: left in, it invites the
+        agent to answer a question about its own name."""
+        assert strip_mention(text, self.NAMES) == "what is the notice period?"
+
+    def test_a_mention_later_in_the_line_still_counts(self) -> None:
+        assert strip_mention("quick one for @AI Avatar — is this recorded?", self.NAMES) == (
+            "quick one for — is this recorded?"
+        )
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "sounds good, thanks!",
+            "here's the JD: https://example.com/jd",
+            "@Priya can you share the deck?",
+        ],
+    )
+    def test_a_message_between_participants_is_not_addressed(self, text: str) -> None:
+        assert strip_mention(text, self.NAMES) is None
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "AI Avatar what is the notice period?",
+            "did the AI avatar join?",
+            "ai avatar, are you there?",
+        ],
+    )
+    def test_the_name_without_an_at_is_not_a_tag(self, text: str) -> None:
+        """Talking about the avatar is not talking to it. Without the ``@`` there is no way to
+        tell the two apart, so the room gets left alone."""
+        assert strip_mention(text, self.NAMES) is None
+
+    @pytest.mark.parametrize("text", ["@Aisha is joining late", "@aiavatarish nonsense"])
+    def test_a_name_embedded_in_another_word_is_not_a_mention(self, text: str) -> None:
+        """A participant called "Aisha" must not trigger an avatar called "AI"."""
+        assert strip_mention(text, ("AI",)) is None
+
+    def test_a_bare_mention_keeps_its_text(self) -> None:
+        """Somebody getting the avatar's attention with nothing else. Stripping to an empty
+        string would have ``send_chat`` drop it silently, which reads as being ignored."""
+        assert strip_mention("@AI Avatar", self.NAMES) == "@AI Avatar"
+
+    def test_any_configured_name_matches(self) -> None:
+        assert strip_mention("@gunika are you there?", ("AI Avatar", "Gunika")) == (
+            "are you there?"
+        )
+
+    def test_no_names_means_nothing_is_addressed(self) -> None:
+        assert strip_mention("@AI Avatar hello", ()) is None
+
+
+class TestMentionPolicy:
+    """The filter as the bridge applies it: which offers survive, and what the agent receives."""
+
+    def _source(self, **kwargs: object) -> MeetChatSource:
+        return MeetChatSource(clock=MediaClock(), mention_names=("AI Avatar",), **kwargs)  # type: ignore[arg-type]
+
+    async def test_only_the_message_naming_the_avatar_is_queued(self) -> None:
+        source = self._source()
+        await source.start()
+
+        chatter = source.offer({"text": "shall we start?", "sender": "Priya"}, message_id="m1")
+        reply = source.offer({"text": "yes, one minute", "sender": "Dev"}, message_id="m2")
+        question = source.offer(
+            {"text": "@AI Avatar what is the CTC?", "sender": "Priya"}, message_id="m3"
+        )
+        assert (chatter, reply, question) == (False, False, True)
+
+        assert source.received == 1
+        assert source.ignored == 2
+        message = await asyncio.wait_for(anext(source.messages()), timeout=1)
+        assert message.text == "what is the CTC?"
+        assert message.sender == "Priya"
+
+    async def test_an_ignored_message_is_not_reconsidered_on_the_next_scan(self) -> None:
+        """Meet re-renders the list constantly. A message nobody addressed to the avatar does
+        not become addressed to it on the next scan, and re-testing it is work with no outcome
+        — the id is remembered whatever the verdict."""
+        source = self._source()
+        await source.start()
+
+        for _ in range(5):
+            assert source.offer({"text": "sounds good"}, message_id="m1") is False
+        assert source.ignored == 1
+
+    async def test_the_requirement_can_be_turned_off(self) -> None:
+        """A 1:1 meeting, where everything typed is addressed to the avatar anyway."""
+        source = MeetChatSource(clock=MediaClock(), require_mention=False)
+        await source.start()
+        assert source.offer({"text": "shall we start?"}, message_id="m1") is True
+
+    async def test_nothing_is_forwarded_while_no_name_is_known(self) -> None:
+        """A misconfiguration, and a loud one: a silently deaf avatar looks like a broken one,
+        so the warning carries the two settings that fix it."""
+        source = MeetChatSource(clock=MediaClock())
+        await source.start()
+        assert source.offer({"text": "@AI Avatar hello"}, message_id="m1") is False
+
+    async def test_the_roster_name_is_learned_and_answered_to(self) -> None:
+        """The configured ``display_name`` is only what Meet is told if it asks. A signed-in
+        profile joins under the account's own name, which is what participants type."""
+        source = MeetChatSource(clock=MediaClock(), mention_names=("AI Avatar",))
+        await source.start()
+        assert source.offer({"text": "@Gunika are you there?"}, message_id="m1") is False
+
+        source.observe_self_name("Gunika")
+        assert source.offer({"text": "@Gunika are you there?"}, message_id="m2") is True
+        assert source.mention_names == ("AI Avatar", "Gunika")
+
+    def test_learning_a_name_is_idempotent_and_survives_junk(self) -> None:
+        """Fed from the roster listener, which runs on the bridge's read loop: it is called on
+        every roster scan, and the page can report an empty name."""
+        source = MeetChatSource(clock=MediaClock(), mention_names=("AI Avatar",))
+        for name in ("Gunika", "gunika", "  Gunika  ", None, "", "   "):
+            source.observe_self_name(name)
+        assert source.mention_names == ("AI Avatar", "Gunika")
+
+    async def test_the_avatars_own_message_skips_the_check(self) -> None:
+        """It carries the avatar's name by definition, so testing it would only say yes.
+        ``send_chat`` drops it on ``is_self`` a step later, which is where that belongs."""
+        source = self._source()
+        await source.start()
+        own = source.offer(
+            {"text": "Hello! I am Gunika", "sender": "AI Avatar", "isSelf": True},
+            message_id="m1",
+        )
+        assert own is True
+        message = await asyncio.wait_for(anext(source.messages()), timeout=1)
+        assert message.is_self is True
+        assert message.text == "Hello! I am Gunika"
 
 
 class TestForwardingPolicy:
