@@ -215,6 +215,45 @@ class TestBridgeContract:
         assert "navigator.sendBeacon" not in bridge_code
 
 
+class TestScanCost:
+    """What the DOM scans cost the media path.
+
+    Everything this bridge does shares one thread with Meet's own WebRTC, the canvas that
+    backs the avatar's camera track, and the `postMessage` that feeds the playout worklet.
+    Work done here is not free and does not fail loudly — it is paid for in media that
+    arrives late, which is what a participant hears as an avatar that answers slowly.
+    """
+
+    def test_the_page_text_is_read_once_per_scan(self, bridge_code: str) -> None:
+        """``innerText`` forces a synchronous layout of the whole document and then
+        serialises the text out of it. ``observedState`` used to call it up to four times per
+        scan, on a scan driven by Meet's own mutations — hundreds of full-page reflows a
+        second, for four checks that could share one read."""
+        state_fn = bridge_code.split("function observedState()", 1)[1].split(
+            "\n  function ", 1
+        )[0]
+        assert "innerText" not in state_fn, "observedState must not read the page itself"
+        assert state_fn.count("bodyText()") == 1, "one read, however many checks consume it"
+        assert bridge_code.count("document.body.innerText") == 1
+
+    def test_the_scans_have_a_floor_between_them(self, bridge_code: str) -> None:
+        """Coalescing per animation frame bounds the scans at Meet's repaint rate and no
+        lower, and Meet mutates on essentially every frame — so they ran at ~60 Hz for the
+        whole call, each pass laying out the document and reading ``innerText`` off every chat
+        and participant row."""
+        observers = bridge_code.split("function installObservers()", 1)[1]
+        assert "CONFIG.scanThrottleMs" in observers
+        assert "lastScanAt" in observers
+
+    def test_a_scan_deferred_by_the_floor_still_happens(self, bridge_code: str) -> None:
+        """Dropping a scan that arrives inside the window would mean a chat message typed
+        during a burst of mutations waits for the *next* mutation — and in a still meeting
+        the next one may be seconds away, which reads as an ignored question."""
+        observers = bridge_code.split("function installObservers()", 1)[1]
+        assert "trailing" in observers
+        assert "setTimeout" in observers
+
+
 class TestWorkletContract:
     def test_the_capture_worklet_batches_to_a_whole_frame(self) -> None:
         """Partial frames would be rejected by ``AudioFrame``'s own validation."""
@@ -229,10 +268,16 @@ class TestWorkletContract:
         assert "0x7fff" in source
 
     def test_the_playout_worklet_never_stalls_the_graph(self) -> None:
-        """Returning false would tear the node out and kill the microphone track for good."""
+        """Returning false would tear the node out and kill the microphone track for good.
+
+        Scoped to ``process`` rather than to the file: it is the return value of *that* method
+        that the graph acts on, and a predicate helper answering "is this block silent" with
+        ``false`` is not the same statement at all.
+        """
         source = read_asset(PLAYOUT_WORKLET_ASSET)
-        assert "return false" not in source
-        assert "return true" in source
+        process = source.split("  process(_inputs, outputs) {", 1)[1]
+        assert "return false" not in process
+        assert "return true" in process
 
     def test_the_playout_worklet_drops_oldest_on_overflow(self) -> None:
         """Python ahead of the sound card means latency is accumulating; stale audio goes."""
@@ -244,6 +289,35 @@ class TestWorkletContract:
         """The bridge carries no metrics; it reports counters and Python decides."""
         playout = read_asset(PLAYOUT_WORKLET_ASSET)
         assert "type: 'stats'" in playout
+
+    def test_the_playout_worklet_gives_accumulated_latency_back(self) -> None:
+        """Overflow at capacity was the only thing that ever removed samples.
+
+        Nothing corrects the two clocks either side of the ring, so every hiccup added to its
+        standing depth and none of it came back: the buffer ratcheted towards its half-second
+        capacity over a call and stayed there, which is half a second added to every reply
+        with every health check still green.
+        """
+        source = read_asset(PLAYOUT_WORKLET_ASSET)
+        assert "_trim()" in source
+        assert "_target" in source
+
+    def test_the_playout_worklet_only_ever_trims_silence(self) -> None:
+        """A shortened pause is inaudible; a shortened word is a hole in speech.
+
+        The trim stops at the first block carrying any sound, so a backlog behind a sentence
+        still being spoken waits for the pause after it rather than eating into it.
+        """
+        source = read_asset(PLAYOUT_WORKLET_ASSET)
+        assert "_silentAhead" in source
+        assert "SILENCE_FLOOR" in source
+
+    def test_the_playout_worklet_tests_a_block_rather_than_a_sample(self) -> None:
+        """Speech crosses zero on every cycle, so a per-sample silence test would cut into a
+        vowel at the first zero crossing it found."""
+        source = read_asset(PLAYOUT_WORKLET_ASSET)
+        assert "_trimBlock" in source
+        assert "_silentAhead(block)" in source
 
 
 class TestOutboundAudioEnforcement:
@@ -543,10 +617,60 @@ class TestHandRaiseCapture:
         assert "state.handsUp.has(candidate.key)" in scan, (
             "a hand already up must not be re-reported"
         )
-        assert "state.handsUp = current" in scan, (
-            "the current set must replace the old one, or a lowered hand could never be "
-            "raised again"
+        assert "state.handsUp.add(candidate.key)" in scan, (
+            "a hand observed up must be recorded as up, so the next scan reads it as the "
+            "same hand rather than as a new one"
         )
+
+    def test_a_hand_still_up_is_recorded_before_the_gates_that_withhold_it(
+        self, bridge_code: str
+    ) -> None:
+        """Baselining and the cooldown decide whether to *report* a hand, never whether it is
+        up. Recording it only after those gates would leave a withheld hand looking unseen, so
+        every later scan would read it as a fresh raise and the gate it just failed would be
+        the only thing holding it back — which is a rate limit, not an edge.
+        """
+        scan = bridge_code.split("function scanHands()", 1)[1].split("function scanRoster", 1)[0]
+        recorded = scan.index("state.handsUp.add(candidate.key)")
+        assert recorded < scan.index("if (baselining)"), "recorded before the baseline gate"
+        assert recorded < scan.index("cooldownMs && now - last"), "recorded before the cooldown"
+
+    def test_a_hand_comes_down_only_after_a_grace_window_of_not_being_seen(
+        self, bridge_code: str
+    ) -> None:
+        """**The fix for an avatar repeating "ok, go ahead" at a hand that never moved.**
+
+        The set of raised hands used to be replaced wholesale by whatever the current scan
+        found — and only the twice-a-second sweep finds anything, because Meet renders the
+        evidence as text and icon glyphs rather than as attributes. Every scan in between
+        emptied the set, so the next sweep re-reported the same unmoved hand as a new one and
+        the cooldowns turned that into an interruption on a timer. Measured against this
+        file's own scan loop: 118 interruptions from one hand held up for ten minutes.
+
+        A hand therefore comes down when it has not been *seen* for a while, not when one scan
+        missed it — a real raised hand does briefly leave the DOM when Meet re-renders a tile,
+        closes the people panel, or scrolls a participant out of its virtualised list.
+        """
+        scan = bridge_code.split("function scanHands()", 1)[1].split("function scanRoster", 1)[0]
+        assert "state.handsUp = current" not in scan, (
+            "replacing the set from one scan is the bug: a scan that could not see a hand is "
+            "not evidence that it came down"
+        )
+        assert "state.handsSeenAt.set(candidate.key, now)" in scan, (
+            "a hand still up must refresh its timestamp, not merely be skipped"
+        )
+        assert "handRaiseDownGraceMs" in scan
+        assert "state.handsUp.delete(key)" in scan
+
+    def test_a_hand_is_only_retired_on_a_full_sweep(self, bridge_code: str) -> None:
+        """The narrow selector pass that runs between sweeps matches nothing in the layouts
+        Meet actually renders, so letting a partial scan age a hand out would reintroduce the
+        same false edge the grace window exists to remove."""
+        scan = bridge_code.split("function scanHands()", 1)[1].split("function scanRoster", 1)[0]
+        # The last `if (sweep)` is the retirement pass; the first only stamps the sweep clock.
+        retire = scan.rsplit("if (sweep) {", 1)
+        assert len(retire) > 1, "retirement must be inside a sweep-only branch"
+        assert "state.handsUp.delete(key)" in retire[1].split("\n    }", 1)[0]
 
     def test_a_hand_is_recognised_by_wording_rather_than_by_markup(
         self, bridge_code: str

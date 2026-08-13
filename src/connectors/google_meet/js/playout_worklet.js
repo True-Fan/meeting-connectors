@@ -26,7 +26,32 @@
  *
  * Both counters are reported upward so the Python side can see them: this
  * processor makes no judgement about whether they matter.
+ *
+ * **What the buffer holds is latency, and nothing here used to give it back.**
+ * The two clocks either side of this ring are independent and neither is
+ * corrected: the Pacer emits exactly 20 ms of audio every 20 ms of its own
+ * monotonic clock, and Web Audio pulls 128 samples at whatever rate the audio
+ * device actually runs at. Every scheduling hiccup, every burst that arrives
+ * while the main thread is busy, adds to the standing depth — and because the
+ * only thing that ever removed samples was overflow at the far end of half a
+ * second, the depth ratcheted upward for the life of the call and stayed
+ * there. A listener hears that as the avatar answering half a second late,
+ * getting later the longer the meeting runs, with nothing anywhere reporting a
+ * fault.
+ *
+ * So the ring is trimmed back towards a target depth — but **only ever through
+ * silence**, which is what makes it free. A discarded silent block shortens a
+ * pause between utterances by a few milliseconds and nobody can hear it; a
+ * discarded audible block is a hole in a word and everybody can. The Pacer
+ * publishes continuously, so the gaps between the avatar's sentences are full
+ * of exactly the silence this needs, and the backlog collapses to the target
+ * during any pause in the conversation. It is the same trade `Pacer._take_audio`
+ * makes one process upstream, for the same reason, and it never touches speech.
  */
+
+const SILENCE_FLOOR = 512 / 0x8000;
+/* Amplitude at or above which a sample counts as sound, matching `pacer.SILENCE_FLOOR`
+ * on int16's scale (about -36 dBFS). Above lossy-decode noise, far below speech. */
 
 class McPlayoutProcessor extends AudioWorkletProcessor {
   constructor(options) {
@@ -38,8 +63,20 @@ class McPlayoutProcessor extends AudioWorkletProcessor {
     this._write = 0;
     this._available = 0;
 
+    // The depth to trim back towards. Deep enough to absorb the jitter between a 20 ms
+    // arrival cadence and a 128-sample render quantum; shallow enough that what it costs a
+    // conversation is not worth measuring. Zero disables trimming entirely.
+    this._target = opts.targetSamples || 0;
+    // Trimmed in whole blocks, and the size is a floor rather than a preference: speech
+    // crosses zero on every cycle, so a per-sample test would cut into a vowel at the first
+    // zero crossing it found. A block that is *entirely* below the floor cannot be part of a
+    // voiced sound — the lowest pitch a human produces still completes half a cycle well
+    // inside it.
+    this._trimBlock = opts.trimBlockSamples || 240;
+
     this._underruns = 0;
     this._dropped = 0;
+    this._trimmed = 0;
     this._reportEvery = opts.reportEverySamples || 48000;
     this._sinceReport = 0;
 
@@ -53,8 +90,46 @@ class McPlayoutProcessor extends AudioWorkletProcessor {
       }
       if (data instanceof Int16Array) {
         this._push(data);
+        this._trim();
       }
     };
+  }
+
+  /*
+   * Whether the `count` oldest queued samples are all silence.
+   *
+   * Reads without consuming, so a block that turns out to carry speech is left exactly where
+   * it was and gets played.
+   */
+  _silentAhead(count) {
+    let index = this._read;
+    for (let i = 0; i < count; i += 1) {
+      const sample = this._ring[index];
+      if (sample >= SILENCE_FLOOR || sample <= -SILENCE_FLOOR) {
+        return false;
+      }
+      index = (index + 1) % this._capacity;
+    }
+    return true;
+  }
+
+  /*
+   * Give back accumulated latency, one silent block at a time.
+   *
+   * Stops at the first block that carries any sound, so speech is never the thing that gets
+   * shortened — a backlog behind a sentence that is still being spoken simply waits for the
+   * pause after it, which is where it costs nothing.
+   */
+  _trim() {
+    if (!this._target) {
+      return;
+    }
+    const block = this._trimBlock;
+    while (this._available - this._target >= block && this._silentAhead(block)) {
+      this._read = (this._read + block) % this._capacity;
+      this._available -= block;
+      this._trimmed += block;
+    }
   }
 
   _push(pcm) {
@@ -105,6 +180,7 @@ class McPlayoutProcessor extends AudioWorkletProcessor {
         type: 'stats',
         underruns: this._underruns,
         dropped: this._dropped,
+        trimmed: this._trimmed,
         buffered: this._available,
       });
     }

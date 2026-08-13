@@ -208,6 +208,11 @@
     // a hand reports once when it appears in the set and again only after it has left it.
     // Keyed by participant id where Meet gives one, by name where it does not.
     handsUp: new Set(),
+    // key -> the last time that hand was actually observed on the page. What makes "still up"
+    // survive a scan that could not see it: the broad sweep runs twice a second and the narrow
+    // selector pass in between finds nothing in most Meet layouts, so presence is only ever
+    // sampled. Membership of `handsUp` is retired from this rather than from the last scan.
+    handsSeenAt: new Map(),
     // key -> last report time. A hand that flickers off and on during a re-render must not
     // interrupt the avatar twice, and Meet re-renders constantly.
     handsLastSentAt: new Map(),
@@ -424,6 +429,13 @@
       outputChannelCount: [1],
       processorOptions: {
         capacitySamples: Math.round(CONFIG.publishSampleRateHz * CONFIG.playoutBufferSeconds),
+        // The depth the ring is trimmed back to through silence. The capacity above is the
+        // hard ceiling that drops audio outright; this is the standing depth the buffer is
+        // kept near, so latency does not ratchet up to that ceiling and stay there.
+        targetSamples: Math.round(
+          CONFIG.publishSampleRateHz * (CONFIG.playoutTargetSeconds || 0)
+        ),
+        trimBlockSamples: Math.max(Math.round(CONFIG.publishSampleRateHz * 0.005), 1),
         reportEverySamples: CONFIG.publishSampleRateHz,
       },
     });
@@ -945,31 +957,49 @@
     return false;
   }
 
-  function textPresent(needles) {
-    const body = document.body ? document.body.innerText || '' : '';
-    const haystack = body.toLowerCase();
-    return (needles || []).some((needle) => haystack.includes(needle.toLowerCase()));
+  /*
+   * The page's visible text, read once.
+   *
+   * `innerText` is not a cheap property. It forces a synchronous layout of the whole document
+   * and then serialises the rendered text out of it, and on a Meet call that is a large tree
+   * that is being mutated continuously. **It is also the single most expensive thing this
+   * bridge does**, and it used to be done four times per scan on a scan driven by Meet's own
+   * mutations — hundreds of full-page reflows a second, on the one main thread that also
+   * encodes the avatar's camera track, runs Meet's own WebRTC, and hands PCM to the playout
+   * worklet. Everything downstream of that thread arrives late when it is busy, which is what
+   * a listener hears as the avatar answering slowly.
+   */
+  function bodyText() {
+    return document.body ? document.body.innerText || '' : '';
+  }
+
+  function textPresent(needles, haystack) {
+    const text = (haystack || '').toLowerCase();
+    return (needles || []).some((needle) => text.includes(needle.toLowerCase()));
   }
 
   function observedState() {
     const s = CONFIG.selectors;
+    // One read, four checks. The checks and their order are unchanged; only the number of
+    // times the page is laid out to answer them is.
+    const text = bodyText();
     // Order matters and encodes precedence: a terminal condition must win over
     // "still in call", because the leave button lingers in the DOM for a beat
     // after a host removes us and the wrong answer there causes a rejoin loop
     // against a meeting that has explicitly rejected the avatar.
-    if (textPresent(s.ejectedText)) {
+    if (textPresent(s.ejectedText, text)) {
       return 'ejected';
     }
-    if (textPresent(s.deniedText)) {
+    if (textPresent(s.deniedText, text)) {
       return 'denied';
     }
-    if (textPresent(s.endedText)) {
+    if (textPresent(s.endedText, text)) {
       return 'ended';
     }
     if (matchesAny(s.inCall)) {
       return 'joined';
     }
-    if (matchesAny(s.lobby) || textPresent(s.lobbyText)) {
+    if (matchesAny(s.lobby) || textPresent(s.lobbyText, text)) {
       return 'lobby';
     }
     return 'joining';
@@ -1303,6 +1333,12 @@
    * avatar dozens of times per hand. `handsUp` holds the current set; only entering it is
    * reported, and a hand must be lowered before it can be reported again.
    *
+   * **What that set is built from is the whole difficulty**, and getting it wrong produced an
+   * avatar that said "ok, go ahead" every few seconds at somebody whose hand had not moved.
+   * Presence is *sampled*, not observed: the sweep that can actually find a hand runs twice a
+   * second, and the scans in between see nothing. So the set is aged out by when each hand was
+   * last **seen** rather than rebuilt from the latest scan — see `scanHands`.
+   *
    * Nothing here decides whether a raised hand should interrupt the avatar, or what the agent
    * is told. The page reports the edge; Python decides the rest.
    */
@@ -1602,11 +1638,13 @@
     if (state.meetState !== 'joined') {
       state.handsWasJoined = false;
       state.handsUp.clear();
+      state.handsSeenAt.clear();
       return;
     }
     if (!state.handsWasJoined) {
       state.handsWasJoined = true;
       state.handsUp.clear();
+      state.handsSeenAt.clear();
       state.handsLastSentAt.clear();
       state.handsArmedAt = Date.now();
       state.handsBaselineUntil = Date.now() + (CONFIG.handRaiseBaselineMs || 3000);
@@ -1627,13 +1665,20 @@
     const candidates = handCandidates(sweep);
     const baselining = now < state.handsBaselineUntil;
     const cooldownMs = CONFIG.handRaiseCooldownMs || 0;
-    const current = new Set();
 
     for (const candidate of candidates) {
-      current.add(candidate.key);
+      // Seen now, whatever happens next: this is the timestamp the retirement pass below
+      // reads, and it has to be written for a hand that is merely still up as much as for one
+      // that has just gone up.
+      state.handsSeenAt.set(candidate.key, now);
       if (state.handsUp.has(candidate.key)) {
         continue; // already up; this is a re-render, not a new request
       }
+      // Recorded before the baseline and cooldown gates rather than after, so a hand that is
+      // up but deliberately not reported still counts as up. Otherwise every later scan reads
+      // it as a fresh raise and the gate it just failed is the only thing holding it back —
+      // which is a rate limit, not an edge.
+      state.handsUp.add(candidate.key);
       if (baselining) {
         continue; // up before we arrived, so not an interruption of anything
       }
@@ -1655,9 +1700,37 @@
       report('handRaise', { name: candidate.name, how: candidate.how, self: candidate.isSelf });
     }
 
-    // Replace rather than merge, so lowering a hand removes it and raising it again is a new
-    // edge. The cooldown, not this, is what stops a re-render from counting as a lower/raise.
-    state.handsUp = current;
+    /*
+     * A hand comes down when it has not been *seen* for a while — not when one scan missed it.
+     *
+     * **This is the fix for an avatar that says "ok, go ahead" over and over at a person whose
+     * hand never moved.** The set used to be replaced wholesale by whatever the current scan
+     * found, and only the full sweep can find anything: the narrow selector pass that runs in
+     * between matches nothing in the layouts Meet actually renders, because the evidence is in
+     * text and icon glyphs rather than in attributes (see `handCandidates`). So every scan
+     * between sweeps emptied the set, the next sweep re-detected the same unmoved hand as a
+     * brand new one, and the only thing standing between that and a continuous interrupt was
+     * the cooldown — which is why the interruptions arrived on a timer, one every cooldown, in
+     * the middle of somebody typing questions into the chat.
+     *
+     * Retiring on a grace window instead makes the set say what it claims to say. The window
+     * has to cover several sweeps, because a raised hand genuinely disappears from the DOM for
+     * a moment when Meet re-renders a tile, closes the people panel, or scrolls a participant
+     * out of its virtualised list — none of which is anybody lowering their hand.
+     *
+     * Only on a sweep, for the same reason: a partial scan is not evidence that a hand is
+     * gone, so it may not be allowed to age one out.
+     */
+    if (sweep) {
+      const graceMs = CONFIG.handRaiseDownGraceMs || 0;
+      for (const key of Array.from(state.handsUp)) {
+        const seenAt = state.handsSeenAt.get(key) || 0;
+        if (now - seenAt >= graceMs) {
+          state.handsUp.delete(key);
+          state.handsSeenAt.delete(key);
+        }
+      }
+    }
 
     // Nothing found yet: say what the page does have, a bounded number of times.
     const diagMs = CONFIG.handRaiseDiagMs || 0;
@@ -1720,8 +1793,40 @@
     );
   }
 
+  /*
+   * Read the page, on a floor.
+   *
+   * Coalescing per animation frame bounds the scan rate at Meet's own repaint rate, which
+   * sounded like enough and is not: Meet mutates on essentially every frame, so the scans ran
+   * at ~60 Hz for the whole call. Each pass lays the document out (`observedState`), reads
+   * `innerText` off every chat row, and reads it again off every participant row — and it does
+   * that on **the renderer's main thread**, the same one encoding a 720p25 camera track and
+   * posting the avatar's PCM into the playout worklet. Starving that thread does not show up
+   * as an error anywhere; it shows up as media arriving late, which is what "the avatar is
+   * slow to answer" is.
+   *
+   * A floor between scans is the whole fix, and it costs nothing that matters: a quarter of a
+   * second is far below what a person notices in a reply and far above what the DOM needs to
+   * settle. Chat, the roster and the meeting state are all things that changed while a human
+   * was typing or clicking; none of them needs sixty looks a second.
+   *
+   * The trailing timer is not optional. Dropping a scan that arrives inside the window would
+   * mean a chat message typed during a burst of mutations waits for the *next* mutation, and
+   * in a still meeting the next one may be seconds away.
+   */
   function installObservers() {
     let scheduled = false;
+    let lastScanAt = 0;
+    let trailing = null;
+
+    const runScans = () => {
+      lastScanAt = Date.now();
+      scanState();
+      scanRoster();
+      scanChat();
+      scanHands();
+    };
+
     const schedule = () => {
       if (scheduled) {
         return;
@@ -1732,10 +1837,22 @@
       // more time in querySelectorAll than in media.
       requestAnimationFrame(() => {
         scheduled = false;
-        scanState();
-        scanRoster();
-        scanChat();
-        scanHands();
+        const throttleMs = CONFIG.scanThrottleMs || 0;
+        const since = Date.now() - lastScanAt;
+        if (throttleMs && since < throttleMs) {
+          if (trailing === null) {
+            trailing = setTimeout(() => {
+              trailing = null;
+              runScans();
+            }, throttleMs - since);
+          }
+          return;
+        }
+        if (trailing !== null) {
+          clearTimeout(trailing);
+          trailing = null;
+        }
+        runScans();
       });
     };
 

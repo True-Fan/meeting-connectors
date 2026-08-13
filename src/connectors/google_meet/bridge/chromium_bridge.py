@@ -85,13 +85,44 @@ cadence Zoom's RTMS leg is configured for, so the avatar sees an identical arriv
 whichever platform it is talking to."""
 
 PLAYOUT_BUFFER_SECONDS = 0.5
-"""Ring-buffer depth in the playout worklet. Half a second absorbs a scheduling hiccup
-between the Pacer's media clock and the browser's audio clock without adding audible
-latency; deeper would trade responsiveness for smoothness in a conversation, which is the
-wrong direction."""
+"""Ring-buffer *capacity* in the playout worklet — the hard ceiling, past which audio is
+dropped outright. Half a second absorbs a scheduling hiccup between the Pacer's media clock
+and the browser's audio clock without adding audible latency; deeper would trade
+responsiveness for smoothness in a conversation, which is the wrong direction."""
+
+PLAYOUT_TARGET_SECONDS = 0.12
+"""Standing depth the playout ring is trimmed back towards, through silence only.
+
+**A capacity is not a target, and treating one as the other is where the avatar's replies
+went late.** Nothing ever removed samples from that ring except overflow at the capacity
+above, so every hiccup between two uncorrected clocks added to the standing depth and none of
+it ever came back: the buffer ratcheted up towards half a second over the course of a call and
+stayed there, which is half a second of delay on every answer, growing, with every health
+check green.
+
+120 ms is comfortably more than the jitter between a 20 ms arrival cadence and a 128-sample
+render quantum, and it is reached by discarding silent blocks between utterances — never
+speech. See ``js/playout_worklet.js``."""
+
+PLAYOUT_WARN_INTERVAL_US = 60_000_000
+"""How often to report a standing playout backlog. Rate limited because the condition that
+produces it produces it on every heartbeat."""
 
 HEARTBEAT_INTERVAL_MS = 5_000
 DOM_SCAN_INTERVAL_MS = 2_000
+
+DOM_SCAN_THROTTLE_MS = 250
+"""Minimum gap between DOM scans, however often Meet mutates.
+
+The scans were coalesced per animation frame, which bounds them at the repaint rate and not
+below it — and Meet mutates on essentially every frame, so they ran at ~60 Hz for the whole
+call. Each pass forces a full-document layout and reads ``innerText`` off every chat and
+participant row, **on the renderer's main thread**: the same thread encoding the avatar's
+720p camera track and handing its PCM to the playout worklet. Starving it delays the media,
+which is heard as an avatar that answers slowly.
+
+A quarter of a second is below what a person notices in a reply and far above what the DOM
+needs to settle. Chat, the roster and the meeting state all change at human speed."""
 
 CHAT_OPEN_WINDOW_MS = 90_000
 """How long, after being admitted, the page keeps trying to open the chat panel.
@@ -151,6 +182,24 @@ The page's floor, not the policy: ``MeetHandRaiseSource`` holds the real cooldow
 rate limit that survives a rejoin has to live in Python. This one exists so a DOM re-render
 that momentarily drops the indicator cannot put a burst on the wire in the first place."""
 
+HAND_RAISE_DOWN_GRACE_MS = 5_000
+"""How long a hand must go **unseen** before the page treats it as lowered.
+
+**This is what stops an avatar telling somebody "ok, go ahead" every few seconds while their
+hand has not moved.** The page reports a hand's *transition*, so it has to know which hands
+are already up — and it used to rebuild that set from whatever the current scan happened to
+find. Only the twice-a-second sweep finds anything, because Meet renders the evidence as text
+and icon glyphs rather than as attributes; every scan in between found nothing and emptied
+the set, so the next sweep re-reported the same unmoved hand as a new one. The cooldowns above
+then spaced the repeats out into an interruption on a timer, arriving in the middle of
+whatever the meeting was doing — including somebody typing questions into the chat.
+
+A grace window spanning several sweeps is what makes the set mean what it says. It has to,
+because a raised hand really does vanish from the DOM for a moment when Meet re-renders a
+tile, closes the people panel, or scrolls a participant out of its virtualised list. Matched
+to the cooldown above: a re-raise inside that window would not be reported anyway, so a
+shorter grace could only cost false interruptions and could buy nothing."""
+
 AUDIO_ENFORCE_INTERVAL_MS = 2_000
 """How often the page re-checks that Meet's audio sender still carries the avatar's track.
 
@@ -200,6 +249,7 @@ class ChromiumBridge:
         "_meet_state",
         "_meeting",
         "_page_ready",
+        "_playout_warned_at_us",
         "_policy",
         "_profiles",
         "_rejoins",
@@ -268,6 +318,9 @@ class ChromiumBridge:
         self._task: asyncio.Task[None] | None = None
         self._rejoins = 0
         self._malformed_audio = 0
+        # ``None`` rather than zero, so the first deep buffer is reported when it happens
+        # rather than being swallowed by a window that started at session start.
+        self._playout_warned_at_us: int | None = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -632,6 +685,7 @@ class ChromiumBridge:
             "captureFrameMs": CAPTURE_FRAME_MS,
             "publishSampleRateHz": self._config.publish_audio_format.sample_rate_hz,
             "playoutBufferSeconds": PLAYOUT_BUFFER_SECONDS,
+            "playoutTargetSeconds": PLAYOUT_TARGET_SECONDS,
             "audioEnforceIntervalMs": AUDIO_ENFORCE_INTERVAL_MS,
             "chatEnabled": self._config.chat_enabled,
             "chatOpenWindowMs": CHAT_OPEN_WINDOW_MS,
@@ -640,6 +694,7 @@ class ChromiumBridge:
             "handRaiseEnabled": self._config.hand_raise_enabled,
             "handRaiseBaselineMs": HAND_RAISE_BASELINE_MS,
             "handRaiseCooldownMs": HAND_RAISE_COOLDOWN_MS,
+            "handRaiseDownGraceMs": HAND_RAISE_DOWN_GRACE_MS,
             "handRaiseSweepMs": HAND_RAISE_SWEEP_MS,
             "handRaiseDiagMs": HAND_RAISE_DIAG_MS,
             "videoWidth": video.width,
@@ -648,6 +703,7 @@ class ChromiumBridge:
             "displayName": self._config.display_name,
             "heartbeatIntervalMs": HEARTBEAT_INTERVAL_MS,
             "scanIntervalMs": DOM_SCAN_INTERVAL_MS,
+            "scanThrottleMs": DOM_SCAN_THROTTLE_MS,
             "selectors": self._selectors.to_page_config(),
             # Absent rather than empty when unrestricted: bridge.js reads a missing key as
             # "install everything", and an empty list as "install nothing".
@@ -854,6 +910,7 @@ class ChromiumBridge:
                 self._on_meet_state(message)
             case MeetMessageType.HEARTBEAT:
                 body = message.json()
+                self._note_playout(body.get("playout") or {})
                 await channel.send_json(
                     MeetMessageType.HEARTBEAT, {"sent_at_us": body.get("sent_at_us", 0)}
                 )
@@ -910,6 +967,50 @@ class ChromiumBridge:
             hands.offer(body, event_id=str(body.get("id") or "") or None)
         except Exception as exc:
             logger.warning("meet_bridge.hand_raise_dropped", error=str(exc))
+
+    def _note_playout(self, stats: dict[str, object]) -> None:
+        """Say out loud when the avatar's voice is standing in a queue inside the browser.
+
+        **The one part of this connector's latency that nothing could see.** The playout ring
+        holds however much audio has accumulated between the Pacer's clock and the browser's,
+        and that depth *is* delay on every reply — but it lived in a worklet, was reported only
+        in a heartbeat body, and the heartbeat handler discarded it. A call whose answers had
+        drifted half a second late logged exactly what a healthy one did.
+
+        Rate limited to once a minute and warned about only past the trim target, so a buffer
+        doing its job is silent and one that is not is visible where an operator already looks.
+        Never raises: this is a log line inside the read loop.
+        """
+        try:
+            buffered = int(stats.get("buffered") or 0)
+        except (TypeError, ValueError):
+            return
+        if buffered <= 0:
+            return
+
+        rate = self._config.publish_audio_format.sample_rate_hz
+        buffered_ms = buffered * 1_000 // rate
+        if buffered_ms <= PLAYOUT_TARGET_SECONDS * 1_000 * 2:
+            return
+
+        now_us = self._clock.now_us()
+        if (
+            self._playout_warned_at_us is not None
+            and now_us - self._playout_warned_at_us < PLAYOUT_WARN_INTERVAL_US
+        ):
+            return
+        self._playout_warned_at_us = now_us
+        logger.warning(
+            "meet_bridge.playout_backlog",
+            buffered_ms=buffered_ms,
+            target_ms=int(PLAYOUT_TARGET_SECONDS * 1_000),
+            underruns=stats.get("underruns"),
+            dropped=stats.get("dropped"),
+            trimmed=stats.get("trimmed"),
+            note="the avatar's audio is queued inside the browser, and that depth is added "
+            "to every reply; it is trimmed back through silence, so a backlog that persists "
+            "means the page is not keeping up rather than that the trim is off",
+        )
 
     def _log_page_event(self, event: str | None, detail: dict[str, object]) -> None:
         """Log one page diagnostic, promoting the one that explains a silent avatar.

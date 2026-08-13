@@ -96,12 +96,16 @@ def _page_config(server: PageBridgeServer) -> dict[str, object]:
         "captureFrameMs": 20,
         "publishSampleRateHz": PUBLISH_AUDIO.sample_rate_hz,
         "playoutBufferSeconds": 0.5,
+        # Carried because the page reads a missing key as "off": without it the playout ring
+        # never sheds accumulated latency, which is the behaviour this key exists to end.
+        "playoutTargetSeconds": 0.12,
         "videoWidth": VIDEO.width,
         "videoHeight": VIDEO.height,
         "videoFps": VIDEO.fps,
         "displayName": "AI Avatar",
         "heartbeatIntervalMs": HEARTBEAT_MS,
         "scanIntervalMs": 500,
+        "scanThrottleMs": 250,
         "selectors": DEFAULT_SELECTORS.to_page_config(),
     }
 
