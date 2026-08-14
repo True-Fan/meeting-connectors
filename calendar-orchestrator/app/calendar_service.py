@@ -107,7 +107,35 @@ def _parse_event(raw: dict) -> CalendarEvent:
         updated=raw.get("updated", ""),
         meeting_code=meeting_code,
         meeting_url=meeting_url,
+        attendees=_extract_attendees(raw),
     )
+
+
+def _extract_attendees(raw: dict) -> tuple[str, ...]:
+    """Pull the invite list off a calendar event.
+
+    ``displayName`` when Google has one, the email address otherwise — the bridge prefers
+    whatever name Meet itself reports once somebody joins, so an address here is a serviceable
+    placeholder rather than the final label.
+
+    Three kinds of entry are dropped. ``resource`` entries are rooms and equipment, not people.
+    ``self`` is the bot's own calendar account, which would otherwise be reported as an invitee
+    who never joined while it is sitting in the meeting. Declined invitations are kept
+    deliberately — "Priya was invited and did not come" is true and worth being able to say.
+    """
+    names: list[str] = []
+    seen: set[str] = set()
+    for attendee in raw.get("attendees", []) or ():
+        if not isinstance(attendee, dict):
+            continue
+        if attendee.get("resource") or attendee.get("self"):
+            continue
+        label = str(attendee.get("displayName") or attendee.get("email") or "").strip()
+        if not label or label.casefold() in seen:
+            continue
+        seen.add(label.casefold())
+        names.append(label)
+    return tuple(names)
 
 
 def _extract_meet_link(raw: dict) -> tuple[str, str]:

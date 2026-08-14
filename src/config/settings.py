@@ -317,6 +317,64 @@ class GoogleMeetSettings(BaseModel):
     and people will shorten it — an account called "TrueFan Interview Avatar" gets
     ``["Gunika", "bot"]`` so ``@Gunika`` and ``@bot`` are recognised too."""
 
+    attendance_enabled: bool = True
+    """Keep a record of who was in the meeting, so the agent can be asked about it later.
+
+    On by default, because unlike ``chat_enabled`` it costs nothing and risks nothing: it adds
+    no DOM scanning, no new page observer, and no visible UI action. It subscribes to the roster
+    stream the connector already receives and accumulates it in Python — see
+    ``connectors/google_meet/meeting/attendance.py``.
+
+    What it makes answerable: who is here now, who was here and left, who rejoined, and — when
+    the session has been seeded with an invite list via ``POST /sessions/{id}/invitees`` — who
+    was invited and never turned up. Read it back with ``GET /sessions/{id}/participants``.
+
+    Turn it off to have the connector remember nothing about who attended. The roster itself is
+    unaffected either way; this only controls whether its history is kept."""
+
+    attendance_push_enabled: bool = True
+    """Push the attendance brief to the avatar agent, so it can answer without a round trip.
+
+    Requires ``attendance_enabled``. On by default because without it the feature does not do
+    what people expect: in a live meeting the bridge knew exactly who was present and the agent
+    still answered *"I don't have access to your meeting details"* — because nothing carried the
+    ledger over the avatar socket.
+
+    Delivered as ``kind="meeting_context"``, which is **not** the channel chat and raised hands
+    use. That distinction is the point: a chat frame is a turn the avatar answers out loud, and
+    an avatar announcing "Aarav Sharma is in the meeting" every time somebody reconnects is
+    worse than one that says nothing. An agent that has not implemented the kind negotiates
+    below ``1.2`` and receives nothing, with one warning logged naming the fix.
+
+    Turn it off if the agent reads attendance from ``GET /sessions/{id}/participants`` instead —
+    a tool-calling agent gets fresher data that way, at the cost of a round trip mid-answer."""
+
+    attendance_push_require_negotiation: bool = True
+    """Only send the brief to an agent that negotiated protocol ``1.2`` or above.
+
+    **Set this to False to skip the agent's handshake change.** Adding attendance to an existing
+    agent otherwise takes two edits — reply ``"1.2"`` in the server hello, *and* handle
+    ``kind="meeting_context"`` — and forgetting the first silently disables the feature while
+    the second looks done. With this off the frame is sent regardless of the negotiated version,
+    so only the handler is needed.
+
+    Safe for any agent that **ignores control frames it does not recognise**, which is the usual
+    behaviour and the only requirement. Leave it on if the agent instead raises on an unknown
+    kind, because then an undeliverable frame becomes an error on the avatar socket rather than
+    a warning in this log.
+
+    Not a licence to send it as chat: this changes *who is sent the new frame*, never the frame's
+    kind. Attendance never travels on the channel the avatar speaks from."""
+
+    attendance_push_interval_s: float = Field(default=5.0, ge=0.5, le=120.0)
+    """How often the ledger is checked for changes worth pushing.
+
+    Not how often anything is sent: a meeting whose roster is unchanged sends nothing at all,
+    because the brief is standing context and resending an identical one is noise in the agent's
+    context window. Five seconds sits between the page's own 250 ms scan floor — low enough that
+    a burst of roster churn collapses into one push — and the moment a new arrival finishes
+    saying hello."""
+
     hand_raise_enabled: bool = True
     """Stop the avatar and hand over when a participant raises their hand in the meeting.
 

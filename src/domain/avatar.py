@@ -62,19 +62,31 @@ class AvatarProtocolVersion:
 # Fixed contract constants
 # ---------------------------------------------------------------------------
 
-AVATAR_PROTOCOL_VERSION = AvatarProtocolVersion(major=1, minor=1)
+AVATAR_PROTOCOL_VERSION = AvatarProtocolVersion(major=1, minor=2)
 """The protocol version this bridge speaks.
 
-Raised from ``1.0`` to add inbound chat (``AvatarChatMessage``), which is *additive*: the
-frame is new, nothing existing changed shape. That is precisely what the minor version is
-for, and why the compatibility rule above only pins the major. A ``1.0`` agent negotiates
-down, never receives a chat frame, and behaves exactly as it did before.
+Raised from ``1.0`` to add inbound chat (``AvatarChatMessage``), then to ``1.2`` for
+``AvatarMeetingContext``. Both are *additive*: the frames are new, nothing existing changed
+shape. That is precisely what the minor version is for, and why the compatibility rule above
+only pins the major. A ``1.0`` agent negotiates down, never receives either frame, and behaves
+exactly as it did before.
 
 **Raised hands did not raise this again, deliberately.** A dedicated ``interrupt`` frame was
 written first and reverted: it required the agent to learn a second frame kind before a raised
 hand could do anything at all, and the agent that exists today understands ``chat``. Delivering
 the hand as a chat message means the feature works against an unmodified agent — see
 ``AvatarClient.send_hand_raise``."""
+
+AVATAR_MEETING_CONTEXT_MIN_VERSION = AvatarProtocolVersion(major=1, minor=2)
+"""The version that introduced ``AvatarMeetingContext``. Below this it is withheld.
+
+**Withheld rather than delivered as chat, and this is the one place that rule is inverted.**
+A raised hand travels on the chat channel precisely *because* everything on that channel is
+something the avatar says out loud — "Priya raised their hand" should produce "of course, go
+ahead". Attendance must not: an avatar that announces "Aarav Sharma is in the meeting" every
+time somebody's wifi hiccups is a worse feature than one that says nothing. So this needs a
+frame kind the agent handles silently, which means an agent that does not know the kind must
+receive nothing at all rather than be handed something it will read aloud."""
 
 AVATAR_CHAT_MIN_VERSION = AvatarProtocolVersion(major=1, minor=1)
 """The version that introduced chat. Below this, chat is withheld rather than sent and
@@ -184,6 +196,41 @@ class AvatarChatMessage(BaseModel):
     def version(self) -> AvatarProtocolVersion:
         """The minimum protocol version an agent must speak to receive this."""
         return AVATAR_CHAT_MIN_VERSION
+
+
+class AvatarMeetingContext(BaseModel):
+    """Standing facts about the meeting, for the agent to know rather than to say.
+
+    **The distinction from ``AvatarChatMessage`` is the entire design.** A chat frame is a turn:
+    somebody said something and the avatar is expected to answer. This is not a turn — it is
+    background the agent should have *in case* it is asked, and an agent that speaks on receiving
+    it is misbehaving. The two cannot share a kind for that reason, and an agent too old to know
+    this kind is sent nothing rather than a chat frame it would read aloud.
+
+    Consumed by updating the agent's system/context state, not by appending a user message. In a
+    LiveKit agent that is a ``chat_ctx`` update; the shape of that call is the agent's business.
+
+    ``text`` is prose rather than a participant array, because its destination is a context
+    window. "Aarav Sharma and Priya Menon are in the meeting; Rahul Verma was invited and never
+    joined" is what lets an LLM answer "who's here?", "who left?" and "who's missing?" from one
+    string, and it states what is *unknown* too — which a list of names cannot.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["meeting_context"] = "meeting_context"
+    text: str
+    """The brief. Replaces any previous one for this session rather than appending — it is a
+    current-state description, so accumulating them would leave the agent holding a history of
+    contradictory rosters."""
+    topic: str = "attendance"
+    """What this brief is about, so later briefs on other subjects can share the kind and the
+    agent can replace the right one."""
+    observed_at_us: int = 0
+
+    def version(self) -> AvatarProtocolVersion:
+        """The minimum protocol version an agent must speak to receive this."""
+        return AVATAR_MEETING_CONTEXT_MIN_VERSION
 
 
 def check_handshake(client: AvatarClientHello, server: AvatarServerHello) -> AvatarProtocolVersion:

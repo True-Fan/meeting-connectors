@@ -1768,8 +1768,19 @@
           node.getAttribute('data-requested-participant-id') ||
           node.id ||
           '';
-        const name = (node.getAttribute('aria-label') || node.innerText || '').trim();
-        participants.push({ id, name: name.slice(0, 120) });
+        // First line only, exactly as `handSignal` already does. `innerText` on a participant
+        // container is not the name — it is the name plus every control Meet renders on the
+        // tile, so an unbounded read produced roster entries like "frame_person Reframe
+        // visual_effects Backgrounds and effects more_vert More options for <name>". The name
+        // is the first line; everything after it is the hover toolbar.
+        const raw = (node.getAttribute('aria-label') || node.innerText || '').trim();
+        const name = raw.split('\n')[0].trim();
+        // Meet marks your own entry in the text it renders, and that is the only reliable
+        // self signal the page has: `CONFIG.displayName` is what we *asked* to be called,
+        // which a signed-in profile ignores in favour of the account's own name. Reported
+        // rather than resolved here — the bridge decides what it means.
+        const isSelf = /\(\s*you\s*\)|\byou\b\s*$/i.test(name);
+        participants.push({ id, name: name.slice(0, 120), isSelf });
       }
       if (participants.length) {
         break;
@@ -1779,7 +1790,7 @@
     // A signature rather than a deep compare: the roster is rescanned on every
     // DOM mutation in a UI that mutates constantly, and re-sending an identical
     // roster would flood the channel with no new information.
-    const signature = participants.map((p) => `${p.id}|${p.name}`).join(';');
+    const signature = participants.map((p) => `${p.id}|${p.name}|${p.isSelf ? 1 : 0}`).join(';');
     if (signature === state.rosterSignature) {
       return;
     }

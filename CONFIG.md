@@ -484,6 +484,11 @@ MC_GOOGLE_MEET__PUBLISH_SAMPLE_RATE_HZ=48000   # 16000 | 24000 | 48000
 MC_GOOGLE_MEET__LOBBY_TIMEOUT_S=300            # a human has to click Admit
 MC_GOOGLE_MEET__REJOIN_MAX_ATTEMPTS=5
 MC_GOOGLE_MEET__WATCHDOG_INTERVAL_S=5
+MC_GOOGLE_MEET__ATTENDANCE_ENABLED=true        # remember who attended; see below
+MC_GOOGLE_MEET__ATTENDANCE_PUSH_ENABLED=true   # tell the agent, so it can answer
+MC_GOOGLE_MEET__ATTENDANCE_PUSH_INTERVAL_S=5
+MC_GOOGLE_MEET__ATTENDANCE_PUSH_REQUIRE_NEGOTIATION=true   # false = skip the agent's
+                                                           # handshake change; see below
 
 # Not recommended. Only bootstraps an empty profile, and only works on an account with
 # no second factor — which is not a configuration for an account in customer meetings.
@@ -504,6 +509,116 @@ Notes on two defaults:
   microphone needs no resampling stage. Only 16/24/48 kHz are accepted, because Web Audio
   would resample anything else *silently* rather than fail — a pitch artefact nobody can
   trace.
+
+### Attendance — who is in the meeting, and who never came
+
+`MC_GOOGLE_MEET__ATTENDANCE_ENABLED` (default `true`) keeps a per-session record built from the
+roster the page already reports, so the agent can be asked who attended after the fact. On by
+default because it costs nothing: no extra DOM scanning, no new page observer, and nothing other
+participants can see — unlike `CHAT_ENABLED`, which has to open a panel.
+
+Read it back per session:
+
+```bash
+curl localhost:8000/sessions/ses_abc123/participants
+```
+
+The response separates `present`, `departed` and `never_joined`, carries per-person join/leave
+times and rejoin counts, and includes an `agent_context` string written for an LLM's context
+window rather than for a parser.
+
+**"Who was invited" needs the calendar, not the browser.** Meet only shows invitees who have not
+joined inside the People panel, behind selectors that change without notice, so the invite list
+is supplied as data instead:
+
+```bash
+curl -X POST localhost:8000/sessions/ses_abc123/invitees \
+  -H 'content-type: application/json' \
+  -d '{"invitees": ["Aarav Sharma", "priya@example.com"]}'
+```
+
+`calendar-orchestrator` does this automatically for meetings it schedules — it reads `attendees`
+off the Google Calendar event and posts them after the join succeeds. The call is best-effort
+there: a failure costs the invite list, never the meeting.
+
+Without an invite list, `never_joined` is empty **and** `has_invite_list` is `false` — which the
+`agent_context` renders as "unknown" rather than "nobody", because those are different answers.
+
+#### Getting it into the agent — one required agent-side change
+
+Serving the ledger over HTTP makes it *available*. It does not make the agent *hold* it, and the
+difference is not academic: in a live run the bridge knew exactly who was present and the agent
+still answered *"I don't have access to your meeting details or a list of participants."*
+
+So the bridge now **pushes** the brief over the avatar socket
+(`MC_GOOGLE_MEET__ATTENDANCE_PUSH_ENABLED`, default on) as a new frame kind:
+
+```json
+{"kind": "meeting_context", "topic": "attendance",
+ "text": "Currently in the meeting (2): Aarav Sharma and Priya Menon. Invited but never joined (1): Rahul Verma.",
+ "observed_at_us": 123456789}
+```
+
+The frame is deliberately *not* `kind: "chat"`. Everything on the chat channel is something the
+avatar says out loud — that is how a raised hand becomes "of course, go ahead" — and an avatar
+that announces "Aarav Sharma is in the meeting" every time somebody reconnects is worse than one
+that says nothing.
+
+**The agent has to handle the frame; there is no way around that.** The bridge cannot make an
+LLM know something without sending it something the agent processes. If the log says
+
+```
+avatar.meeting_context_unsupported  negotiated=1.1  required=1.2
+```
+
+then the bridge is working and the agent has not been updated yet.
+
+By default this is **two** agent edits, and forgetting the first silently disables the feature
+while the second looks done:
+
+1. reply `"1.2"` as `protocol_version` in the agent's server hello, and
+2. handle `kind: "meeting_context"`.
+
+**Set `MC_GOOGLE_MEET__ATTENDANCE_PUSH_REQUIRE_NEGOTIATION=false` to skip step 1.** The frame is
+then sent regardless of the negotiated version, which is safe for any agent that ignores control
+frames it does not recognise — leaving only the handler:
+
+```python
+# where the bridge's control frames are handled
+if frame.get("kind") == "meeting_context":
+    session.chat_ctx.add_message(role="system", content=frame["text"])   # replace the prior one
+    return   # no session.generate_reply() — this is context, not a turn
+```
+
+The frame is a full replacement for the previous brief on the same `topic`, not a delta, so
+keeping only the most recent one is correct. Leave the setting on if the agent instead *raises*
+on an unknown kind, because then an undeliverable frame becomes an error on the avatar socket
+rather than a warning in this log.
+
+**Alternative: let the agent pull instead.** A tool-calling agent gets fresher data by hitting
+the endpoint when the question is actually asked, at the cost of a round trip mid-answer. Set
+`MC_GOOGLE_MEET__ATTENDANCE_PUSH_ENABLED=false` and register a tool:
+
+```python
+@function_tool
+async def who_is_in_the_meeting() -> str:
+    """Who is currently in the meeting, who has left, and who never joined."""
+    r = await http.get(f"http://bridge:8000/sessions/{session_id}/participants")
+    return r.json()["agent_context"]
+```
+
+Either path works; running both is redundant, not harmful.
+
+#### A note on the names themselves
+
+Meet's participant DOM is lossy, and two faults were fixed after the first live run. `innerText`
+on a participant tile is the name *plus every control rendered over it*, which produced roster
+entries like `frame_person Reframe visual_effects ... More options for jadumeetboot`; only the
+first line is read now, and a label still containing icon-font tokens is rejected rather than
+guessed at. Separately, the avatar was counting **itself** as an attendee, because `display_name`
+is only what Meet is *asked* to call it — a signed-in profile renders the Google account's own
+name instead. Self-detection now also uses Meet's "(you)" marker and the local part of
+`MC_GOOGLE_MEET__GOOGLE_EMAIL`.
 
 ## 11.4 Container requirements
 

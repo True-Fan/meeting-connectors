@@ -121,7 +121,9 @@ async def _run_join(event: CalendarEvent, state: TriggeredEventStore, settings: 
         event.meeting_code,
     )
     try:
-        await trigger_bot_join(event.meeting_code, settings.bridge)
+        await trigger_bot_join(
+            event.meeting_code, settings.bridge, attendees=event.attendees
+        )
     except BotTriggerError:
         logger.exception("failed to trigger bot join for %s", event.event_id)
         # Not marked as triggered: bot_client already retried internally, so a further

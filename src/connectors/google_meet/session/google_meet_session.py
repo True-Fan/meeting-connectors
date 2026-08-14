@@ -45,6 +45,8 @@ from src.connectors.google_meet.bridge.chromium_bridge import ChromiumBridge, Dr
 from src.connectors.google_meet.browser.profile import ProfileManager
 from src.connectors.google_meet.config import GoogleMeetConnectorConfig
 from src.connectors.google_meet.egress.media_sink import ChromiumMediaSink
+from src.connectors.google_meet.meeting.attendance import AttendanceLedger
+from src.connectors.google_meet.meeting.attendance_announcer import AttendanceAnnouncer
 from src.connectors.google_meet.meeting.chat import MeetChatSource
 from src.connectors.google_meet.meeting.hand_raise import MeetHandRaiseSource, render_prompt
 from src.connectors.google_meet.monitoring.watchdog import MediaWatchdog
@@ -75,6 +77,8 @@ class GoogleMeetSession:
     """One avatar participating in one Google Meet conference."""
 
     __slots__ = (
+        "_announcer",
+        "_attendance",
         "_bridge",
         "_chat",
         "_clock",
@@ -99,6 +103,8 @@ class GoogleMeetSession:
         watchdog: MediaWatchdog,
         chat: MeetChatSource | None = None,
         hands: MeetHandRaiseSource | None = None,
+        attendance: AttendanceLedger | None = None,
+        announcer: AttendanceAnnouncer | None = None,
     ) -> None:
         self._session = session
         self._clock = clock
@@ -109,6 +115,8 @@ class GoogleMeetSession:
         self._watchdog = watchdog
         self._chat = chat
         self._hands = hands
+        self._attendance = attendance
+        self._announcer = announcer
         self._task: asyncio.Task[None] | None = None
 
     @property
@@ -122,6 +130,17 @@ class GoogleMeetSession:
     @property
     def bridge(self) -> ChromiumBridge:
         return self._bridge
+
+    @property
+    def attendance(self) -> AttendanceLedger | None:
+        """Who has been in this meeting, or ``None`` when the ledger is disabled.
+
+        Read by ``MeetingService.attendance_snapshot`` through a structural check, which is how
+        the API serves this without ``MeetingService`` learning that Google Meet exists — the
+        same duck-typing ``health_report`` already relies on. ``None`` rather than an empty
+        ledger when disabled, so "switched off" and "nobody here yet" stay distinguishable.
+        """
+        return self._attendance
 
     async def start(self) -> None:
         """Join the meeting, then start routing.
@@ -143,6 +162,12 @@ class GoogleMeetSession:
         if self._hands is not None:
             await self._hands.start()
         self._task = asyncio.create_task(self._router.run(), name="media-router")
+        # After the router, because it has nothing to send until the avatar client has
+        # completed its handshake — the announcer's first push happens one settle interval
+        # later, by which time the negotiated version is known and the roster has stopped
+        # churning.
+        if self._announcer is not None:
+            await self._announcer.start()
         await self._watchdog.start()
 
     async def stop(self) -> None:
@@ -153,6 +178,9 @@ class GoogleMeetSession:
         the meeting and closes the browser for both legs at once. Then the router's queues.
         """
         await self._watchdog.stop()
+        # Before the router, so it cannot try to send on a transport that is being closed.
+        if self._announcer is not None:
+            await self._announcer.stop()
 
         task, self._task = self._task, None
         if task is not None:
@@ -429,6 +457,35 @@ class GoogleMeetSessionFactory:
             )
             hands = hand_source
 
+        # Attendance, on the same "built only when enabled" terms — but note what it is *not*
+        # given: no queue, no task, no place on the media path, and no component in the health
+        # report. It is a listener on the roster stream that already exists, which is the whole
+        # reason it can be on by default where chat and hands are judgement calls. The page does
+        # no extra work for it, so it cannot cost media latency (``meeting/attendance.py``).
+        attendance: AttendanceLedger | None = None
+        announcer: AttendanceAnnouncer | None = None
+        if config.attendance_enabled:
+            # Seeded with every name that could mean "us", because the avatar counting itself as
+            # an attendee makes every answer wrong by one — observed in a live meeting, where the
+            # bot reported two others in a call Meet itself described as having "one other
+            # person". ``display_name`` alone is not enough: Meet only asks for it when the
+            # profile has lost its session, and a signed-in profile renders the *account's* name
+            # instead. That name is not configured anywhere, but the account address is, and the
+            # local part is what Google derives the rendered name from.
+            attendance = AttendanceLedger(self_names=_self_name_candidates(config))
+            bridge.add_roster_listener(attendance.observe_roster)
+            # Serving the ledger over HTTP makes it available; this is what makes the agent
+            # actually hold it. Both paths exist because they answer different questions — the
+            # push keeps a conversational agent able to answer "who is here?" with no round
+            # trip, and the endpoint is what an operator or a tool-calling agent reads.
+            if config.attendance_push_enabled:
+                announcer = AttendanceAnnouncer(
+                    ledger=attendance,
+                    avatar=avatar,
+                    interval_s=config.attendance_push_interval_s,
+                    require_negotiation=config.attendance_push_require_negotiation,
+                )
+
         # Speech as a trigger for the hand-raise handover — built only when enabled, on the
         # same terms as chat and hands, so a session that should hold the floor carries no
         # detector at all rather than an inert one. The wording is the hand's, rendered here
@@ -472,6 +529,8 @@ class GoogleMeetSessionFactory:
             watchdog=watchdog,
             chat=chat,
             hands=hands,
+            attendance=attendance,
+            announcer=announcer,
         )
 
     # -- component builders ------------------------------------------------
@@ -492,3 +551,38 @@ class GoogleMeetSessionFactory:
                 clip_path, ctx=ctx, video_format=video_format, audio_format=audio_format
             )
         return IdleFrameSource(ctx=ctx, video_format=video_format, audio_format=audio_format)
+
+
+def _self_name_candidates(config: GoogleMeetConnectorConfig) -> tuple[str, ...]:
+    """Every name that might be the avatar's own, so it is never counted as an attendee.
+
+    Two sources, both configuration rather than observation, because this has to be right on the
+    *first* roster — by the time Meet's own "(you)" marker is read, a wrong entry has already
+    been recorded as a person who joined.
+
+    * ``display_name`` — what we asked to be called. Correct only when the profile has lost its
+      Google session and Meet prompted for a name.
+    * the local part of ``google_email`` — Google derives an unnamed account's rendered name
+      from it, which is why a bot signed in as ``jadumeetboot@gmail.com`` appears in the roster
+      as "jadumeetboot" and matches nothing configured. Dots and plus-addressing are dropped so
+      ``first.last+meet@`` also yields "first last".
+    """
+    candidates: list[str] = []
+    if config.display_name:
+        candidates.append(config.display_name)
+
+    local = (config.google_email or "").split("@", 1)[0].split("+", 1)[0].strip()
+    if local:
+        candidates.append(local)
+        spaced = local.replace(".", " ").replace("_", " ").replace("-", " ")
+        if spaced != local:
+            candidates.append(" ".join(spaced.split()))
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for name in candidates:
+        folded = name.casefold()
+        if folded and folded not in seen:
+            seen.add(folded)
+            unique.append(name)
+    return tuple(unique)

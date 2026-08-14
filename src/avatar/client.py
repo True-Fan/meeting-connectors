@@ -24,8 +24,10 @@ from collections.abc import AsyncIterator
 from src.domain.avatar import (
     AVATAR_CHAT_MIN_VERSION,
     AVATAR_INPUT_FORMAT,
+    AVATAR_MEETING_CONTEXT_MIN_VERSION,
     AvatarChatMessage,
     AvatarClientHello,
+    AvatarMeetingContext,
     AvatarProtocolVersion,
     check_handshake,
 )
@@ -51,6 +53,8 @@ class AvatarClient:
         "_chat_sent",
         "_chat_unsupported_warned",
         "_connected",
+        "_context_sent",
+        "_context_unsupported_warned",
         "_ctx",
         "_init_segment",
         "_metrics",
@@ -79,6 +83,8 @@ class AvatarClient:
         self._negotiated: AvatarProtocolVersion | None = None
         self._chat_sent = 0
         self._chat_unsupported_warned = False
+        self._context_sent = 0
+        self._context_unsupported_warned = False
 
     @property
     def init_segment(self) -> MediaChunk | None:
@@ -113,6 +119,14 @@ class AvatarClient:
     def supports_chat(self) -> bool:
         """Whether the negotiated version includes inbound chat."""
         return self._negotiated is not None and self._negotiated >= AVATAR_CHAT_MIN_VERSION
+
+    @property
+    def supports_meeting_context(self) -> bool:
+        """Whether the negotiated version includes silent meeting-context briefs."""
+        return (
+            self._negotiated is not None
+            and self._negotiated >= AVATAR_MEETING_CONTEXT_MIN_VERSION
+        )
 
     async def stop(self) -> None:
         """Disconnect. Idempotent."""
@@ -230,6 +244,63 @@ class AvatarClient:
                 is_self=event.is_self,
             )
         )
+
+    async def send_meeting_context(
+        self,
+        text: str,
+        *,
+        topic: str = "attendance",
+        observed_at_us: int = 0,
+        require_negotiation: bool = True,
+    ) -> bool:
+        """Give the agent standing context it should know but not speak.
+
+        Returns True when the frame was handed to the transport. False means it was withheld,
+        and the only interesting case is an agent that negotiated below
+        ``AVATAR_MEETING_CONTEXT_MIN_VERSION`` — warned once, because an operator who has just
+        switched attendance on deserves to be told the agent cannot receive it rather than
+        watching it silently do nothing. That was the actual failure mode this replaced: the
+        bridge knew who was in the meeting and the agent answered "I don't have access".
+
+        Unlike ``send_chat`` there is no self-filter and no empty-text special case beyond the
+        obvious: this is not a turn, so there is no feedback loop to prevent.
+
+        ``require_negotiation=False`` sends regardless of the negotiated version. That is a
+        deliberate escape hatch rather than a default, and the asymmetry with chat is the
+        reason it can exist at all: an unknown *chat* frame is dangerous because the agent
+        understands the kind and would speak it, whereas an unknown *control* frame is only as
+        dangerous as the agent's tolerance for one it does not recognise. An agent that ignores
+        unknown kinds — most do — can therefore be given this without bumping its handshake,
+        which turns a two-part agent change into a one-part one. An agent that instead throws on
+        an unknown kind must not be sent it, which is why the safe behaviour is the default.
+        """
+        brief = text.strip()
+        if not brief:
+            return False
+
+        if require_negotiation and not self.supports_meeting_context:
+            if not self._context_unsupported_warned:
+                self._context_unsupported_warned = True
+                logger.warning(
+                    "avatar.meeting_context_unsupported",
+                    negotiated=str(self._negotiated) if self._negotiated else None,
+                    required=str(AVATAR_MEETING_CONTEXT_MIN_VERSION),
+                    note="the agent cannot receive meeting context, so it will not be able to "
+                    "answer who is in the meeting; handle kind='meeting_context' in the agent, "
+                    "or have it query GET /sessions/{id}/participants instead",
+                )
+            return False
+
+        frame = AvatarMeetingContext(text=brief, topic=topic, observed_at_us=observed_at_us)
+        await self._transport.send_control(frame.model_dump_json())
+        self._context_sent += 1
+        logger.info(
+            "avatar.meeting_context_sent",
+            topic=topic,
+            chars=len(brief),
+            total=self._context_sent,
+        )
+        return True
 
     async def chunks(self) -> AsyncIterator[MediaChunk]:
         """Yield fMP4 chunks, caching the init segment as it passes."""

@@ -44,6 +44,44 @@ _STATUS_SUFFIXES: tuple[str, ...] = (
 """Status text Meet appends inside the same ``aria-label`` as the name. Stripped so that
 one person does not appear as two entries when they start presenting."""
 
+_SELF_MARKERS: tuple[str, ...] = ("(you)", "(You)")
+"""Text Meet appends to *your own* roster entry.
+
+**Read before ``_STATUS_SUFFIXES`` strips it, which is the whole point.** ``" (you)"`` is in
+both lists: it has to come off the name so one person is not two entries, and it is also the
+only self signal the page can offer that does not depend on configuration. Stripping it first
+threw the signal away, and the observable consequence was the avatar counting *itself* as a
+participant — because ``selfName`` carries the configured ``display_name`` ("AI Avatar"), which
+a signed-in profile never uses; Meet renders the Google account's own name instead."""
+
+_UI_TOKENS: tuple[str, ...] = (
+    "frame_person",
+    "visual_effects",
+    "more_vert",
+    "present_to_all",
+    "devices",
+    "closed_caption",
+    "keep",
+    "push_pin",
+)
+"""Material icon-font names that appear as *text* inside a participant tile.
+
+An icon font glyph is a text node holding the glyph's name, so any of these in a name means the
+label is a container's full text rather than a person — the same fact ``handSignal`` in
+``bridge.js`` relies on. ``js/bridge.js`` now takes only the first line, which removes these at
+source; this is the second line of defence, because a page running a stale script must not be
+able to put "frame_person Reframe visual_effects" into an answer about who attended."""
+
+_CONTROL_PHRASES: tuple[str, ...] = (
+    "more options for",
+    "backgrounds and effects",
+    "reframe",
+    "pin to screen",
+    "remove from meeting",
+)
+"""Control labels Meet renders alongside a name. Removed before the name is judged, because
+"More options for Priya Menon" is a button's label and "Priya Menon" is the person."""
+
 
 @dataclass(frozen=True, slots=True)
 class MeetParticipant:
@@ -121,7 +159,17 @@ def parse_roster(body: dict[str, Any]) -> MeetRoster:
         if not isinstance(raw, dict):
             continue
         page_id = str(raw.get("id") or "").strip()
-        name = _clean(str(raw.get("name") or ""))
+        raw_name = str(raw.get("name") or "")
+        # Before cleaning, because cleaning removes the marker this reads.
+        marked_self = _is_self_label(raw_name)
+        name = _clean(raw_name)
+
+        # A label that *was* text and cleaned to nothing is a rejection, not an anonymous
+        # person: it means the node matched a container rather than a participant, so the id
+        # attached to it does not identify somebody to count. Distinguished from an id with no
+        # label at all, which is a real participant Meet declined to attribute and is kept.
+        if raw_name.strip() and not name:
+            continue
         if not page_id and not name:
             continue
 
@@ -137,23 +185,81 @@ def parse_roster(body: dict[str, Any]) -> MeetRoster:
             MeetParticipant(
                 page_id=page_id,
                 display_name=name,
-                is_self=bool(self_name) and name.lower() == (self_name or "").lower(),
+                # Three independent signals, any of which is sufficient. The configured name
+                # is the weakest and used to be the only one — see ``_SELF_MARKERS``.
+                is_self=(
+                    marked_self
+                    or bool(raw.get("isSelf"))
+                    or (bool(self_name) and name.lower() == (self_name or "").lower())
+                ),
             )
         )
 
     return MeetRoster(participants=tuple(parsed), self_name=self_name)
 
 
+def _is_self_label(label: str) -> bool:
+    """Whether a raw label is Meet's marking of our own entry.
+
+    Takes the *uncleaned* label, because ``_clean`` removes the marker.
+    """
+    lowered = " ".join(str(label or "").split()).lower()
+    return any(marker in lowered for marker in _SELF_MARKERS)
+
+
 def _clean(label: str) -> str:
-    """Strip status text and truncate a name pulled out of an ARIA label."""
-    value = " ".join(label.split())
+    """Reduce a raw label to a person's name, or to empty when it is not one.
+
+    Four passes, each answering a failure seen in a live meeting rather than an imagined one:
+
+    1. **First line only.** ``js/bridge.js`` now does this at source, but a page running a stale
+       script still sends a tile's whole text.
+    2. **Control phrases out.** "More options for Priya Menon" is a button, not a person.
+    3. **Icon tokens reject the label.** Their presence means this is a container's text, and
+       nothing salvaged from it can be trusted to be a name.
+    4. **Collapse a doubled name.** Meet renders the name twice inside one tile — as the label
+       and again in the roster row — which arrived as "dev Choudhary dev Choudhary".
+
+    Returns ``""`` for anything that does not survive, and the caller drops it. A missing
+    participant is a gap; a participant called "frame_person Reframe visual_effects" is a wrong
+    answer delivered confidently, which is worse.
+    """
+    value = " ".join(str(label or "").splitlines()[0].split()) if label else ""
+
+    lowered = value.lower()
+    for phrase in _CONTROL_PHRASES:
+        index = lowered.find(phrase)
+        if index >= 0:
+            value = (value[:index] + " " + value[index + len(phrase) :]).strip()
+            lowered = value.lower()
+
+    if any(token in lowered for token in _UI_TOKENS):
+        return ""
+
     lowered = value.lower()
     for suffix in _STATUS_SUFFIXES:
         index = lowered.find(suffix)
         if index > 0:
             value = value[:index]
             break
-    return value.strip().strip(",").strip()[:_MAX_NAME_LEN]
+
+    value = " ".join(value.split()).strip().strip(",").strip()
+    return _collapse_repeat(value)[:_MAX_NAME_LEN]
+
+
+def _collapse_repeat(value: str) -> str:
+    """Halve a name that is its own first half repeated.
+
+    "dev Choudhary dev Choudhary" is one person. Word-wise rather than by string halves so that
+    a genuine repeated *word* ("Ann Ann Smith") is left alone — only an exact doubling of the
+    whole token sequence collapses, which a real name does not produce by accident.
+    """
+    words = value.split()
+    if len(words) >= 2 and len(words) % 2 == 0:
+        half = len(words) // 2
+        if [w.casefold() for w in words[:half]] == [w.casefold() for w in words[half:]]:
+            return " ".join(words[:half])
+    return value
 
 
 def _stable_id(value: str) -> int:

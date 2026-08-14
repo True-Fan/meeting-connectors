@@ -141,6 +141,27 @@ class GoogleMeetConnectorConfig:
     """Extra names the avatar answers to after an ``@``, beyond the one Meet shows for its own
     account (learned from the roster) and the configured ``display_name``."""
 
+    attendance_enabled: bool = True
+    """Whether the connector remembers who attended the meeting.
+
+    On by default because it is pure observation: it reads the roster stream that already
+    arrives and keeps a ledger in Python, adding no DOM work and nothing other participants can
+    see. See ``GoogleMeetSettings.attendance_enabled`` and ``meeting/attendance.py``."""
+
+    attendance_push_enabled: bool = True
+    """Whether the attendance brief is pushed to the agent as ``meeting_context``.
+
+    See ``GoogleMeetSettings.attendance_push_enabled``. Ignored when ``attendance_enabled`` is
+    False — there is no ledger to push."""
+
+    attendance_push_interval_s: float = 5.0
+    """How often the ledger is polled for changes worth pushing. See
+    ``GoogleMeetSettings.attendance_push_interval_s``."""
+
+    attendance_push_require_negotiation: bool = True
+    """Whether the brief is withheld from an agent that negotiated below ``1.2``. See
+    ``GoogleMeetSettings.attendance_push_require_negotiation``."""
+
     hand_raise_enabled: bool = True
     """Whether a participant raising their hand stops the avatar and takes the floor.
 
@@ -288,6 +309,10 @@ class GoogleMeetConnectorConfig:
             chat_enabled=meet.chat_enabled,
             chat_require_mention=meet.chat_require_mention,
             chat_mention_names=tuple(meet.chat_mention_names),
+            attendance_enabled=meet.attendance_enabled,
+            attendance_push_enabled=meet.attendance_push_enabled,
+            attendance_push_interval_s=meet.attendance_push_interval_s,
+            attendance_push_require_negotiation=meet.attendance_push_require_negotiation,
             hand_raise_enabled=meet.hand_raise_enabled,
             # Empty means "the wording that ships with the connector". The default lives in
             # ``meeting/hand_raise.py`` and cannot be repeated in ``settings.py`` — shared code

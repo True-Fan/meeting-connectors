@@ -250,6 +250,107 @@ class TestFullConversation:
 # --------------------------------------------------------------------------- #
 
 
+class TestAttendance:
+    """The ledger, through the real factory wiring and the real page bridge.
+
+    What these prove that the unit tests cannot: that ``GoogleMeetSessionFactory`` actually
+    registers the ledger on the roster listener, and that a ``PARTICIPANTS`` message crossing a
+    real socket reaches it. The unit tests own the diffing logic; this owns the wiring.
+    """
+
+    async def test_the_factory_wires_the_ledger_to_the_roster_stream(
+        self, meet_settings, session_context
+    ) -> None:
+        driver = joined_driver(auto_page=True)
+        session, _, _ = _build_session(meet_settings, driver, session_context)
+        try:
+            await session.start()
+            page = driver.page
+            assert page is not None
+
+            await page.send_participants(["Aarav Sharma", "Priya Menon", "AI Avatar"])
+            await _wait_for(lambda: session.attendance.snapshot().scans > 0)
+
+            snapshot = session.attendance.snapshot()
+            assert {r.label for r in snapshot.present} == {"Aarav Sharma", "Priya Menon"}, (
+                "the avatar's own entry must not be counted as an attendee"
+            )
+        finally:
+            await session.stop()
+
+    async def test_somebody_leaving_is_remembered(self, meet_settings, session_context) -> None:
+        driver = joined_driver(auto_page=True)
+        session, _, _ = _build_session(meet_settings, driver, session_context)
+        try:
+            await session.start()
+            page = driver.page
+            assert page is not None
+
+            await page.send_participants(["Aarav Sharma", "Priya Menon", "AI Avatar"])
+            await _wait_for(lambda: len(session.attendance.snapshot().present) == 2)
+
+            await page.send_participants(["Aarav Sharma", "AI Avatar"])
+            await _wait_for(lambda: len(session.attendance.snapshot().departed) == 1)
+
+            snapshot = session.attendance.snapshot()
+            assert {r.label for r in snapshot.present} == {"Aarav Sharma"}
+            assert {r.label for r in snapshot.departed} == {"Priya Menon"}
+        finally:
+            await session.stop()
+
+    async def test_the_agent_is_told_who_is_in_the_meeting(
+        self, meet_settings, session_context
+    ) -> None:
+        """The live failure this feature exists for.
+
+        The bridge held the right names, the endpoint served them, and the agent still answered
+        "I don't have access to your meeting details or a list of participants" — because nothing
+        crossed the avatar socket. This asserts the frame arrives, through the real factory
+        wiring, on the real page bridge.
+        """
+        import json
+
+        driver = joined_driver(auto_page=True)
+        session, transport, _ = _build_session(meet_settings, driver, session_context)
+        try:
+            await session.start()
+            page = driver.page
+            assert page is not None
+
+            await page.send_participants(["dev Choudhary", "AI Avatar"])
+
+            def briefed() -> bool:
+                return any(
+                    json.loads(p).get("kind") == "meeting_context"
+                    for p in transport.sent_control
+                )
+
+            await _wait_for(briefed, timeout_s=6.0)
+
+            brief = next(
+                json.loads(p)
+                for p in transport.sent_control
+                if json.loads(p).get("kind") == "meeting_context"
+            )
+            assert "dev Choudhary" in brief["text"]
+            assert brief["topic"] == "attendance"
+        finally:
+            await session.stop()
+
+    async def test_the_ledger_is_absent_when_the_feature_is_off(
+        self, meet_settings, session_context
+    ) -> None:
+        """Off means no ledger at all, not an empty one — so the API can say "disabled"."""
+        meet_settings.google_meet.attendance_enabled = False
+        driver = joined_driver(auto_page=True)
+        session, _, _ = _build_session(meet_settings, driver, session_context)
+        try:
+            await session.start()
+            assert session.attendance is None
+        finally:
+            await session.stop()
+
+
 class TestSessionSemantics:
     async def test_both_legs_move_together(self, meet_settings, session_context) -> None:
         """One browser tab is the participant: there is no state in which Meet ingest works

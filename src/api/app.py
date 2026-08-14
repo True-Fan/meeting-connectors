@@ -13,7 +13,7 @@ from fastapi import FastAPI
 
 from src import __version__
 from src.api.middleware import CorrelationIdMiddleware
-from src.api.routers import health, metrics, sessions
+from src.api.routers import health, metrics, participants, sessions
 from src.config.settings import Settings
 from src.containers import Container
 from src.infrastructure.logging import configure_logging, get_logger
@@ -72,6 +72,10 @@ def create_app(*, container: Container | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(metrics.router)
     app.include_router(sessions.router)
+    # Same ``/sessions`` prefix, separate module: attendance is read and seeded per session but
+    # is not part of the lifecycle, and keeping it out of ``sessions.py`` keeps that router's
+    # claim intact — it still mentions no platform and no connector-specific concept.
+    app.include_router(participants.router)
 
     # Platform-specific webhook, resolved from the container rather than imported, so
     # this module names no connector (doc 003 §1.5).

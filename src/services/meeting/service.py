@@ -153,9 +153,7 @@ class MeetingService:
             ),
         )
 
-        with bind_context(
-            session_id=session.session_id, correlation_id=session.correlation_id
-        ):
+        with bind_context(session_id=session.session_id, correlation_id=session.correlation_id):
             self._claim_pending_rtms(session)
             self._registry.register(session)
 
@@ -224,9 +222,7 @@ class MeetingService:
             self._registry.park_pending_rtms(binding)
             return None
 
-        with bind_context(
-            session_id=session.session_id, correlation_id=session.correlation_id
-        ):
+        with bind_context(session_id=session.session_id, correlation_id=session.correlation_id):
             self._apply_binding(session, binding)
             self._registry.bind_uuid(session.session_id, binding.meeting_uuid)
             logger.info("session.rtms_bound", meeting_uuid=binding.meeting_uuid)
@@ -258,9 +254,7 @@ class MeetingService:
         if session is None:
             raise SessionNotFoundError(session_id)
 
-        with bind_context(
-            session_id=session.session_id, correlation_id=session.correlation_id
-        ):
+        with bind_context(session_id=session.session_id, correlation_id=session.correlation_id):
             await self._supervisor.shutdown(session_id)
             self._registry.remove(session_id)
             logger.info("session.stopped", state=session.state)
@@ -278,3 +272,43 @@ class MeetingService:
         """Component-level health for one session, if it is supervised."""
         connector_session: ConnectorSession | None = self._supervisor.get(session_id)
         return connector_session.health() if connector_session is not None else None
+
+    # -- attendance --------------------------------------------------------
+    #
+    # Duck-typed rather than added to ``ConnectorSession``, and deliberately so. Doc 003 §0
+    # sets the rule this file already follows elsewhere: *a protocol earns its place only if a
+    # second implementation exists in this repository today.* One connector keeps an
+    # attendance ledger, so widening the port would oblige Zoom and Teams to answer a question
+    # neither can, and put a Meet-shaped concept in the one place that is meant to be
+    # platform-blind. When a second connector grows one, this becomes a protocol method and
+    # these two ``getattr`` calls go away.
+
+    def attendance_snapshot(self, session_id: SessionId) -> object | None:
+        """Who has been in this session's meeting, if its connector tracks that.
+
+        ``None`` covers three genuinely different cases the caller has to distinguish — no
+        such session, a connector with no ledger, and a ledger switched off — so the API layer
+        maps it to a 404 with a message rather than to an empty answer, which would read as
+        "nobody attended".
+        """
+        ledger = self._ledger(session_id)
+        return ledger.snapshot() if ledger is not None else None
+
+    def seed_invitees(self, session_id: SessionId, names: tuple[str, ...]) -> int | None:
+        """Tell a session who was invited. Returns how many names were newly recorded.
+
+        Separate from session creation because the invite list comes from a different place
+        than the join does: the calendar event, which the orchestrator holds and the bridge has
+        no access to. Accepting it as a later call keeps ``CreateSessionRequest`` platform-blind
+        and lets the list arrive late — a meeting whose invitees are posted ten minutes in still
+        gets a correct "who never joined" answer, because the ledger marks existing entries
+        rather than replacing them.
+        """
+        ledger = self._ledger(session_id)
+        return ledger.seed_invitees(names) if ledger is not None else None
+
+    def _ledger(self, session_id: SessionId) -> Any | None:
+        connector_session = self._supervisor.get(session_id)
+        if connector_session is None:
+            return None
+        return getattr(connector_session, "attendance", None)
