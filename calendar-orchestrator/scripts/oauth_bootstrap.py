@@ -22,9 +22,8 @@ from pathlib import Path
 # installing the package.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from google_auth_oauthlib.flow import InstalledAppFlow  # noqa: E402
-
-from app.config import CALENDAR_SCOPES, Settings  # noqa: E402
+from app.config import Settings
+from google_auth_oauthlib.flow import InstalledAppFlow
 
 
 def main() -> None:
@@ -46,8 +45,14 @@ def main() -> None:
         )
         raise SystemExit(1)
 
-    flow = InstalledAppFlow.from_client_secrets_file(str(client_secret_file), CALENDAR_SCOPES)
+    # Scopes follow the enabled features, so turning on ORCH_GMAIL__ENABLED and re-running
+    # this script is all it takes to add Gmail consent to an existing setup.
+    scopes = settings.required_scopes()
+    flow = InstalledAppFlow.from_client_secrets_file(str(client_secret_file), scopes)
     print("Opening a browser for sign-in. Sign in as the BOT's Google account, not your own.")
+    print("Requesting scopes:")
+    for scope in scopes:
+        print(f"  - {scope}")
     credentials = flow.run_local_server(port=0)
 
     token_file = settings.google.oauth_token_file

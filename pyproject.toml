@@ -75,6 +75,10 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["ARG001", "ARG002", "S101"]
+# calendar-orchestrator is a separate service with its own venv and pytest config, so its
+# tests need the same allowances spelled out again — the pattern above is anchored at the
+# repo root and does not reach them.
+"calendar-orchestrator/tests/**" = ["ARG001", "ARG002", "S101"]
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"

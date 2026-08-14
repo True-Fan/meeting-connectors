@@ -89,6 +89,55 @@ async def trigger_bot_join(
     ) from last_exc
 
 
+async def has_active_session(meeting_code: str, settings: BridgeSettings) -> bool:
+    """True if the bridge already has a live session in ``meeting_code``.
+
+    The bridge's ``POST /sessions`` is not idempotent — it will happily start a *second*
+    avatar in a meeting that already has one, and two bots talking over each other is a very
+    visible failure. That is a real risk and not a theoretical one: a meeting can be on the
+    calendar (so the poller joins it at T-60s) *and* have someone click "Add people" once it
+    is running, which is a second, independent trigger for the same meeting.
+
+    Best-effort by design. If the bridge cannot be reached or answers something unexpected
+    this returns ``False`` — meaning "go ahead and join". Failing open is the right bias: a
+    duplicate bot is embarrassing, but skipping a join because a status check hiccuped means
+    the meeting has no bot at all, which is the failure this feature exists to prevent.
+    """
+    list_url = settings.url.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=settings.timeout_s) as client:
+            response = await client.get(list_url)
+            if response.status_code >= 400:
+                logger.warning(
+                    "could not list sessions (%d); assuming %s is not joined",
+                    response.status_code,
+                    meeting_code,
+                )
+                return False
+            sessions = response.json().get("sessions", [])
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("could not list sessions (%s); assuming %s is not joined", exc, meeting_code)
+        return False
+
+    for session in sessions:
+        if not isinstance(session, dict):
+            continue
+        if session.get("meeting_number") != meeting_code:
+            continue
+        # "stopped" and "failed" are the bridge's terminal states; a session in any other
+        # state is either in the meeting or on its way in, and either way a second one must
+        # not be started.
+        if session.get("state") not in ("stopped", "failed"):
+            logger.info(
+                "bridge already has session %s in meeting %s (state=%s)",
+                session.get("session_id"),
+                meeting_code,
+                session.get("state"),
+            )
+            return True
+    return False
+
+
 async def _seed_invitees(
     client: httpx.AsyncClient,
     join_response: httpx.Response,
