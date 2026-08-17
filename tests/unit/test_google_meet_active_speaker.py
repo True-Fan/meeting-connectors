@@ -813,12 +813,19 @@ class TestAgentBrief:
         assert "Nobody has been heard speaking yet" in brief
         assert "Do not assume it is whoever spoke or typed most recently" in brief
 
-    def test_a_named_voice_is_marked_as_the_one_addressing_the_avatar(self, tracker) -> None:
-        """The agent's own transcription hears the words with no name on them, so this sentence
-        is the only thing that connects "who is talking" to "who is talking *to me*"."""
+    def test_a_named_voice_answers_the_question_in_the_form_it_is_asked(self, tracker) -> None:
+        """**The fact was in the brief and the answer still was not.** A live run had the agent
+        answer "who is speaking?" with "dev Choudhary" and, from the same brief a minute earlier,
+        answer "what is my name?" with "I do not know your name". The agent's own transcription
+        hears the words with no name attached, so nothing connects the first-person question to
+        the voice unless the brief writes the connection down."""
         tracker.offer(_edge(name="dev Choudhary"))
 
-        assert "the person the avatar is being spoken to by" in tracker.snapshot().agent_context()
+        brief = tracker.snapshot().agent_context()
+
+        assert "That is the person talking to the avatar" in brief
+        assert 'when they say "I", "me" or "my" they mean dev Choudhary' in brief
+        assert 'asked "what is my name?" or "who am I?", the answer is dev Choudhary' in brief
 
     def test_it_names_who_spoke_last_once_the_room_is_quiet(self, tracker, clock) -> None:
         """"Who was talking before me?" is asked in a pause, which is exactly when `current` is
@@ -841,7 +848,7 @@ class TestAgentBrief:
         brief = tracker.snapshot().agent_context()
 
         assert "counts speech only" in brief
-        assert "typed in the meeting chat but not spoken aloud is not a speaker" in brief
+        assert "typed in the chat but has not spoken is not the voice being heard" in brief
 
 
 class TestSpeakerAnnouncer:

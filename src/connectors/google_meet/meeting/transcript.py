@@ -74,13 +74,14 @@ Oldest dropped, like the speaker turn history and for the same reason: this answ
 just said" far more often than "what was said an hour ago". Five hundred lines is a long meeting's
 worth of captions at a few hundred bytes each."""
 
-_BRIEF_LINES = 12
+_BRIEF_LINES = 8
 """How many lines the agent's brief carries.
 
 A window rather than the lot, because the brief is standing context that is re-sent whenever it
 changes: an unbounded transcript would grow the frame without limit and crowd out the
-conversation the agent is actually having. Twelve lines is comfortably more than a question and
-its follow-ups."""
+conversation the agent is actually having. Eight lines is comfortably more than a question and its
+follow-ups — and it was twelve until a live run complained about reply latency, where every line
+here is tokens the agent re-reads before it can start answering."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +146,19 @@ class TranscriptSnapshot:
         """Everything one person said. Case-insensitive, because the caller is quoting a human."""
         folded = " ".join(name.split()).casefold()
         return tuple(line for line in self.lines if line.label.casefold() == folded)
+
+    @property
+    def chat_lines(self) -> int:
+        """How many lines were typed rather than spoken.
+
+        **The count a pusher should watch, and the reason is latency rather than tidiness.** The
+        agent transcribes the meeting's audio itself, so a captioned line tells it something it
+        already knows — while re-sending standing context invalidates the reply it had started
+        preparing. Captions arrive every couple of seconds *while somebody is talking*, which is
+        the worst possible moment to do that. A typed line is the opposite: the agent cannot hear
+        the chat panel, so it is news, and it arrives at typing speed.
+        """
+        return sum(1 for line in self.lines if line.in_chat)
 
     def recent(self, limit: int = _BRIEF_LINES) -> tuple[TranscriptLine, ...]:
         return self.lines[-limit:] if limit > 0 else ()

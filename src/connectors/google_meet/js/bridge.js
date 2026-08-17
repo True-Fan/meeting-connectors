@@ -207,6 +207,15 @@
     // the first row only — reading each row in isolation attributes the first and orphans the
     // rest. Carried across scans too, because the group can be extended minutes later.
     chatLastSender: null,
+    // Resolved sender per message, so the climb runs **once per message** rather than once per
+    // message per scan.
+    //
+    // The name has to be resolved for every row including already-forwarded ones — that is what
+    // attributes a grouped message — and this scan runs on the DOM mutation observer, which Meet
+    // keeps busy: at a 250 ms throttle with twenty messages on screen that was thousands of
+    // `querySelector` calls a second on the main thread, for an answer that cannot change. The
+    // browser is also drawing the avatar's video, so main-thread work here is not free.
+    chatSenderById: new Map(),
     // Bounded, like the hand-raise and caption diagnostics: a panel whose sender markup we
     // cannot read must say so with evidence in it, and must not then fill the log for the rest
     // of the meeting.
@@ -2480,7 +2489,7 @@
     return found;
   }
 
-  function chatMessageId(node, text) {
+  function chatMessageId(node, text, sender) {
     // Meet's own id when it exposes one, because it is stable across re-renders. Otherwise a
     // content key, which is weaker: two identical messages from the same person collapse into
     // one. That is the right trade — answering a duplicate twice is worse than missing an
@@ -2496,8 +2505,9 @@
     if (own) {
       return own;
     }
-    const sender = (chatSender(node) || {}).name || '';
-    return `${sender}|${text}`;
+    // The sender is passed in rather than read again: the caller has already resolved it, and
+    // this runs for every rendered row on every DOM scan.
+    return `${sender || ''}|${text}`;
   }
 
   /*
@@ -2620,6 +2630,7 @@
       // A fresh call is a fresh list: carrying a name over from the previous one would attribute
       // this meeting's first message to somebody who is not in it.
       state.chatLastSender = null;
+      state.chatSenderById.clear();
       state.chatSenderDiagnostics = 0;
       // A rejoin renders the panel's history again; re-baselining stops the avatar answering
       // messages it has already seen, and `chatSeen` still guards the individual ids.
@@ -2672,15 +2683,31 @@
        * check — because the name on a row we have already sent is what attributes the next one.
        * Meet renders a run of messages from one person under a single heading, so skipping seen
        * rows would throw away the only copy of the name the group has.
+       *
+       * Cached, because "every row, every scan" is a real cost on a thread that is also drawing
+       * video. Keyed by Meet's message id where there is one and by the text otherwise; both are
+       * stable for a rendered message, which is exactly why the answer can be reused.
        */
-      const found = chatSender(node);
+      const cacheKey =
+        node.getAttribute('data-message-id') || node.getAttribute('data-id') || text;
+      let found = state.chatSenderById.get(cacheKey);
+      if (found === undefined) {
+        found = chatSender(node);
+        if (state.chatSenderById.size > 500) {
+          // A ceiling rather than an eviction policy: the map is a cache, and rebuilding it costs
+          // one climb per visible row. Unbounded growth in a long meeting is the failure worth
+          // avoiding.
+          state.chatSenderById.clear();
+        }
+        state.chatSenderById.set(cacheKey, found);
+      }
       if (found) {
         state.chatLastSender = found.name;
       }
       const sender = found ? found.name : state.chatLastSender;
       const senderFrom = found ? found.from : (sender ? 'group' : 'none');
 
-      const id = chatMessageId(node, text);
+      const id = chatMessageId(node, text, sender);
       if (state.chatSeen.has(id)) {
         continue;
       }

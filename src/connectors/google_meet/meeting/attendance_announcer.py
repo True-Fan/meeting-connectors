@@ -170,9 +170,18 @@ class AttendanceAnnouncer:
                 current = f"{current}#{','.join(speakers.current)}"
                 current = f"{current}#{','.join(sorted(speakers.candidates))}"
             if transcript is not None:
-                # The line count, not the text: a new line is news, and re-rendering the same ones
-                # is not.
-                current = f"{current}#{len(transcript.lines)}"
+                # **The *chat* line count, not every line, and this one is about reply latency.**
+                # Re-sending standing context makes the agent rebuild its frame and throws away
+                # the reply it had begun preparing; a captioned line arrives every couple of
+                # seconds *while somebody is talking*, so keying on the total meant a push landing
+                # on almost every sentence, at the exact moment the answer was being formed. It
+                # also bought nothing: the agent transcribes the meeting's audio itself, so a
+                # captioned line is the one thing in this brief it already knows. A typed line it
+                # cannot know, and arrives at typing speed.
+                #
+                # Captions still reach the agent — the next push carries every line the ledger
+                # holds. They no longer *cause* one.
+                current = f"{current}#{transcript.chat_lines}"
             if current == self._last:
                 return
 

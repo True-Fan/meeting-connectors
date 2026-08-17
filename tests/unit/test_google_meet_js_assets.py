@@ -651,8 +651,27 @@ class TestChatCapture:
         """Meet recycles chat list nodes, so a shifted index turns an already-answered message
         into a new one and the avatar answers it twice. Position is the one part of a chat row
         guaranteed not to be stable."""
-        assert "function chatMessageId(node, text)" in bridge_code
+        assert "function chatMessageId(node, text, sender)" in bridge_code
         assert "|${index}" not in bridge_code
+
+    def test_the_sender_is_resolved_once_per_message_not_once_per_scan(
+        self, bridge_code: str
+    ) -> None:
+        """**A cost I added and then had to pay back.** The name must be resolved for every row
+        including already-forwarded ones, because that is what attributes a grouped message — but
+        this scan runs on Meet's mutation observer at a 250 ms throttle, so with twenty messages
+        on screen the climb was thousands of `querySelector` calls a second on the thread that is
+        also drawing the avatar's video. The answer cannot change for a rendered message, so it is
+        resolved once and reused."""
+        scan = bridge_code.split("function scanChat()", 1)[1].split("function scanRoster", 1)[0]
+        assert "state.chatSenderById.get(cacheKey)" in scan
+        assert "state.chatSenderById.set(cacheKey, found)" in scan
+        assert "state.chatSenderById.size > 500" in scan, "a cache in a long meeting needs a lid"
+        # The dedupe key used to resolve the sender a *second* time for every row.
+        identity = bridge_code.split("function chatMessageId(node, text, sender)", 1)[1].split(
+            "\n  function ", 1
+        )[0]
+        assert "chatSender(" not in identity
 
 
 class TestHandRaiseCapture:

@@ -207,9 +207,17 @@ class SpeakerSnapshot:
                         f"participant it is. {self._unattributed_guard()}"
                     )
                 else:
+                    # **Stated as the answer to the question that gets asked, because the
+                    # inference does not happen on its own.** A live run had the agent answer
+                    # "who is speaking?" with "dev Choudhary" and, a minute earlier and a minute
+                    # later, answer "what is my name?" with "I do not know your name" — from the
+                    # same brief. It had the fact and did not connect it to a first-person
+                    # question, so the connection is now written down rather than left implied.
                     lines.append(
-                        f"{speaker} is speaking right now — this is the person the avatar is "
-                        "being spoken to by."
+                        f"{speaker} is speaking right now. That is the person talking to the "
+                        f"avatar, so when they say \"I\", \"me\" or \"my\" they mean "
+                        f"{speaker} — asked \"what is my name?\" or \"who am I?\", the answer "
+                        f"is {speaker}."
                     )
             else:
                 lines.append(f"Speaking right now: {_join(self.current)}.")
@@ -242,15 +250,14 @@ class SpeakerSnapshot:
         # who have communicated" answers "who was talking to you?" with whoever typed last — and
         # then, asked whose voice it is hearing now, offers the same name.
         lines.append(
-            "This paragraph counts speech only. Somebody who has typed in the meeting chat but "
-            "not spoken aloud is not a speaker here, and must not be treated as the voice the "
-            "avatar is currently hearing."
+            "This paragraph counts speech only: somebody who typed in the chat but has not "
+            "spoken is not the voice being heard."
         )
 
         if self.self_name:
             lines.append(
-                f'The avatar itself appears in the meeting as "{self.self_name}" and is never '
-                "counted as a speaker — its own audio never reaches the microphone tap."
+                f'The avatar itself appears as "{self.self_name}" and is never counted as a '
+                "speaker."
             )
 
         return " ".join(lines)
