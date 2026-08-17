@@ -652,3 +652,180 @@ class TestADeadAvatarIsNotAHealthySession:
             assert session.leg_states()[0] is not ComponentState.DEGRADED
         finally:
             await session.stop()
+
+
+class TestSpeakerAttribution:
+    """Who is speaking, through the real factory wiring and the real page bridge.
+
+    The unit tests own the bookkeeping. What these own is the wiring — and specifically the two
+    things a live run showed the unit tests could not see: that a speaking edge crossing a real
+    socket reaches the tracker, and that a session ends up with **exactly one** thing pushing
+    standing context to the agent.
+    """
+
+    async def test_a_speaking_edge_reaches_the_tracker(
+        self, meet_settings, session_context
+    ) -> None:
+        driver = joined_driver(auto_page=True)
+        session, _, _ = _build_session(meet_settings, driver, session_context)
+        try:
+            await session.start()
+            page = driver.page
+            assert page is not None
+
+            await page.send_speaker(name="Priya Menon", speaking=True)
+            await _wait_for(lambda: session.speakers.current_speaker() == "Priya Menon")
+        finally:
+            await session.stop()
+
+    async def test_the_speaker_is_named_in_a_two_person_call_with_no_page_attribution(
+        self, meet_settings, session_context
+    ) -> None:
+        """**The case the first live run failed.** Meet renders remote *audio* on elements outside
+        the participant tile, so an audio stream's id never appears there — every turn came back
+        "Someone" while the levels were measured perfectly. With one other person in the room there
+        is exactly one person it can have been, and no markup is consulted to say so.
+        """
+        driver = joined_driver(auto_page=True)
+        session, _, _ = _build_session(meet_settings, driver, session_context)
+        try:
+            await session.start()
+            page = driver.page
+            assert page is not None
+
+            await page.send_participants(["dev Choudhary", "AI Avatar"])
+            await _wait_for(lambda: len(session.attendance.snapshot().present) == 1)
+
+            # Exactly what the page sends when it can hear somebody and cannot name them.
+            await page.send_speaker(name=None, speaking=True)
+            await _wait_for(lambda: session.speakers.current_speaker() == "dev Choudhary")
+
+            (turn,) = session.speakers.snapshot().turns
+            assert turn.inferred is True, "reached by elimination, and recorded as such"
+        finally:
+            await session.stop()
+
+    async def test_a_session_has_exactly_one_context_pusher(
+        self, meet_settings, session_context
+    ) -> None:
+        """**The regression this prevents was reported as attendance breaking.**
+
+        An agent keeps one slot for standing context. With both features on there were two
+        announcers writing to it, and the speaker one — pushing every few seconds against a roster
+        that changes once a meeting — evicted the other: asked who was in the meeting, the avatar
+        answered "Someone is present in the meeting". So the speaker brief travels *inside* the
+        attendance brief, and the second pusher exists only when the first does not.
+        """
+        driver = joined_driver(auto_page=True)
+        session, _, _ = _build_session(meet_settings, driver, session_context)
+
+        # Reaching into the built session, because the wiring *is* the property under test —
+        # the same argument ``_build_session`` makes for swapping the transport in place.
+        announcer = session._announcer
+        speaker_announcer = session._speaker_announcer
+
+        assert announcer is not None, "attendance still pushes"
+        assert speaker_announcer is None, "and it is the only pusher"
+
+    async def test_the_brief_names_both_who_is_here_and_who_is_talking(
+        self, meet_settings, session_context
+    ) -> None:
+        import json
+
+        driver = joined_driver(auto_page=True)
+        session, transport, _ = _build_session(meet_settings, driver, session_context)
+        try:
+            await session.start()
+            page = driver.page
+            assert page is not None
+
+            await page.send_participants(["dev Choudhary", "AI Avatar"])
+            await page.send_speaker(name="dev Choudhary", speaking=True)
+
+            def briefed() -> bool:
+                return any(
+                    "is speaking right now" in json.loads(p).get("text", "")
+                    for p in transport.sent_control
+                    if json.loads(p).get("kind") == "meeting_context"
+                )
+
+            await _wait_for(briefed, timeout_s=8.0)
+
+            brief = next(
+                json.loads(p)["text"]
+                for p in reversed(transport.sent_control)
+                if json.loads(p).get("kind") == "meeting_context"
+            )
+            assert "Currently in the meeting" in brief
+            assert "dev Choudhary is speaking right now" in brief
+        finally:
+            await session.stop()
+
+
+class TestTranscript:
+    """Who said what, through the real factory wiring and the real page bridge.
+
+    The gap this closes is the one a live run made obvious: asked "what did they ask you?", the
+    avatar could only say it did not know. Attribution knows who is talking and not what was said;
+    the agent's transcription knows what was said and receives one mixed stream, so it can never
+    attribute it. Meet's captions have both, and these prove the path from that panel to the brief.
+    """
+
+    async def test_a_caption_line_reaches_the_transcript(
+        self, meet_settings, session_context
+    ) -> None:
+        driver = joined_driver(auto_page=True)
+        session, _, _ = _build_session(meet_settings, driver, session_context)
+        try:
+            await session.start()
+            page = driver.page
+            assert page is not None
+
+            await page.send_caption(speaker="Dev Choudhary", text="Tell me about Delhi")
+            await _wait_for(lambda: session.transcript.count == 1)
+
+            (line,) = session.transcript.snapshot().lines
+            assert line.speaker == "Dev Choudhary"
+            assert line.text == "Tell me about Delhi"
+        finally:
+            await session.stop()
+
+    async def test_the_brief_tells_the_agent_who_asked_what(
+        self, meet_settings, session_context
+    ) -> None:
+        """**The answer to "what did they ask you?" arriving where the agent can use it.**
+
+        One frame carries who is here, who is talking, and what each person said — because an agent
+        has one slot for standing context, and three pushers would evict each other exactly as two
+        already did.
+        """
+        import json
+
+        driver = joined_driver(auto_page=True)
+        session, transport, _ = _build_session(meet_settings, driver, session_context)
+        try:
+            await session.start()
+            page = driver.page
+            assert page is not None
+
+            await page.send_participants(["Dev Choudhary", "AI Avatar"])
+            await page.send_caption(speaker="Dev Choudhary", text="Tell me about India Gate")
+
+            def briefed() -> bool:
+                return any(
+                    "Tell me about India Gate" in json.loads(p).get("text", "")
+                    for p in transport.sent_control
+                    if json.loads(p).get("kind") == "meeting_context"
+                )
+
+            await _wait_for(briefed, timeout_s=8.0)
+
+            brief = next(
+                json.loads(p)["text"]
+                for p in reversed(transport.sent_control)
+                if json.loads(p).get("kind") == "meeting_context"
+            )
+            assert "Currently in the meeting" in brief, "attendance is still there"
+            assert "Dev Choudhary: Tell me about India Gate" in brief
+        finally:
+            await session.stop()

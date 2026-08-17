@@ -53,12 +53,14 @@ from src.connectors.google_meet.exceptions import (
     MeetConfigurationError,
 )
 from src.connectors.google_meet.js import load_assets
+from src.connectors.google_meet.meeting.active_speaker import SpeakerTracker
 from src.connectors.google_meet.meeting.chat import MeetChatSource
 from src.connectors.google_meet.meeting.controls import MeetControls
 from src.connectors.google_meet.meeting.hand_raise import MeetHandRaiseSource
 from src.connectors.google_meet.meeting.join import MeetJoiner
 from src.connectors.google_meet.meeting.meet_url import resolve_join_target
 from src.connectors.google_meet.meeting.participants import MeetRoster, parse_roster
+from src.connectors.google_meet.meeting.transcript import MeetTranscript
 from src.connectors.google_meet.reconnect.classify import build_policy, is_fatal
 from src.connectors.google_meet.websocket.protocol import (
     MeetMessage,
@@ -200,6 +202,88 @@ tile, closes the people panel, or scrolls a participant out of its virtualised l
 to the cooldown above: a re-raise inside that window would not be reported anyway, so a
 shorter grace could only cost false interruptions and could buy nothing."""
 
+SPEAKER_SAMPLE_MS = 200
+"""How often the page measures each remote track's level.
+
+**On its own timer rather than on the DOM scan, and that is the design.** Every other observer
+in this connector is driven by Meet's mutations, which is right for things that change when
+somebody clicks. Speech is not one: a meeting can sit visually still while a person talks for a
+minute, and a turn sampled at the mutation rate would start late and end later.
+
+Affordable because it touches no DOM at all — it reads 512 bytes out of an ``AnalyserNode`` per
+participant and does arithmetic on them. That is why it can run five times a second while the
+scans that force a layout are floored at four; the two costs are not comparable. 200 ms also
+bounds the error on a turn boundary, which is what makes "who was speaking then" answerable."""
+
+SPEAKER_MAP_MS = 2_000
+"""How often the page re-checks which participant each remote stream is rendered on.
+
+Property reads (``srcObject``, ``closest``) rather than text, so no layout is forced — but it
+walks every media element on the page, and the answer only changes when somebody joins, leaves,
+or Meet re-lays-out its tiles. All of those are human-speed."""
+
+SPEAKER_DOM_SCAN_MS = 400
+"""Floor between passes over Meet's own speaking indicator.
+
+The fallback signal, and the only one that can be broken by a Meet release — so it is rate
+limited below the energy sampler and above the DOM scan floor. It matters most in the case the
+energy path cannot cover: a participant whose stream never appears on a tile the page can read."""
+
+SPEAKER_START_LEVEL = 0.02
+"""RMS at which a track counts as somebody talking, on a 0-1 scale.
+
+Two thresholds rather than one, because a single one makes a speaker flicker on and off across
+every consonant and each flicker is a turn boundary. This is the level a voice has to reach to
+take the floor; ``SPEAKER_STOP_LEVEL`` is the lower one it has to fall below to give it up.
+
+Deliberately above room tone and below conversational speech. It is a floor rather than a tuned
+value: the page reports the measured level with every edge, so a room that needs a different
+number can be tuned from a reading — the same discipline ``speech_interrupt_threshold`` uses."""
+
+SPEAKER_STOP_LEVEL = 0.012
+"""RMS below which a track is no longer speaking, once ``SPEAKER_RELEASE_MS`` has passed."""
+
+SPEAKER_RELEASE_MS = 600
+"""How long a track must stay quiet before its turn ends.
+
+Short on purpose. This decides when a turn *ends*, and a long release would report somebody as
+speaking through the other person's reply. The complementary judgement — whether a gap ended
+the turn or merely punctuated it — is made in Python, where a rejoin can look at the turn it is
+rejoining. See ``meeting/active_speaker.py``."""
+
+SPEAKER_DIAG_MS = 30_000
+"""How long to wait before reporting that nobody has been heard, and what the page does have.
+
+The lesson from the chat button and the hand indicator, applied before it costs a round of live
+testing this time: a DOM-reading feature that finds nothing is indistinguishable from a quiet
+meeting. Emitted at most four times, and only while nothing has ever been attributed."""
+
+CAPTION_OPEN_RETRY_MS = 2_000
+"""Minimum gap between attempts to switch captions on. Bounded by ``CHAT_OPEN_WINDOW_MS``, which
+is the same wall-clock budget and exists for the same reason: Meet has not drawn its control bar
+in the first seconds of a call, and a scan-count budget is spent before it does."""
+
+CAPTION_SCAN_MS = 400
+"""Floor between reads of the caption panel.
+
+The panel is small — a few short lines — so this is the one place in the bridge where reading
+``innerText`` is affordable, and the only place it buys something no cheaper read can: Meet
+renders the speaker's name and the caption as separate blocks, so the *rendered* line break is
+what separates the name from the words. ``textContent`` runs them together."""
+
+CAPTION_SETTLE_MS = 1_200
+"""How long a caption must stop changing before it counts as a finished line.
+
+Meet extends a caption word by word while somebody talks, so forwarding on sight would deliver a
+dozen fragments of one sentence and the transcript would read as stutter. A little over a second
+is longer than the gap between words and shorter than the gap between turns."""
+
+CAPTION_DIAG_MS = 25_000
+"""How long to wait before reporting that no caption has been captured, and what the panel holds.
+
+Emitted at most three times. Same discipline as the hand-raise and speaker diagnostics, and the
+same reason: a DOM-reading feature that finds nothing looks exactly like a quiet meeting."""
+
 AUDIO_ENFORCE_INTERVAL_MS = 2_000
 """How often the page re-checks that Meet's audio sender still carries the avatar's track.
 
@@ -257,9 +341,11 @@ class ChromiumBridge:
         "_roster_listeners",
         "_selectors",
         "_server",
+        "_speakers",
         "_state",
         "_state_listeners",
         "_task",
+        "_transcript",
     )
 
     def __init__(
@@ -301,6 +387,10 @@ class ChromiumBridge:
         # shape ``MeetingService`` uses for an unconfigured connector.
         self._chat: MeetChatSource | None = None
         self._hands: MeetHandRaiseSource | None = None
+        # Attached by the session factory when speaker tracking is on, on the same terms as the
+        # two above: a session with it off carries no tracker at all rather than an inert one.
+        self._speakers: SpeakerTracker | None = None
+        self._transcript: MeetTranscript | None = None
 
         self._inbound: BoundedFrameQueue[AudioFrame] = BoundedFrameQueue(
             name="google_meet_inbound",
@@ -442,6 +532,23 @@ class ChromiumBridge:
         """
         self._hands = hands
 
+    def attach_speakers(self, speakers: SpeakerTracker) -> None:
+        """Route observed speaking edges into ``speakers``.
+
+        Injected for the reason chat and hands are: the bridge stays ignorant of who consumes
+        the events, and a session with the feature off never creates the surface.
+        """
+        self._speakers = speakers
+
+    def attach_transcript(self, transcript: MeetTranscript) -> None:
+        """Route settled caption lines *and* observed chat messages into ``transcript``.
+
+        Injected on the same terms as the rest: the bridge learns nothing about who consumes
+        them. Both feeds, because a meeting's conversation is spoken and typed and the ledger
+        that answers "what was said?" has to hold both — see ``_on_chat``.
+        """
+        self._transcript = transcript
+
     async def page_stats(self) -> dict[str, Any] | None:
         """Read ``window.__MC_BRIDGE_STATS__()`` from the live page.
 
@@ -504,6 +611,7 @@ class ChromiumBridge:
             "inbound_dropped": self._inbound.dropped,
             "participants": self._roster.count,
             "others": len(self._roster.others),
+            "speaker_events": self._speakers.events if self._speakers is not None else 0,
         }
 
     def add_roster_listener(self, listener: RosterListener) -> None:
@@ -697,6 +805,20 @@ class ChromiumBridge:
             "handRaiseDownGraceMs": HAND_RAISE_DOWN_GRACE_MS,
             "handRaiseSweepMs": HAND_RAISE_SWEEP_MS,
             "handRaiseDiagMs": HAND_RAISE_DIAG_MS,
+            "speakerTrackingEnabled": self._config.speaker_tracking_enabled,
+            "speakerSampleMs": SPEAKER_SAMPLE_MS,
+            "speakerMapMs": SPEAKER_MAP_MS,
+            "speakerDomScanMs": SPEAKER_DOM_SCAN_MS,
+            "speakerStartLevel": SPEAKER_START_LEVEL,
+            "speakerStopLevel": SPEAKER_STOP_LEVEL,
+            "speakerReleaseMs": SPEAKER_RELEASE_MS,
+            "speakerDiagMs": SPEAKER_DIAG_MS,
+            "captionsEnabled": self._config.captions_enabled,
+            "captionOpenWindowMs": CHAT_OPEN_WINDOW_MS,
+            "captionOpenRetryMs": CAPTION_OPEN_RETRY_MS,
+            "captionScanMs": CAPTION_SCAN_MS,
+            "captionSettleMs": CAPTION_SETTLE_MS,
+            "captionDiagMs": CAPTION_DIAG_MS,
             "videoWidth": video.width,
             "videoHeight": video.height,
             "videoFps": video.fps,
@@ -882,6 +1004,11 @@ class ChromiumBridge:
 
             # Buffered audio is stale by definition; replaying it would burst.
             self._inbound.clear()
+            if self._speakers is not None:
+                # The page that opened those turns is gone, so no stop edge for them will ever
+                # arrive and whoever was mid-sentence would read as speaking for the rest of the
+                # meeting. The turns themselves are kept — they did happen.
+                self._speakers.reset()
             self._rejoins += 1
             logger.warning(
                 "meet_bridge.rejoined",
@@ -920,6 +1047,10 @@ class ChromiumBridge:
                 self._on_chat(message)
             case MeetMessageType.HAND_RAISE:
                 self._on_hand_raise(message)
+            case MeetMessageType.ACTIVE_SPEAKER:
+                self._on_active_speaker(message)
+            case MeetMessageType.CAPTION:
+                self._on_caption(message)
             case MeetMessageType.PAGE_EVENT:
                 # The page reports facts and never interprets them, so this is the layer
                 # that decides they are worth a log line at all.
@@ -937,21 +1068,43 @@ class ChromiumBridge:
                 )
 
     def _on_chat(self, message: MeetMessage) -> None:
-        """Hand one observed chat message to the chat source.
+        """Hand one observed chat message to the chat source, and to the transcript.
 
         Synchronous and total, like ``_on_audio``: this runs inside the read loop, which is the
         media channel. A coroutine could stall it and an exception would tear it down — and a
         dead read loop stops audio in both directions, which is a catastrophic price for a
         malformed chat payload. So the sink is a plain method that swallows.
+
+        **Two sinks, and they are given different things on purpose.** The chat source decides
+        what the avatar should *answer* — it filters on ``@mention``, drops the avatar's own
+        messages, and queues the survivors. The transcript records what was *said*, and neither
+        of those filters applies to history: a message between two participants is not the
+        avatar's to answer and is still part of the conversation it will be asked to recall. So
+        the transcript is fed the raw payload, independently, and a session with chat disabled
+        keeps neither.
         """
-        chat = self._chat
-        if chat is None:
-            return
         try:
             body = message.json()
-            chat.offer(body, message_id=str(body.get("id") or "") or None)
         except Exception as exc:
             logger.warning("meet_bridge.chat_dropped", error=str(exc))
+            return
+
+        message_id = str(body.get("id") or "") or None
+        chat = self._chat
+        if chat is not None:
+            try:
+                chat.offer(body, message_id=message_id)
+            except Exception as exc:
+                logger.warning("meet_bridge.chat_dropped", error=str(exc))
+
+        transcript = self._transcript
+        if transcript is not None:
+            # Second, and in its own guard: a bookkeeping failure must not cost the avatar the
+            # answer to a question it was actually asked.
+            try:
+                transcript.offer_chat(body, message_id=message_id)
+            except Exception as exc:
+                logger.warning("meet_bridge.chat_transcript_dropped", error=str(exc))
 
     def _on_hand_raise(self, message: MeetMessage) -> None:
         """Hand one observed raised hand to the hand-raise source.
@@ -967,6 +1120,37 @@ class ChromiumBridge:
             hands.offer(body, event_id=str(body.get("id") or "") or None)
         except Exception as exc:
             logger.warning("meet_bridge.hand_raise_dropped", error=str(exc))
+
+    def _on_active_speaker(self, message: MeetMessage) -> None:
+        """Hand one speaking edge to the tracker.
+
+        Synchronous and total, like ``_on_chat`` and ``_on_hand_raise``. This one arrives more
+        often than either — several times a turn, per participant — which makes the rule it
+        follows more load-bearing rather than less: it runs inside the read loop, and a malformed
+        payload must cost an attribution rather than the meeting's audio in both directions.
+        """
+        speakers = self._speakers
+        if speakers is None:
+            return
+        try:
+            speakers.offer(message.json())
+        except Exception as exc:
+            logger.warning("meet_bridge.active_speaker_dropped", error=str(exc))
+
+    def _on_caption(self, message: MeetMessage) -> None:
+        """Hand one settled caption line to the transcript. Synchronous and total, like the rest.
+
+        This is what makes "what did they ask you?" answerable, so it is worth being explicit that
+        it still may not cost the meeting anything: a malformed payload from a DOM we do not
+        control must lose a line of transcript, never the read loop that carries audio.
+        """
+        transcript = self._transcript
+        if transcript is None:
+            return
+        try:
+            transcript.offer(message.json())
+        except Exception as exc:
+            logger.warning("meet_bridge.caption_dropped", error=str(exc))
 
     def _note_playout(self, stats: dict[str, object]) -> None:
         """Say out loud when the avatar's voice is standing in a queue inside the browser.
@@ -1050,6 +1234,102 @@ class ChromiumBridge:
             )
             return
 
+        if event == "speakerNothingSeen":
+            # **Warning, for the same reason ``handRaiseNothingSeen`` is.** It means the page has
+            # been listening for a speaker and attributed nobody, which is indistinguishable from
+            # a meeting where nobody has spoken. The counters separate the two failures that
+            # produce it: ``probes: 0`` with remote tracks present means the analysers never
+            # attached and the energy path is dead, while probes with ``mapped: 0`` means the
+            # levels are being measured and nothing on the page says whose they are.
+            logger.warning(
+                "meet_bridge.speaker_not_seen",
+                seconds=detail.get("seconds"),
+                probes=detail.get("probes"),
+                mapped=detail.get("mapped"),
+                media_elements=detail.get("mediaElements"),
+                streams_on_tiles=detail.get("streamsOnTiles"),
+                participant_nodes=detail.get("participantNodes"),
+                probe_errors=detail.get("probeErrors"),
+                # **The three counters and the two shape lists, because without them this warning
+                # says only "something is wrong" — which the log already implied.** A run where
+                # captions named four speakers and the indicator named none produced no reading at
+                # all: the page collected the tiles and media elements it can see, and this handler
+                # dropped them on the floor. ``attributed_live`` at 0 with ``attributed`` above it
+                # is the specific diagnosis that the indicator selectors match nothing and only the
+                # caption panel — always a beat late — is naming anybody.
+                edges=detail.get("edges"),
+                attributed=detail.get("attributed"),
+                attributed_live=detail.get("attributedLive"),
+                selectors=detail.get("selectors"),
+                # What the DOM actually contains: the shape of each media element and of each
+                # participant tile. This is the reading the ``speaking`` selectors are still
+                # waiting on, and the reason they are documented as unverified.
+                elements=detail.get("elements"),
+                tiles=detail.get("tiles"),
+                note="no speaker attributed live yet; if somebody did talk, these counters say "
+                "which half of the attribution path is missing and the shapes say what the "
+                "page has to match on",
+            )
+            return
+
+        if event == "captionsNothingSeen":
+            # **Warning, and the most useful line in this file when attribution is failing.** The
+            # caption panel is the one place a name and the words that person said appear together,
+            # so if it is empty the avatar cannot answer "what did they ask". ``on: False`` means
+            # captions never switched on — a button-selector problem — and ``on: True`` with no
+            # blocks means the panel is open and the block selectors do not match what is in it,
+            # which ``regionText`` then shows verbatim.
+            logger.warning(
+                "meet_bridge.captions_not_seen",
+                seconds=detail.get("seconds"),
+                captions_on=detail.get("on"),
+                attempts=detail.get("attempts"),
+                blocks=detail.get("blocks"),
+                captured=detail.get("captured"),
+                attributed=detail.get("attributed"),
+                buttons_seen=detail.get("buttonsSeen"),
+                # The shape of each matched block, which is what separates "the selector found
+                # nothing" from "the selector found the words and the name is elsewhere" — the
+                # second is what a live run actually did, eleven times.
+                block_shapes=detail.get("blockShapes"),
+                alts=detail.get("alts"),
+                region_text=detail.get("regionText"),
+                note="no caption attributed yet; if anybody spoke, this is what the panel "
+                "actually contains",
+            )
+            return
+
+        if event in ("captionsOn", "captionsArmed", "captionsGaveUp"):
+            # Info rather than debug for the same reason ``handsArmed`` is: "is the feature even
+            # running" is the first question asked when a transcript is empty.
+            logger.info(
+                f"meet_bridge.{event}",
+                attempts=detail.get("attempts"),
+                seconds=detail.get("seconds"),
+                buttons_seen=detail.get("buttonsSeen"),
+            )
+            return
+
+        if event == "speakersArmed":
+            logger.info(
+                "meet_bridge.speakers_armed",
+                sample_ms=detail.get("sampleMs"),
+                selectors=detail.get("selectors"),
+            )
+            return
+
+        if event == "speakerProbeFailed":
+            # The energy path is the half that does not depend on Meet's markup, so losing it
+            # is worth a warning even though the DOM indicator may still cover the participant.
+            logger.warning(
+                "meet_bridge.speaker_probe_failed",
+                track=detail.get("trackId"),
+                error=detail.get("error"),
+                note="this participant's level cannot be measured, so their speech will only "
+                "be attributed if Meet's own indicator is readable",
+            )
+            return
+
         if event == "handsArmed":
             # Info rather than debug: this answers "is the feature even running", which is the
             # first question when a raised hand produces nothing — asked at exactly the moment
@@ -1124,6 +1404,37 @@ class ChromiumBridge:
         roster = parse_roster(message.json())
         if roster == self._roster:
             return
+
+        # **Announced once, at info, because "which entry is the avatar" decides three features
+        # and was previously unobservable.** A live log showed ``others=3 participants=3`` — no
+        # entry marked as ours — while attendance reported the avatar's own account as a second
+        # attendee and speaker attribution then credited it with somebody else's speech. Nothing in
+        # the log said which name the connector thought was its own, so the fault looked like three
+        # unrelated ones. Logged on change rather than per roster: it is fixed for a session.
+        # **On the first roster that has anybody in it, and whenever the answer changes.**
+        # Gating on ``self_name`` alone was a bug in this line: the first roster of a session
+        # arrives *empty* — the page reports before Meet has drawn a tile — so the name was logged
+        # against ``entries=[]`` and never again, because the fallback name never changed. The one
+        # reading that settles which entry is the avatar was therefore missing from exactly the
+        # logs it was added for.
+        first_populated = roster.count > 0 and self._roster.count == 0
+        if first_populated or roster.self_name != self._roster.self_name:
+            logger.info(
+                "meet_bridge.self_name",
+                self_name=roster.self_name,
+                others=[p.display_name for p in roster.others],
+                # Every entry with the flag the page put on it, which is the reading that settles
+                # "is one of these the avatar". ``self_name`` alone could not: it says what the
+                # connector *believes*, and a live log showed an account name among the others with
+                # nothing to say whether the page had marked it or simply failed to.
+                entries=[
+                    f"{p.display_name}{' [self]' if p.is_self else ''}"
+                    for p in roster.participants
+                ],
+                note="the name the avatar's own account appears under; every entry other than "
+                "this one is counted as a participant",
+            )
+
         self._roster = roster
         logger.debug("meet_bridge.roster", participants=roster.count, others=len(roster.others))
         for listener in self._roster_listeners:

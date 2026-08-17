@@ -45,10 +45,13 @@ from src.connectors.google_meet.bridge.chromium_bridge import ChromiumBridge, Dr
 from src.connectors.google_meet.browser.profile import ProfileManager
 from src.connectors.google_meet.config import GoogleMeetConnectorConfig
 from src.connectors.google_meet.egress.media_sink import ChromiumMediaSink
+from src.connectors.google_meet.meeting.active_speaker import SpeakerTracker
 from src.connectors.google_meet.meeting.attendance import AttendanceLedger
 from src.connectors.google_meet.meeting.attendance_announcer import AttendanceAnnouncer
 from src.connectors.google_meet.meeting.chat import MeetChatSource
 from src.connectors.google_meet.meeting.hand_raise import MeetHandRaiseSource, render_prompt
+from src.connectors.google_meet.meeting.speaker_announcer import SpeakerAnnouncer
+from src.connectors.google_meet.meeting.transcript import MeetTranscript
 from src.connectors.google_meet.monitoring.watchdog import MediaWatchdog
 from src.connectors.google_meet.virtual_camera.adapter import VirtualCameraAdapter
 from src.connectors.google_meet.virtual_microphone.adapter import VirtualMicrophoneAdapter
@@ -87,7 +90,10 @@ class GoogleMeetSession:
         "_router",
         "_session",
         "_source",
+        "_speaker_announcer",
+        "_speakers",
         "_task",
+        "_transcript",
         "_watchdog",
     )
 
@@ -105,6 +111,9 @@ class GoogleMeetSession:
         hands: MeetHandRaiseSource | None = None,
         attendance: AttendanceLedger | None = None,
         announcer: AttendanceAnnouncer | None = None,
+        speakers: SpeakerTracker | None = None,
+        speaker_announcer: SpeakerAnnouncer | None = None,
+        transcript: MeetTranscript | None = None,
     ) -> None:
         self._session = session
         self._clock = clock
@@ -117,6 +126,9 @@ class GoogleMeetSession:
         self._hands = hands
         self._attendance = attendance
         self._announcer = announcer
+        self._speakers = speakers
+        self._speaker_announcer = speaker_announcer
+        self._transcript = transcript
         self._task: asyncio.Task[None] | None = None
 
     @property
@@ -141,6 +153,27 @@ class GoogleMeetSession:
         ledger when disabled, so "switched off" and "nobody here yet" stay distinguishable.
         """
         return self._attendance
+
+    @property
+    def speakers(self) -> SpeakerTracker | None:
+        """Who is speaking and who has spoken, or ``None`` when tracking is disabled.
+
+        Read by ``MeetingService.speaker_snapshot`` through the same structural check that serves
+        attendance, which is how the API answers this without ``MeetingService`` learning that
+        Google Meet exists. ``None`` rather than an empty tracker when disabled, so "switched
+        off" and "nobody has spoken yet" stay distinguishable — the same distinction
+        ``SpeakerSnapshot.events`` preserves one level down.
+        """
+        return self._speakers
+
+    @property
+    def transcript(self) -> MeetTranscript | None:
+        """What each participant said, or ``None`` when captions are off.
+
+        Duck-typed to the API through the same structural check attendance and speakers use, so
+        ``MeetingService`` stays platform-blind.
+        """
+        return self._transcript
 
     async def start(self) -> None:
         """Join the meeting, then start routing.
@@ -168,6 +201,10 @@ class GoogleMeetSession:
         # churning.
         if self._announcer is not None:
             await self._announcer.start()
+        # After the router for the same reason the attendance announcer is: it pushes on the
+        # avatar socket, which has not completed its handshake until the router has run.
+        if self._speaker_announcer is not None:
+            await self._speaker_announcer.start()
         await self._watchdog.start()
 
     async def stop(self) -> None:
@@ -181,6 +218,8 @@ class GoogleMeetSession:
         # Before the router, so it cannot try to send on a transport that is being closed.
         if self._announcer is not None:
             await self._announcer.stop()
+        if self._speaker_announcer is not None:
+            await self._speaker_announcer.stop()
 
         task, self._task = self._task, None
         if task is not None:
@@ -430,9 +469,13 @@ class GoogleMeetSessionFactory:
             # ``display_name``, which Meet only asks for when the profile has lost its session.
             # The roster is the only place that name appears, so the source learns it from
             # there and treats the configured name as the fallback until it does.
-            bridge.add_roster_listener(
-                lambda roster: chat_source.observe_self_name(roster.self_name)
-            )
+            #
+            # The whole roster rather than just that name, because it also answers "is there
+            # exactly one other person here?" — which is what puts a name on a message whose
+            # sender Meet's markup did not give up. Observed live: five typed questions, every
+            # one forwarded to the agent with no sender at all, in a call whose roster had named
+            # the only other participant before the first of them was sent.
+            bridge.add_roster_listener(chat_source.observe_roster)
             chat = chat_source
 
         # Raised hands, on the same terms and for the same reason: built only when enabled, so
@@ -457,6 +500,52 @@ class GoogleMeetSessionFactory:
             )
             hands = hand_source
 
+        # Who is speaking. Built only when enabled, on the same terms as chat and hands — and
+        # note what it is *not* given, which is the whole claim this feature rests on: no place
+        # on the media path, no queue in front of the mix, no stage between the tap and the
+        # worklet, and nothing that can delay a frame. The page measures each remote track on an
+        # analyser branched off a source node that already exists and reports edges; everything
+        # else happens here, in Python, off the audio path entirely
+        # (``meeting/active_speaker.py``).
+        #
+        # Before attendance, because the attendance brief carries this one: an agent has a single
+        # slot for standing context, and two pushers competing for it evicted each other — see
+        # ``meeting/attendance_announcer.py``.
+        speakers: SpeakerTracker | None = None
+        speaker_announcer: SpeakerAnnouncer | None = None
+        if config.speaker_tracking_enabled:
+            speakers = SpeakerTracker(
+                clock=clock,
+                hold_ms=config.speaker_hold_ms,
+                merge_gap_ms=config.speaker_merge_gap_ms,
+                self_names=_self_name_candidates(config),
+            )
+            bridge.attach_speakers(speakers)
+            # The roster is where a participant id becomes a name — and where "is there exactly
+            # one other person here" is answered, which is what names a speaker in a two-person
+            # call without reading any markup at all. The page reports the id it can see reliably;
+            # this resolves it, including retroactively for a turn heard before the first roster.
+            bridge.add_roster_listener(speakers.observe_roster)
+
+        # What was actually said, from Meet's own captions — the one place a name and the words
+        # that person said appear together. This is what makes "what did they ask you?" answerable
+        # at all: the agent's transcription hears one mixed stream and cannot attribute it, and
+        # everything above knows who is talking without knowing the words.
+        #
+        # Built for **either** source, not just captions. The ledger also holds what was typed
+        # (``meeting/transcript.py``), and a deployment that runs chat with captions off still has
+        # a conversation to remember — gating the whole ledger on captions would leave that
+        # deployment exactly where the caption-only one was: able to answer every question except
+        # what was asked.
+        transcript: MeetTranscript | None = None
+        if config.captions_enabled or config.chat_enabled:
+            transcript = MeetTranscript(self_names=_self_name_candidates(config))
+            bridge.attach_transcript(transcript)
+            # The account's rendered name again, so the avatar's own captioned turns are marked as
+            # its own rather than read back to it as something a participant said — and, as for
+            # chat, the roster is where a nameless line gets a name by elimination.
+            bridge.add_roster_listener(transcript.observe_roster)
+
         # Attendance, on the same "built only when enabled" terms — but note what it is *not*
         # given: no queue, no task, no place on the media path, and no component in the health
         # report. It is a listener on the roster stream that already exists, which is the whole
@@ -479,22 +568,52 @@ class GoogleMeetSessionFactory:
             # push keeps a conversational agent able to answer "who is here?" with no round
             # trip, and the endpoint is what an operator or a tool-calling agent reads.
             if config.attendance_push_enabled:
+                pushes_speakers = speakers if config.speaker_push_enabled else None
                 announcer = AttendanceAnnouncer(
                     ledger=attendance,
                     avatar=avatar,
-                    interval_s=config.attendance_push_interval_s,
+                    # The faster of the two cadences when this brief also carries the speaker: who
+                    # is here changes when somebody joins, and who is talking changes every
+                    # sentence.
+                    interval_s=(
+                        min(config.attendance_push_interval_s, config.speaker_push_interval_s)
+                        if pushes_speakers is not None
+                        else config.attendance_push_interval_s
+                    ),
                     require_negotiation=config.attendance_push_require_negotiation,
+                    speakers=pushes_speakers,
+                    transcript=transcript,
                 )
+
+        # The speaker brief needs its own pusher only when the attendance one is not running —
+        # attendance switched off, or its push disabled. **Never both at once**, which is the
+        # whole point: an agent has one slot for standing context, and the second pusher is what
+        # evicted the first. Observed live as an avatar that had been told who was in the meeting
+        # answering "Someone is present in the meeting".
+        if (
+            speakers is not None
+            and config.speaker_push_enabled
+            and announcer is None
+        ):
+            speaker_announcer = SpeakerAnnouncer(
+                tracker=speakers,
+                avatar=avatar,
+                interval_s=config.speaker_push_interval_s,
+                require_negotiation=config.speaker_push_require_negotiation,
+            )
 
         # Speech as a trigger for the hand-raise handover — built only when enabled, on the
         # same terms as chat and hands, so a session that should hold the floor carries no
-        # detector at all rather than an inert one. The wording is the hand's, rendered here
-        # because the inbound mix carries no name: a voice and a hand are the same request, so
-        # the avatar should answer both with "ok, go ahead".
+        # detector at all rather than an inert one. The wording is the hand's: a voice and a hand
+        # are the same request, so the avatar should answer both with "ok, go ahead".
         speech: SpeechDetector | None = None
         voice_prompt = ""
         if config.speech_interrupt_enabled:
             speech = SpeechDetector(rms_threshold=config.speech_interrupt_threshold)
+            # The anonymous rendering, which is what the interruption used to be able to say and
+            # remains the fallback. With a tracker attached the router renders the same template
+            # with the speaker's name instead — the inbound mix still carries no attribution, so
+            # the name comes from the tracker rather than from the frame.
             voice_prompt = render_prompt(config.hand_raise_prompt, None)
 
         router = MediaRouter(
@@ -511,6 +630,12 @@ class GoogleMeetSessionFactory:
             hand_raise_mute_ms=config.hand_raise_mute_ms,
             speech=speech,
             voice_prompt=voice_prompt,
+            # A dictionary lookup into the tracker, called on the frame that triggers a
+            # barge-in. Passing it is what turns "Someone wants to say something" into
+            # "Priya Menon wants to say something"; passing nothing — which Zoom and Teams do —
+            # leaves that leg byte-for-byte as it was.
+            speaker_provider=speakers.current_speaker if speakers is not None else None,
+            voice_prompt_template=config.hand_raise_prompt if speakers is not None else "",
         )
 
         watchdog = MediaWatchdog(
@@ -531,6 +656,9 @@ class GoogleMeetSessionFactory:
             hands=hands,
             attendance=attendance,
             announcer=announcer,
+            speakers=speakers,
+            speaker_announcer=speaker_announcer,
+            transcript=transcript,
         )
 
     # -- component builders ------------------------------------------------

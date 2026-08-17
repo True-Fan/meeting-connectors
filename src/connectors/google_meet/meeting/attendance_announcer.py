@@ -16,6 +16,14 @@ touch media.
 an identical one is pure noise in the agent's context window; and an agent that is re-told the
 same roster every five seconds is being handed a reason to mention it. So the signature of
 *who is present, who left and who is missing* is compared, and only a real change is pushed.
+
+**Why it carries the speaker brief too, rather than a second announcer doing it.** Because an
+agent has *one* place to put standing context, and two pushers competing for it is a bug that
+looks like an unrelated regression. Observed live: speaker briefs pushed every few seconds
+displaced the attendance brief, and the avatar — asked who was in the meeting — answered
+"Someone is present in the meeting", having been left holding only the most recent frame. The
+two facts belong in one brief because they answer one question between them: *who is here, and
+who is talking*. One frame, one slot, no eviction.
 """
 
 from __future__ import annotations
@@ -24,7 +32,9 @@ import asyncio
 from contextlib import suppress
 
 from src.avatar.client import AvatarClient
+from src.connectors.google_meet.meeting.active_speaker import SpeakerTracker
 from src.connectors.google_meet.meeting.attendance import AttendanceLedger, AttendanceSnapshot
+from src.connectors.google_meet.meeting.transcript import MeetTranscript
 from src.infrastructure.logging import get_logger
 
 logger = get_logger(__name__)
@@ -81,7 +91,9 @@ class AttendanceAnnouncer:
         "_require_negotiation",
         "_sent",
         "_settle_s",
+        "_speakers",
         "_task",
+        "_transcript",
     )
 
     def __init__(
@@ -92,9 +104,19 @@ class AttendanceAnnouncer:
         interval_s: float = DEFAULT_INTERVAL_S,
         settle_s: float = SETTLE_DELAY_S,
         require_negotiation: bool = True,
+        speakers: SpeakerTracker | None = None,
+        transcript: MeetTranscript | None = None,
     ) -> None:
         self._ledger = ledger
         self._avatar = avatar
+        # Optional, and folded into this brief rather than pushed alongside it — see the module
+        # docstring for the eviction that made a second announcer the wrong shape. ``None`` when
+        # speaker tracking is off, in which case every byte on this wire is what it always was.
+        self._speakers = speakers
+        # The conversation itself, on the same terms and for the same reason: it is the third thing
+        # an agent needs a slot for, and there is one slot. Who is here, who is talking, and what
+        # they said are one brief.
+        self._transcript = transcript
         self._require_negotiation = require_negotiation
         # A floor against a pathological value only — zero or negative would busy-loop. The
         # operator-facing minimum is 0.5 s and lives in ``GoogleMeetSettings``, where policy
@@ -138,12 +160,46 @@ class AttendanceAnnouncer:
                 # useless, and would have to be corrected a second later.
                 return
 
+            speakers = self._speakers.snapshot() if self._speakers is not None else None
+            transcript = self._transcript.snapshot() if self._transcript is not None else None
             current = signature(snapshot)
+            if speakers is not None:
+                # The candidate list too, because it is now *in* the brief: somebody unmuting
+                # narrows "it could be either of them" down to a name, and a change the frame
+                # carries but the signature ignores is a change the agent never hears about.
+                current = f"{current}#{','.join(speakers.current)}"
+                current = f"{current}#{','.join(sorted(speakers.candidates))}"
+            if transcript is not None:
+                # The line count, not the text: a new line is news, and re-rendering the same ones
+                # is not.
+                current = f"{current}#{len(transcript.lines)}"
             if current == self._last:
                 return
 
+            brief = snapshot.agent_context()
+            # **Included before the first speaking edge, not after it — the gate here was the last
+            # thing holding the fix out of the frame.** ``SpeakerSnapshot.agent_context`` now says
+            # something useful with zero events: who the voice could be, and that it must not be
+            # resolved from the chat history. Requiring ``events`` withheld exactly that sentence
+            # during the one moment it was needed — somebody joining and speaking straight away,
+            # which is when the avatar answered "what is my name?" with the name of whoever had
+            # been typing. Still nothing at all when there is nobody to talk about.
+            if speakers is not None and (speakers.events or speakers.candidates):
+                brief = f"{brief} {speakers.agent_context()}"
+            if transcript is not None:
+                said = transcript.agent_context()
+                if said:
+                    # On its own lines, because it is dialogue and reads as such — and because the
+                    # sentences above it are *about* the meeting while this is the meeting.
+                    brief = f"{brief}\n\n{said}"
+
             delivered = await self._avatar.send_meeting_context(
-                snapshot.agent_context(),
+                brief,
+                # **``attendance`` even when the brief also names the speaker.** The topic is part
+                # of a contract an agent may route on, and renaming it to suit a wider brief would
+                # be a breaking change dressed as a tidy-up — an agent handling ``attendance``
+                # would silently stop being told who is in the meeting. The brief grew; the
+                # channel did not.
                 topic="attendance",
                 require_negotiation=self._require_negotiation,
             )
@@ -158,6 +214,8 @@ class AttendanceAnnouncer:
                     present=len(snapshot.present),
                     departed=len(snapshot.departed),
                     never_joined=len(snapshot.never_joined),
+                    speaking=(speakers.current or None) if speakers is not None else None,
+                    transcript_lines=len(transcript.lines) if transcript is not None else None,
                     total=self._sent,
                 )
         except asyncio.CancelledError:

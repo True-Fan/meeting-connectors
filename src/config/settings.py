@@ -427,6 +427,102 @@ class GoogleMeetSettings(BaseModel):
     "go ahead" lands intact. Raise it if the avatar audibly resumes; lower it if the reply
     starts mid-word. Zero drops only what is already queued."""
 
+    captions_enabled: bool = True
+    """**Read Meet's live captions, so the avatar knows who said what — not just who is talking.**
+
+    This is what makes an avatar able to answer *"what did they ask you?"* and *"what did Dev
+    say?"*. Without it those questions are unanswerable in principle, and that is worth
+    understanding rather than taking on trust: the avatar's own transcription lives in the agent,
+    which receives **one mixed stream** and therefore knows the words without knowing whose they
+    are; this connector knows who is speaking without knowing the words, because it measures audio
+    levels rather than speech. Meet's caption panel is the only place in the meeting where a name
+    and the words that person said appear together, because Meet transcribes per participant.
+
+    **Invisible to the meeting, unlike `chat_enabled`.** Captions are rendered locally for whoever
+    switched them on; nobody else sees the avatar enable them, and no participant's own caption
+    setting changes.
+
+    Also the strongest *attribution* signal available: a caption naming somebody is Meet telling
+    us who is talking, in words, which beats every indicator this connector could match on.
+
+    Turn it off to have the connector record nothing about what was said. Ingest is identical
+    either way — this is a DOM read of a small panel, and the audio path is untouched.
+
+    Two honest caveats. Captions are Meet's transcription, so wording is approximate and names and
+    technical terms are often misheard; the brief says so, so the agent does not quote them as
+    verbatim fact. And they are English-first — a Hindi turn is captioned in Hindi only if the
+    meeting's caption language is set to it."""
+
+    speaker_tracking_enabled: bool = True
+    """**Identify who is speaking, and keep that attribution for the whole meeting.**
+
+    On by default because it costs nothing the meeting can hear. The audio the avatar receives is
+    a mix and stays one — no frame is retagged, re-timed, or delayed — and the attribution is
+    assembled from two observations taken *beside* the media path: the level of each remote track,
+    measured on an ``AnalyserNode`` branched off the node that already feeds the mix, and the
+    participant tile Meet renders that track's stream on. See
+    ``connectors/google_meet/meeting/active_speaker.py``.
+
+    What it makes answerable: who is talking right now, who has spoken, in what order, and for
+    how long each. Read it with ``GET /sessions/{id}/speakers``, or have the agent be told
+    (``speaker_push_enabled``). It also names a barge-in: with this off, somebody talking over the
+    avatar is reported to the agent as "Someone", and with it on they are reported by name.
+
+    Turn it off to have the connector observe nothing about who is speaking. Ingest is identical
+    either way — that is the property this feature was built to preserve."""
+
+    speaker_push_enabled: bool = True
+    """Tell the agent who is speaking, as silent context.
+
+    Requires ``speaker_tracking_enabled``. Delivered as ``kind="meeting_context"``, which is
+    **not** the channel chat and raised hands use, and that distinction is the safety property:
+    a chat frame is a turn the avatar says out loud, so pushing speaker changes down it would have
+    the avatar narrate the meeting — "Priya is speaking now" — into the room. Context is silent;
+    the agent knows, and mentions it only if asked.
+
+    Sent on change and never on a timer, so a still meeting sends nothing at all.
+
+    Turn it off if the agent reads ``GET /sessions/{id}/speakers`` instead, or if its context
+    window is better spent on something else — the barge-in attribution and the endpoint both
+    keep working without it."""
+
+    speaker_push_interval_s: float = Field(default=3.0, ge=0.5, le=60.0)
+    """How often the tracker is checked for a change of speaker.
+
+    Not how often anything is sent. Faster than ``attendance_push_interval_s`` because the floor
+    changes hands on the timescale of a sentence rather than of somebody joining, and far slower
+    than the page's own 200 ms sampling — the *history* is exact to a fifth of a second, and this
+    only decides how often the agent is re-briefed about it."""
+
+    speaker_push_require_negotiation: bool = True
+    """Only send the brief to an agent that negotiated protocol ``1.2`` or above.
+
+    Same escape hatch, and same caveat, as ``attendance_push_require_negotiation``: set it False
+    to skip the agent's handshake change when the agent ignores control frames it does not
+    recognise, and leave it on if the agent instead raises on an unknown kind. It changes who is
+    sent the frame, never the frame's kind — speaker context never travels on the channel the
+    avatar speaks from."""
+
+    speaker_hold_ms: int = Field(default=1_500, ge=0)
+    """How long somebody stays "the current speaker" after they stop.
+
+    Speech has gaps at every clause boundary, and the page's release window is short on purpose so
+    a turn *ends* promptly. Without a hold, asking who is speaking during the pause between two
+    sentences answers "nobody" — true of that instant, and the wrong answer to the question. It
+    is also what stops a barge-in landing in a gap from being attributed to no one.
+
+    Zero disables it, which makes ``current_speaker`` a statement about this exact moment."""
+
+    speaker_merge_gap_ms: int = Field(default=1_200, ge=0)
+    """How long a gap may be before it ends a turn rather than punctuating one.
+
+    This is what makes the history read like a conversation instead of like a waveform: without
+    it, one person talking for a minute is forty turns, and "who has been speaking" answers with
+    the same name forty times. A gap longer than this is treated as the floor changing hands —
+    even if it goes back to the same person, which is then two turns because it was.
+
+    Zero records every detected stretch separately."""
+
     speech_interrupt_enabled: bool = True
     """**Treat somebody starting to speak exactly as if they had raised their hand.**
 

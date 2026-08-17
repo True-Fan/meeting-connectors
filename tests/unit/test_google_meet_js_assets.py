@@ -586,6 +586,67 @@ class TestChatCapture:
             "baseline onto the user's first message"
         )
 
+    def test_the_sender_is_looked_for_beyond_the_matched_element(self, bridge_code: str) -> None:
+        """**Every message in a live meeting was forwarded with no sender, and no selector in the
+        list was at fault.** The matched node holds the words — a run matched
+        ``div[jsname="dTKtvb"]``, whose ``innerText`` is the message text and nothing else — and
+        Meet renders the name in the row above it. Searching the node and its immediate parent
+        could not have found it however many candidates it tried. ``parseCaptionBlock`` learned
+        this first; chat never got the same fix.
+        """
+        sender = bridge_code.split("function chatSender(node)", 1)[1].split("\n  function ", 1)[0]
+        assert "scope.parentElement" in sender, "it must look past the matched element"
+        assert "depth < 4" in sender, "and the climb must be bounded"
+
+    def test_a_match_inside_the_message_text_is_not_a_name(self, bridge_code: str) -> None:
+        """Climbing widens the search to elements that *contain* the message, so a careless
+        selector would read the words back as the sender's name."""
+        sender = bridge_code.split("function chatSender(node)", 1)[1].split("\n  function ", 1)[0]
+        assert "node.contains(found)" in sender
+
+    def test_a_grouped_message_inherits_the_name_above_it(self, bridge_code: str) -> None:
+        """Meet renders a run of messages from one person under a single heading, so every row
+        after the first has no name on it at all. Reading rows in isolation attributes the first
+        message of a group and orphans the rest of the conversation."""
+        scan = bridge_code.split("function scanChat()", 1)[1].split("function scanRoster", 1)[0]
+        assert "state.chatLastSender" in scan
+
+    def test_the_name_is_resolved_before_the_dedupe_check(self, bridge_code: str) -> None:
+        """The name lives on the group's *first* row, which is the one already forwarded and
+        therefore the one the dedupe skips. Resolving after the skip throws away the only copy
+        of the name the group has."""
+        scan = bridge_code.split("function scanChat()", 1)[1].split("function scanRoster", 1)[0]
+        assert scan.index("chatSender(node)") < scan.index("state.chatSeen.has(id)")
+
+    def test_an_unattributable_message_says_so_with_evidence(self, bridge_code: str) -> None:
+        """``sender=null`` is a legal value Python degrades gracefully on, so the nameless-chat
+        failure was silent for its entire life — nothing anywhere said the markup had moved. The
+        diagnostic prints what the row actually contains, which is what makes the next selector
+        an observation rather than a guess."""
+        assert "function reportChatSenderMissing(node)" in bridge_code
+        diagnostic = bridge_code.split("function reportChatSenderMissing(node)", 1)[1].split(
+            "\n  function ", 1
+        )[0]
+        assert "chatSenderMissing" in diagnostic
+        assert "rowText" in diagnostic
+        assert "attributes" in diagnostic
+        assert "state.chatSenderDiagnostics >= 3" in diagnostic, (
+            "a panel we cannot read must not fill the log for the rest of the meeting"
+        )
+
+    def test_attribution_is_counted_apart_from_delivery(self, bridge_code: str) -> None:
+        """A run that forwards every message and names nobody is the interesting failure, and it
+        is invisible in a counter that only says chat works. Same lesson as
+        ``captionsAttributed``, which was itself learned twice."""
+        assert "chatAttributed: state.chatAttributed" in bridge_code
+
+    def test_a_new_call_does_not_inherit_the_previous_senders_name(
+        self, bridge_code: str
+    ) -> None:
+        scan = bridge_code.split("function scanChat()", 1)[1].split("function scanRoster", 1)[0]
+        arming = scan.split("state.chatWasJoined = true;", 1)[1].split("if (!ensureChatPanel", 1)[0]
+        assert "state.chatLastSender = null;" in arming
+
     def test_message_identity_does_not_depend_on_position(self, bridge_code: str) -> None:
         """Meet recycles chat list nodes, so a shifted index turns an already-answered message
         into a new one and the avatar answers it twice. Position is the one part of a chat row

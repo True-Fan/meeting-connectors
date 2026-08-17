@@ -453,6 +453,75 @@ class FakePage:
             )
         )
 
+    async def send_speaker(
+        self,
+        *,
+        track_id: str = "t1",
+        participant_id: str = "",
+        name: str | None = "Priya",
+        speaking: bool = True,
+        source: str = "audio",
+        level: float = 0.08,
+    ) -> None:
+        """Report a speaking edge, the way the page's energy sampler does.
+
+        ``track_id`` rather than an identity is the primary key on purpose: the page knows which
+        track went loud before it knows whose tile it is on, so a turn can open unattributed and
+        be named by a later edge carrying the same track.
+        """
+        await self._send(
+            encode_json(
+                MeetMessageType.ACTIVE_SPEAKER,
+                {
+                    "trackId": track_id,
+                    "id": participant_id,
+                    "name": name,
+                    "speaking": speaking,
+                    "source": source,
+                    "level": level,
+                    "heldMs": 0,
+                },
+            )
+        )
+
+    async def send_caption(
+        self, *, speaker: str | None = "Dev Choudhary", text: str = "I want to know about Delhi"
+    ) -> None:
+        """Report one settled caption line, the way the page does once it stops changing."""
+        await self._send(
+            encode_json(
+                MeetMessageType.CAPTION,
+                {"speaker": speaker, "text": text, "isSelf": False},
+            )
+        )
+
+    async def send_chat(
+        self,
+        *,
+        message_id: str = "m1",
+        text: str = "what is my name?",
+        sender: str | None = "Backend Services",
+        sender_from: str = "ancestor",
+        is_self: bool = False,
+    ) -> None:
+        """Report one observed chat message, the way the page's panel scanner does.
+
+        ``sender=None`` is the shape a live meeting actually produced for every message it ever
+        forwarded, so it is a first-class case here rather than an edge one.
+        """
+        await self._send(
+            encode_json(
+                MeetMessageType.CHAT_MESSAGE,
+                {
+                    "id": message_id,
+                    "text": text,
+                    "sender": sender,
+                    "senderFrom": sender_from if sender else "none",
+                    "isSelf": is_self,
+                },
+            )
+        )
+
     async def send_error(self, code: str, message: str, *, fatal: bool = False) -> None:
         await self._send(
             encode_json(

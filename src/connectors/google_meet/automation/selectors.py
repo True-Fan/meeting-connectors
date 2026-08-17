@@ -197,9 +197,23 @@ class MeetSelectors:
         "div[data-sender-name]",
         "[data-sender-name]",
         'div[jsname="dTKtvb"] + div',
+        '[data-message-text] ~ [role="heading"]',
+        'div[role="listitem"] [role="heading"]',
+        ".poVWob",
     )
-    """Attribution, read from the message's own subtree. Optional: an unattributed question is
-    still worth answering, so a miss here degrades to ``sender=None`` rather than dropping."""
+    """Attribution, tried against the message node **and each of its first three ancestors** —
+    see ``chatSender`` in ``bridge.js``. Optional: an unattributed question is still worth
+    answering, so a miss here degrades to ``sender=None`` rather than dropping.
+
+    **Read the climb before adding to this list.** A live run forwarded five messages and named
+    nobody on any of them, and no entry here was at fault: the matched message node holds the
+    words only, and Meet renders the name in the row above it, so a subtree search could not have
+    found it however many selectors it tried. The last two entries are ordered where they are on
+    purpose — a ``role="heading"`` inside the message list is Meet's own semantic marker for the
+    group's sender, and ``.poVWob`` is an obfuscated class that has carried the chat sender for
+    several Meet revisions and will eventually stop. Neither is trusted: when every entry misses,
+    the page emits ``chatSenderMissing`` with the row's text and every attribute on it, which is
+    what makes the next selector an observation rather than a guess."""
 
     # -- raised hands ------------------------------------------------------
     hand_raised: tuple[str, ...] = (
@@ -229,6 +243,90 @@ class MeetSelectors:
     with the action ("Raise hand"), not the state, which is what keeps this from firing on a
     button that is merely present in every meeting — the same asymmetry ``mute_toggle`` relies
     on, and the reason "raise hand" is absent from this list while "raised hand" is in it."""
+
+    account_name: tuple[str, ...] = (
+        'a[aria-label^="Google Account"]',
+        '[aria-label^="Google Account"]',
+        'a[aria-label*="Google Account" i]',
+    )
+    """The account button, read for the name the avatar actually appears under.
+
+    **Not a convenience — it is the only signal that answers "which roster entry is us".**
+    ``display_name`` is what Meet is *asked* to call the avatar, and it is asked only when the
+    profile has lost its Google session; a signed-in profile renders the account's own name. An
+    avatar signed in as an account named "Backend Services" therefore matched nothing, and was
+    counted as a participant: observed live as attendance reporting two people present in a call
+    with one other person in it, and as speaker attribution unable to answer "is there exactly one
+    other person here" because the avatar was one of them.
+
+    Google's accessible name for this control has kept the shape "Google Account: <name>
+    (<email>)" for years — an accessibility obligation rather than a build artefact, which is the
+    same reason everything in this file prefers ARIA."""
+
+    # -- captions ----------------------------------------------------------
+    captions_button: tuple[str, ...] = (
+        'button[aria-label*="Turn on captions" i]',
+        'button[aria-label="Captions" i]',
+        'button[aria-label*="captions" i]',
+        'button[jsname="r8qRAd"]',
+    )
+    """Turns Meet's live captions on.
+
+    **Unlike the chat panel, this is invisible to the meeting.** Captions are rendered locally for
+    whoever switched them on, so nobody else sees the avatar do it — which is why this needs no
+    equivalent of ``chat_enabled``'s "other participants can see this" caveat.
+
+    The *off* wording is deliberately absent, the same asymmetry ``mute_toggle`` relies on: a
+    selector matching "Turn off captions" would switch off the thing this exists to switch on."""
+
+    captions_region: tuple[str, ...] = (
+        'div[aria-label*="Captions" i]',
+        'div[role="region"][aria-label*="caption" i]',
+        '[jsname="dsyhDe"]',
+        'div[aria-live="polite"][aria-label*="caption" i]',
+    )
+    """The rendered caption panel. Matching it is how the page knows the click worked, rather than
+    assuming it did and scraping nothing — the lesson ``chat_panel`` records."""
+
+    caption_block: tuple[str, ...] = (
+        'div[aria-label*="Captions" i] > div > div',
+        '[jsname="dsyhDe"] > div',
+        'div[role="region"][aria-label*="caption" i] > div > div',
+    )
+    """One caption entry: a speaker's name and what they just said.
+
+    Structural rather than semantic, because there is nothing semantic to match — and stated
+    plainly because it is the weakest thing in this file. When none of these match, the page falls
+    back to treating the whole region as one block, which still yields a name and a line in the
+    single-speaker layout Meet uses most. If even that misses, ``captionsNothingSeen`` reports the
+    panel's actual text so the next edit here is a reading rather than a guess."""
+
+    # -- who is speaking ---------------------------------------------------
+    speaking: tuple[str, ...] = (
+        '[data-participant-id][data-is-speaking="true"]',
+        '[data-participant-id][data-speaking="true"]',
+        '[data-is-speaking="true"]',
+        '[aria-label*="is speaking" i]',
+        '[data-tooltip*="is speaking" i]',
+    )
+    """Meet's own indicator that a participant is talking.
+
+    **The weakest of the three speaker signals, and deliberately not the one the feature rests
+    on.** Attribution is built primarily from per-track audio energy measured beside the capture
+    graph, which needs no markup at all and cannot be broken by a Meet release. This list is
+    corroboration, and the fallback for a participant whose stream never appears on a tile the
+    page can read.
+
+    Stated plainly because the alternative is a reader assuming otherwise: these candidates are
+    **unverified against a live meeting**. Meet's speaking indicator is an animated element with
+    a hashed class name, and the hand-raise feature already established that guessing Meet's
+    markup from the outside costs a round of live testing per guess. So the page reports
+    ``speakerNothingSeen`` with what the DOM actually contains — media elements, how many sit
+    inside a participant tile, how many tiles exist — and the next edit here is a reading rather
+    than a fourth guess. Until then the energy path carries the feature on its own.
+
+    No candidate may match the avatar's own tile or a control: ``mute_toggle``'s asymmetry
+    again — Meet labels a *control* with its action and an *indicator* with its state."""
 
     # -- terminal states, by visible text ---------------------------------
     lobby_text: tuple[str, ...] = ("asking to join", "waiting for someone to let you in")
@@ -268,6 +366,11 @@ class MeetSelectors:
             "chatMessage": list(self.chat_message),
             "chatSender": list(self.chat_sender),
             "handRaised": list(self.hand_raised),
+            "speaking": list(self.speaking),
+            "accountName": list(self.account_name),
+            "captionsButton": list(self.captions_button),
+            "captionsRegion": list(self.captions_region),
+            "captionBlock": list(self.caption_block),
             "lobbyText": list(self.lobby_text),
             "deniedText": list(self.denied_text),
             "ejectedText": list(self.ejected_text),

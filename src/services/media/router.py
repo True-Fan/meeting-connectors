@@ -24,6 +24,7 @@ carry.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from contextlib import suppress
 
 from src.avatar.client import AvatarClient
@@ -48,8 +49,15 @@ logger = get_logger(__name__)
 COMPONENT_NAME = "media_router"
 
 ANONYMOUS_SPEAKER = "Someone"
-"""Who a voice interruption is attributed to. The inbound mix carries no attribution, and
-the prompt has to name somebody — the same stand-in ``meeting/hand_raise.py`` uses."""
+"""Who a voice interruption is attributed to when nothing can name them.
+
+The inbound mix carries no attribution — it is summed before it is sampled on every connector —
+and the prompt has to name somebody, so this is the same stand-in ``meeting/hand_raise.py`` uses.
+
+A connector that can identify the speaker *beside* the media path may pass ``speaker_provider``
+and replace this with a name. Nothing about the audio changes when it does: the provider is a
+dictionary lookup into an observer the connector already runs, called on the frame that triggers
+the barge-in. See ``connectors/google_meet/meeting/active_speaker.py``."""
 
 
 class MediaRouter:
@@ -70,9 +78,11 @@ class MediaRouter:
         "_metrics",
         "_pacer",
         "_source",
+        "_speaker_provider",
         "_speech",
         "_suppressed",
         "_voice_prompt",
+        "_voice_prompt_template",
     )
 
     def __init__(
@@ -91,6 +101,8 @@ class MediaRouter:
         hand_raise_mute_ms: int = 0,
         speech: SpeechDetector | None = None,
         voice_prompt: str = "",
+        speaker_provider: Callable[[], str | None] | None = None,
+        voice_prompt_template: str = "",
     ) -> None:
         self._ctx = ctx
         self._clock = clock
@@ -114,6 +126,12 @@ class MediaRouter:
         # What the agent is told when a voice takes the floor, already rendered. The same
         # wording a raised hand sends, because it is the same request.
         self._voice_prompt = voice_prompt
+        # Optional on the same terms as everything above: a connector that can say who is
+        # talking passes these two, and one that cannot passes neither and behaves exactly as
+        # it did. The template is the unrendered form of ``voice_prompt``, needed because the
+        # name is not known until the moment somebody speaks.
+        self._speaker_provider = speaker_provider
+        self._voice_prompt_template = voice_prompt_template
         self._forwarded = 0
         self._suppressed = 0
         self._chat_forwarded = 0
@@ -351,19 +369,59 @@ class MediaRouter:
         detector = self._speech
         if detector is None or not detector.observe(frame):
             return None
+        # Asked at the moment of the interruption, which is the only moment the answer is about.
+        # A miss costs the name and never the barge-in — the two are decided independently, so an
+        # attribution that is not available cannot delay the avatar falling silent.
+        speaker = self._current_speaker()
         logger.info(
             "router.speech_detected",
+            participant=speaker or ANONYMOUS_SPEAKER,
+            attributed=speaker is not None,
             rms=round(detector.last_rms),
             noise_floor=round(detector.noise_floor),
             trigger_level=round(detector.trigger_level),
         )
         return HandRaise(
-            # The inbound mix carries no attribution and the prompt has to name somebody —
-            # the same stand-in the hand-raise source uses for an unattributed indicator.
-            participant=ANONYMOUS_SPEAKER,
-            prompt=self._voice_prompt,
+            # Named when a connector can identify the speaker beside the media path; otherwise
+            # the same stand-in the hand-raise source uses for an unattributed indicator, because
+            # the inbound mix itself carries no attribution.
+            participant=speaker or ANONYMOUS_SPEAKER,
+            prompt=self._voice_prompt_for(speaker),
             raised_at_us=self._clock.now_us(),
         )
+
+    def _current_speaker(self) -> str | None:
+        """Who the connector believes is talking, or ``None``.
+
+        Total by construction: this runs on the inbound audio leg, so a provider that raises
+        must cost the name rather than the frame — and losing the leg would stop the meeting's
+        audio in both directions.
+        """
+        provider = self._speaker_provider
+        if provider is None:
+            return None
+        try:
+            name = provider()
+        except Exception as exc:
+            logger.warning("router.speaker_lookup_failed", error=str(exc))
+            return None
+        cleaned = " ".join(str(name or "").split())
+        return cleaned or None
+
+    def _voice_prompt_for(self, speaker: str | None) -> str:
+        """The interruption prompt, naming the speaker when one is known.
+
+        Falls back to the pre-rendered anonymous wording on anything unexpected. The template is
+        operator-supplied (``GoogleMeetSettings.hand_raise_prompt``), so a stray brace in it must
+        cost the name rather than the handover — the same trade
+        ``connectors/google_meet/meeting/hand_raise.render_prompt`` makes.
+        """
+        if not speaker or not self._voice_prompt_template:
+            return self._voice_prompt
+        try:
+            return self._voice_prompt_template.format(name=speaker).strip() or self._voice_prompt
+        except (IndexError, KeyError, ValueError):
+            return self._voice_prompt
 
     # -- avatar → decoder --------------------------------------------------
 

@@ -182,6 +182,42 @@ class GoogleMeetConnectorConfig:
     """How long the pacer keeps discarding avatar media after an interrupt, so the sentence
     already in flight does not simply resume. See ``GoogleMeetSettings.hand_raise_mute_ms``."""
 
+    captions_enabled: bool = True
+    """Whether the page reads Meet's live captions to record who said what.
+
+    See ``GoogleMeetSettings.captions_enabled`` and ``meeting/transcript.py``. Also the strongest
+    speaker signal the page has, because Meet writes the name next to the words."""
+
+    speaker_tracking_enabled: bool = True
+    """Whether the connector identifies who is speaking and keeps that attribution.
+
+    Ingest is unchanged either way — the mix, the frame size and the wire are untouched, and the
+    attribution comes from an analyser branched off the capture graph plus the participant tile
+    each stream is rendered on. See ``GoogleMeetSettings.speaker_tracking_enabled`` and
+    ``meeting/active_speaker.py``."""
+
+    speaker_push_enabled: bool = True
+    """Whether who is speaking is pushed to the agent as ``meeting_context``.
+
+    See ``GoogleMeetSettings.speaker_push_enabled``. Ignored when ``speaker_tracking_enabled`` is
+    False — there is nothing to push."""
+
+    speaker_push_interval_s: float = 3.0
+    """How often the tracker is polled for a change of speaker. See
+    ``GoogleMeetSettings.speaker_push_interval_s``."""
+
+    speaker_push_require_negotiation: bool = True
+    """Whether the brief is withheld from an agent that negotiated below ``1.2``. See
+    ``GoogleMeetSettings.speaker_push_require_negotiation``."""
+
+    speaker_hold_ms: int = 1_500
+    """How long somebody stays the current speaker after they stop. See
+    ``GoogleMeetSettings.speaker_hold_ms``."""
+
+    speaker_merge_gap_ms: int = 1_200
+    """How long a gap may be before it ends a turn rather than punctuating one. See
+    ``GoogleMeetSettings.speaker_merge_gap_ms``."""
+
     speech_interrupt_enabled: bool = True
     """Whether somebody speaking hands them the floor exactly as raising a hand would.
 
@@ -321,6 +357,13 @@ class GoogleMeetConnectorConfig:
             hand_raise_prompt=meet.hand_raise_prompt or HAND_RAISE_PROMPT,
             hand_raise_cooldown_s=meet.hand_raise_cooldown_s,
             hand_raise_mute_ms=meet.hand_raise_mute_ms,
+            captions_enabled=meet.captions_enabled,
+            speaker_tracking_enabled=meet.speaker_tracking_enabled,
+            speaker_push_enabled=meet.speaker_push_enabled,
+            speaker_push_interval_s=meet.speaker_push_interval_s,
+            speaker_push_require_negotiation=meet.speaker_push_require_negotiation,
+            speaker_hold_ms=meet.speaker_hold_ms,
+            speaker_merge_gap_ms=meet.speaker_merge_gap_ms,
             speech_interrupt_enabled=meet.speech_interrupt_enabled,
             speech_interrupt_threshold=meet.speech_interrupt_threshold,
             inject_stages=tuple(meet.inject_stages),

@@ -12,7 +12,8 @@
  *      ordinary `getUserMedia` path so Meet publishes them like real devices.
  *   2. Tap every inbound remote audio track, mix it, and ship it to Python as
  *      16 kHz mono PCM.
- *   3. Report what it observes: roster, admission state, track lifecycle.
+ *   3. Report what it observes: roster, admission state, track lifecycle, and which
+ *      participant is speaking — measured on a branch off the tap, never in it.
  *   4. Carry frames both ways over one loopback WebSocket.
  *
  * It contains no business logic, no avatar knowledge, no decoding, no metrics
@@ -67,6 +68,8 @@
     PAGE_EVENT: 0x0b,
     CHAT_MESSAGE: 0x0c,
     HAND_RAISE: 0x0d,
+    ACTIVE_SPEAKER: 0x0e,
+    CAPTION: 0x0f,
   };
 
   const FLAG = { NONE: 0x00, KEYFRAME: 0x01, SILENCE: 0x02, MIXED: 0x04 };
@@ -165,6 +168,9 @@
     canvas: null,
     canvasCtx: null,
     cameraTrack: null,
+    // Ids of the camera clones Meet was handed. The self-view tile renders one of them, which is
+    // how the page identifies its own tile without comparing names — see `selfTileName`.
+    ownVideoTrackIds: new Set(),
     micTrack: null,
     videoFrames: 0,
     cameraClones: 0,
@@ -192,6 +198,19 @@
     chatPanelOpened: false,
     chatOpenAttempts: 0,
     chatMessagesSent: 0,
+    // Counted apart from `chatMessagesSent` for the reason `captionsAttributed` is: a run that
+    // forwards every message and names nobody is the interesting failure, and a counter that
+    // only says "chat works" hides it. That is exactly how this shipped nameless.
+    chatAttributed: 0,
+    // The last name seen while walking the message list, in DOM order. Meet groups consecutive
+    // messages from one person under a single name, so a run of them renders with the name on
+    // the first row only — reading each row in isolation attributes the first and orphans the
+    // rest. Carried across scans too, because the group can be extended minutes later.
+    chatLastSender: null,
+    // Bounded, like the hand-raise and caption diagnostics: a panel whose sender markup we
+    // cannot read must say so with evidence in it, and must not then fill the log for the rest
+    // of the meeting.
+    chatSenderDiagnostics: 0,
     chatBaselined: false,
     // Whether the in-call arming has happened. Chat is only reachable once admitted, so the
     // open-attempt budget is spent there rather than on the pre-join screen.
@@ -217,6 +236,59 @@
     // interrupt the avatar twice, and Meet re-renders constantly.
     handsLastSentAt: new Map(),
     handsWasJoined: false,
+
+    // Speaker attribution. `speakerProbes` is keyed by track id and holds one AnalyserNode per
+    // remote participant — a *parallel* branch off the source node that already feeds the mix,
+    // never a stage inserted into it. `speakerOwners` maps a MediaStream id to the participant
+    // Meet renders it on, which is the only place the page can learn a name for a track.
+    speakerProbes: new Map(),
+    speakerOwners: new Map(),
+    speakerSink: null,
+    speakerTimer: null,
+    // key -> true, for the DOM indicator pass. Edge-triggered for the same reason hands are:
+    // Meet re-renders the indicator constantly and a level signal would be a flood.
+    speakerDomActive: new Map(),
+    speakerLastMapAt: 0,
+    speakerLastDomAt: 0,
+    speakerArmedAt: 0,
+    speakerWasJoined: false,
+    speakerDiagnostics: 0,
+    speakerEventsSent: 0,
+    // Counted separately from `speakerEventsSent`, because the two failures are different and the
+    // first live run of this feature was invisible for exactly that reason: edges flowed, nothing
+    // was ever named, and the diagnostic gated on "no edges" so it never fired.
+    speakerAttributed: 0,
+    // Attributions from a route that is **not** Meet's caption panel — the energy probes naming a
+    // track, or the speaking indicator naming a tile.
+    //
+    // **The same gate, hidden one level deeper, and it cost another live run.** `speakerAttributed`
+    // counts every named edge, and captions raise named edges too — so four caption-derived
+    // attributions silenced `speakerNothingSeen` for a whole meeting in which the indicator
+    // selectors matched *nothing*, which is exactly the state that report exists to explain. The
+    // caption path is a second-and-a-half behind the voice; the indicator is what would name a
+    // speaker while they are still talking, and it stays unverified until a run tells us its
+    // markup.
+    speakerIndicatorAttributed: 0,
+    speakerProbeErrors: 0,
+
+    // Captions. Meet's own transcription, which is the one place in the page where a name and
+    // the words that person said appear *together* — see `scanCaptions`.
+    captionsOn: false,
+    captionOpenAttempts: 0,
+    captionArmedAt: 0,
+    captionLastAttemptAt: 0,
+    captionLastScanAt: 0,
+    captionGaveUp: false,
+    captionWasJoined: false,
+    // block key -> { speaker, text, changedAt, sent }. Captions grow in place as somebody talks,
+    // so a line is only final once it has stopped changing.
+    captionBlocks: new Map(),
+    captionsSent: 0,
+    // Counted apart from `captionsSent` for the reason `speakerAttributed` is: a run that captures
+    // every caption and names nobody is the interesting failure, and gating a diagnostic on "did
+    // anything arrive" hides it. That mistake has now been made twice.
+    captionsAttributed: 0,
+    captionDiagnostics: 0,
     // Hands already up when we walked in are not requests to interrupt us — we were not
     // speaking yet. Timed from admission, for the reason the chat window is.
     handsBaselineUntil: 0,
@@ -340,12 +412,78 @@
       // Clone per request: Meet may stop a track it was handed, and a stopped
       // master would leave every later request with a dead device.
       state.cameraClones += 1;
-      return state.cameraTrack.clone();
+      return rememberOwnVideo(state.cameraTrack.clone());
     }
     const stream = state.canvas.captureStream(0);
     state.cameraTrack = stream.getVideoTracks()[0];
     state.cameraClones += 1;
-    return state.cameraTrack.clone();
+    return rememberOwnVideo(state.cameraTrack.clone());
+  }
+
+  /*
+   * Remember which video tracks are ours, so the page can find its **own tile**.
+   *
+   * **This is what makes "which roster entry is the avatar" answerable from a fact rather than
+   * from a name.** Every other attempt was a name comparison, and every one of them failed in a
+   * live meeting: `display_name` is what Meet was *asked* to call us and a signed-in profile
+   * ignores it, Meet's "(you)" marker is not in the tile text the roster scan reads, and the
+   * account button is not on the page in the layout Chromium renders headless — observed as
+   * ``self_name='AI Avatar'`` while the avatar's own tile sat in the roster as "Backend Services"
+   * and was counted as a participant.
+   *
+   * The self-view tile renders *our canvas*, through a track we minted and handed to Meet. So the
+   * tile whose `<video>` carries one of these ids is ours, whatever Meet calls us — no guessing.
+   */
+  function rememberOwnVideo(track) {
+    if (track && track.id) {
+      state.ownVideoTrackIds.add(track.id);
+    }
+    return track;
+  }
+
+  function selfTileName() {
+    if (!state.ownVideoTrackIds.size) {
+      return '';
+    }
+    let elements;
+    try {
+      elements = document.querySelectorAll('video');
+    } catch (err) {
+      return '';
+    }
+    for (const element of elements) {
+      const stream = element.srcObject;
+      if (!stream || typeof stream.getVideoTracks !== 'function') {
+        continue;
+      }
+      let ours = false;
+      for (const track of stream.getVideoTracks()) {
+        if (state.ownVideoTrackIds.has(track.id)) {
+          ours = true;
+          break;
+        }
+      }
+      if (!ours) {
+        continue;
+      }
+      let holder;
+      try {
+        holder = element.closest('[data-participant-id], [data-requested-participant-id]');
+      } catch (err) {
+        holder = null;
+      }
+      if (!holder) {
+        continue;
+      }
+      const label = (holder.getAttribute('aria-label') || holder.textContent || '')
+        .trim()
+        .split('\n')[0]
+        .trim();
+      if (label) {
+        return label.slice(0, 120);
+      }
+    }
+    return '';
   }
 
   function drawVideoFrame(header, planes) {
@@ -824,7 +962,7 @@
     }
   }
 
-  async function attachRemoteTrack(track, stream) {
+  async function attachRemoteTrack(track, stream, receiver) {
     if (track.kind !== 'audio' || state.remoteTracks.has(track.id)) {
       return;
     }
@@ -862,12 +1000,20 @@
     const element = document.createElement('audio');
     element.muted = true;
     element.autoplay = true;
+    // Marked as ours, so the speaker mapping pass can tell this element apart from the ones
+    // Meet renders inside a participant tile. Without the mark it is just another <audio>
+    // holding a remote stream, and it carries no participant to attribute it to.
+    element.setAttribute('data-mc-bridge', '1');
     element.srcObject = stream || new MediaStream([track]);
     element.style.display = 'none';
     document.documentElement.appendChild(element);
     element.play().catch(() => {
       /* autoplay is disabled by launch flag; a rejection here is not fatal */
     });
+
+    // A parallel branch off the same source node, added *after* the mix is wired so a failure
+    // here cannot cost the meeting its audio. See `attachSpeakerProbe`.
+    attachSpeakerProbe(track, stream, source, receiver);
 
     state.remoteTracks.set(track.id, { source, element });
     syncCaptureGraph();
@@ -882,6 +1028,7 @@
     }
     const entry = state.remoteTracks.get(trackId);
     state.remoteTracks.delete(trackId);
+    detachSpeakerProbe(trackId);
 
     // A null entry is a claim staked by `attachRemoteTrack` before its await — a track that
     // ended while its graph was still being built. There is nothing to unwire, and releasing
@@ -904,6 +1051,1173 @@
     report('remoteAudioDetached', { trackId, total: state.remoteTracks.size });
   }
 
+  // ------------------------------------------------------- who is speaking
+
+  /*
+   * Who is talking, right now.
+   *
+   * **The audio the avatar receives is a mix and stays one.** Every remote track is summed into
+   * one mono node before the capture worklet sees it, which is what makes the ingest path cheap
+   * and resampler-free — and it is also why an inbound frame can never carry a name. Nothing
+   * here changes that: the mix, the worklet, the frame size and the wire are untouched, so the
+   * audio the agent hears and the latency it hears it at are byte-for-byte what they were.
+   *
+   * Attribution is therefore built from two *observations beside* the media path, and neither
+   * is on it:
+   *
+   * 1. **Energy, per track.** Each remote track already has a `MediaStreamAudioSourceNode`
+   *    feeding the mix. An `AnalyserNode` hung off that same node is a second consumer of an
+   *    existing signal — a branch, not a stage — so the samples reaching the mix are identical
+   *    and arrive at the same time. Reading it is `getByteTimeDomainData` over 512 samples a
+   *    few times a second, which is arithmetic on a small array and touches no DOM.
+   *
+   *    This is the signal that says *when*, precisely, and it works even when Meet's markup
+   *    moves — which, on the evidence of the chat button and the hand indicator, it will.
+   *
+   * 2. **The tile the stream is rendered on.** Energy alone names nobody. Meet attaches each
+   *    participant's stream to a media element inside their tile, and the tile carries
+   *    `data-participant-id` and an `aria-label`. Matching `srcObject.id` against the streams we
+   *    are already analysing is what turns "track 7 is loud" into "Priya Menon is speaking".
+   *
+   * A third path — Meet's own speaking indicator, read through configured selectors — runs as
+   * corroboration and as the fallback for a track whose stream never appears on a tile. It is
+   * last on purpose: it is the most fragile of the three, and it is the only one that stops
+   * working when Meet renames a class.
+   *
+   * **The page reports edges and identities. It decides nothing.** Whether a 400 ms gap is a
+   * pause or a turn boundary, who counts as the current speaker when two people talk at once,
+   * and what any of it is worth telling the agent are all Python's — see
+   * `meeting/active_speaker.py`.
+   */
+  const SPEAKER_SOURCE_AUDIO = 'audio';
+  const SPEAKER_SOURCE_DOM = 'dom';
+
+  /*
+   * Wording Meet puts in the *same* label as the name, when the label is the evidence.
+   *
+   * An indicator matched by `[aria-label*="is speaking"]` reads "Priya Menon is speaking", and
+   * taking that verbatim would report a participant by that whole sentence — the mistake
+   * `handNameFrom` already exists to avoid on the hand-raise path. Python cleans Meet's *status*
+   * suffixes ("presenting", "muted"); this one is not a status, it is the match itself.
+   */
+  const SPEAKER_PHRASES = [' is speaking', ' speaking', ' is talking'];
+
+  function speakerNameFrom(label) {
+    let name = (label || '').trim().split('\n')[0];
+    if (!name) {
+      return '';
+    }
+    const lowered = name.toLowerCase();
+    for (const phrase of SPEAKER_PHRASES) {
+      const at = lowered.indexOf(phrase);
+      if (at !== -1) {
+        name = name.slice(0, at) + name.slice(at + phrase.length);
+        break;
+      }
+    }
+    return name.replace(/[(),.;:]/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+
+  function speakerEnabled() {
+    return !!CONFIG.speakerTrackingEnabled;
+  }
+
+  /*
+   * One analyser per remote track, on a branch of its own.
+   *
+   * Connected to a zero-gain sink that reaches `destination`, which is not decoration: Web Audio
+   * renders what a destination pulls, so an analyser hanging off nothing is not guaranteed to be
+   * given any samples at all — it would read digital silence forever and every participant would
+   * look mute. The sink is the same trick `buildCapture` already uses to keep the capture worklet
+   * pulled, at zero gain for the same reason: the host has no one to play a conference to.
+   */
+  function attachSpeakerProbe(track, stream, source, receiver) {
+    if (!speakerEnabled() || state.speakerProbes.has(track.id)) {
+      return;
+    }
+    const context = state.captureContext;
+    if (!context || !source) {
+      return;
+    }
+    try {
+      if (!state.speakerSink) {
+        const sink = context.createGain();
+        sink.gain.value = 0;
+        sink.connect(context.destination);
+        state.speakerSink = sink;
+      }
+      const analyser = context.createAnalyser();
+      // 512 samples at 16 kHz is a 32 ms window — long enough that a single glottal pulse does
+      // not read as silence, short enough that the start of a word is not smeared across the
+      // sampling interval. Smoothing is off: it applies to the frequency data we do not read,
+      // and leaving it on would only add a second, hidden time constant to the one below.
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0;
+      source.connect(analyser);
+      analyser.connect(state.speakerSink);
+      state.speakerProbes.set(track.id, {
+        analyser,
+        buffer: new Uint8Array(analyser.fftSize),
+        trackId: track.id,
+        streamId: (stream && stream.id) || '',
+        receiver: receiver || null,
+        // The RTP synchronisation source, learned lazily — a receiver has none until packets
+        // have arrived, so asking at attach time reliably returns an empty list.
+        ssrc: '',
+        active: false,
+        level: 0,
+        loudAt: 0,
+        startedAt: 0,
+        identity: '',
+      });
+      report('speakerProbeAttached', {
+        trackId: track.id,
+        streamId: (stream && stream.id) || null,
+        total: state.speakerProbes.size,
+      });
+    } catch (err) {
+      state.speakerProbeErrors += 1;
+      report('speakerProbeFailed', { trackId: track.id, error: String(err) });
+    }
+  }
+
+  function detachSpeakerProbe(trackId) {
+    const probe = state.speakerProbes.get(trackId);
+    if (!probe) {
+      return;
+    }
+    state.speakerProbes.delete(trackId);
+    // A track that ends mid-sentence — somebody leaving while talking — has to close its turn,
+    // or Python holds them as the current speaker for the rest of the meeting.
+    if (probe.active) {
+      probe.active = false;
+      sendSpeaker(probe, false, Date.now(), SPEAKER_SOURCE_AUDIO);
+    }
+    try {
+      probe.analyser.disconnect();
+    } catch (err) {
+      /* already torn down with the context */
+    }
+  }
+
+  function probeLevel(probe) {
+    probe.analyser.getByteTimeDomainData(probe.buffer);
+    const buffer = probe.buffer;
+    let sum = 0;
+    for (let i = 0; i < buffer.length; i += 1) {
+      // Byte time-domain data is unsigned with silence at 128.
+      const sample = (buffer[i] - 128) / 128;
+      sum += sample * sample;
+    }
+    return Math.sqrt(sum / buffer.length);
+  }
+
+  /*
+   * Two thresholds, not one, and a release window.
+   *
+   * A single threshold makes a speaker flicker on and off across every consonant, and each
+   * flicker is a turn boundary Python would have to undo. Starting on the higher level and
+   * stopping only after the lower one has held for `speakerReleaseMs` is the same hysteresis a
+   * gate uses, and it is what makes a turn correspond to somebody talking rather than to the
+   * envelope of their voice.
+   */
+  function sampleSpeakers() {
+    const probes = state.speakerProbes;
+    if (!probes.size) {
+      return;
+    }
+    const now = Date.now();
+    const startLevel = CONFIG.speakerStartLevel || 0.02;
+    const stopLevel = CONFIG.speakerStopLevel || 0.012;
+    const releaseMs = CONFIG.speakerReleaseMs || 600;
+
+    for (const probe of probes.values()) {
+      let level;
+      try {
+        level = probeLevel(probe);
+      } catch (err) {
+        continue; // a probe whose context went away must not stop the others
+      }
+      probe.level = level;
+      if (level >= startLevel) {
+        probe.loudAt = now;
+      }
+
+      if (!probe.active) {
+        if (level >= startLevel) {
+          probe.active = true;
+          probe.startedAt = now;
+          probe.identity = speakerIdentityKey(probe);
+          sendSpeaker(probe, true, now, SPEAKER_SOURCE_AUDIO);
+        }
+        continue;
+      }
+
+      if (level < stopLevel && now - probe.loudAt >= releaseMs) {
+        probe.active = false;
+        sendSpeaker(probe, false, now, SPEAKER_SOURCE_AUDIO);
+        continue;
+      }
+
+      // Still talking, and we have since learned who they are. Re-sent so the open turn is
+      // renamed rather than being recorded under a track id for its whole length — which is
+      // what happens whenever somebody starts speaking before Meet has drawn their tile.
+      const identity = speakerIdentityKey(probe);
+      if (identity !== probe.identity) {
+        probe.identity = identity;
+        sendSpeaker(probe, true, now, SPEAKER_SOURCE_AUDIO);
+      }
+    }
+  }
+
+  /*
+   * The RTP synchronisation source behind a receiver.
+   *
+   * **Why this exists at all, when the stream id was supposed to be the key.** A live meeting
+   * settled it: three audio probes, one stream matched to a tile, and every turn unattributed.
+   * Meet does not render remote *audio* on an element inside the participant tile — the tile
+   * holds the video, and the audio plays from elements Meet keeps elsewhere in the document. So
+   * the stream id of an audio track never appears on a tile and never can.
+   *
+   * The SSRC is the other identifier Meet's own client has to know per participant, and a
+   * numeric id is the kind of thing a UI puts in a data attribute. `speakerOwners` is therefore
+   * keyed by *both*, and `mapSpeakerStreams` indexes whatever it finds; if Meet exposes neither,
+   * the roster fallback in Python still names a two-person call and the diagnostics say exactly
+   * which link is missing.
+   *
+   * Lazy and cheap: a receiver has no synchronisation source until packets have arrived, and the
+   * answer never changes once it has one.
+   */
+  function probeSsrc(probe) {
+    if (probe.ssrc || !probe.receiver) {
+      return probe.ssrc;
+    }
+    let sources;
+    try {
+      sources =
+        typeof probe.receiver.getSynchronizationSources === 'function'
+          ? probe.receiver.getSynchronizationSources()
+          : null;
+    } catch (err) {
+      return '';
+    }
+    if (!sources || !sources.length) {
+      return '';
+    }
+    probe.ssrc = String(sources[0].source || '');
+    return probe.ssrc;
+  }
+
+  function speakerOwner(probe) {
+    const byStream = probe.streamId ? state.speakerOwners.get(probe.streamId) : null;
+    if (byStream) {
+      return byStream;
+    }
+    const ssrc = probeSsrc(probe);
+    return (ssrc ? state.speakerOwners.get('ssrc:' + ssrc) : null) || null;
+  }
+
+  function speakerIdentityKey(probe) {
+    const owner = speakerOwner(probe);
+    if (!owner) {
+      return '';
+    }
+    return (owner.id || '') + '|' + (owner.name || '');
+  }
+
+  function sendSpeaker(probe, speaking, now, source) {
+    const owner = speakerOwner(probe);
+    const id = (owner && owner.id) || '';
+    const name = (owner && owner.name) || null;
+    send(
+      encodeJson(TYPE.ACTIVE_SPEAKER, {
+        // Stable for the life of the track, whatever we do or do not know about who owns it.
+        // Identity travels beside it and may be filled in later, so Python can rename an open
+        // turn instead of splitting it in two.
+        trackId: probe.trackId,
+        id,
+        name,
+        speaking: !!speaking,
+        source,
+        level: Math.round(probe.level * 1000) / 1000,
+        heldMs: speaking ? 0 : Math.max(now - probe.startedAt, 0),
+      })
+    );
+    state.speakerEventsSent += 1;
+    if (name) {
+      // The counter the diagnostic gates on. Edges *sent* was the wrong measure and it hid a whole
+      // live run: three probes reported speech correctly for two minutes, every turn came back
+      // unattributed, and the diagnostic stayed silent because edges had been sent.
+      state.speakerAttributed += 1;
+      // A probe that can name its own track is the live-attribution route working, so it closes
+      // the diagnostic exactly as the indicator does. Only captions are excluded — see
+      // `sendDomSpeaker`.
+      state.speakerIndicatorAttributed += 1;
+    }
+  }
+
+  /*
+   * Which participant each remote stream belongs to.
+   *
+   * The one DOM read this feature needs, and it is deliberately not a text read: `srcObject` and
+   * `closest()` are property lookups, so this forces no layout — unlike `innerText`, which is
+   * the most expensive thing in this file and is why the scans have a floor at all.
+   *
+   * Rate limited independently of the scan, and skipped entirely when nothing is being
+   * analysed: in a meeting the avatar is alone in, this does nothing at all.
+   */
+  function mapSpeakerStreams(force) {
+    if (!speakerEnabled() || !state.speakerProbes.size) {
+      return;
+    }
+    const now = Date.now();
+    const mapMs = CONFIG.speakerMapMs || 2000;
+    if (!force && now - state.speakerLastMapAt < mapMs) {
+      return;
+    }
+    state.speakerLastMapAt = now;
+
+    let elements;
+    try {
+      elements = document.querySelectorAll('video, audio');
+    } catch (err) {
+      return;
+    }
+    for (const element of elements) {
+      // Ours, appended to keep Chromium pulling RTP. It holds a remote stream and belongs to
+      // no participant, so reading it would map every stream to nobody.
+      if (element.getAttribute('data-mc-bridge')) {
+        continue;
+      }
+      const stream = element.srcObject;
+      if (!stream || !stream.id) {
+        continue;
+      }
+      let holder;
+      try {
+        holder = element.closest('[data-participant-id], [data-requested-participant-id]');
+      } catch (err) {
+        continue;
+      }
+      if (!holder) {
+        continue;
+      }
+      const id =
+        holder.getAttribute('data-participant-id') ||
+        holder.getAttribute('data-requested-participant-id') ||
+        '';
+      // `aria-label` only, never the tile's text. The label is a name; the text is the name
+      // plus every control Meet renders on the tile, and reading it is what produced roster
+      // entries like "frame_person Reframe visual_effects" before `scanRoster` took the first
+      // line. An id with no label is still useful — Python resolves it against the roster.
+      const label = (holder.getAttribute('aria-label') || '').trim().split('\n')[0];
+      if (!id && !label) {
+        continue;
+      }
+      const known = state.speakerOwners.get(stream.id);
+      if (known && known.id === id && known.name === (label || null)) {
+        continue;
+      }
+      state.speakerOwners.set(stream.id, { id, name: label || null });
+    }
+
+    mapSpeakerSsrcs();
+  }
+
+  /*
+   * Participants indexed by any numeric id on their tile that matches a receiver's SSRC.
+   *
+   * **Attribute-name-agnostic, deliberately.** Meet has put media identifiers in
+   * `data-ssrc`-shaped attributes across builds, and naming the attribute would be another guess
+   * of the kind the chat button and hand indicator each cost a live run. Instead this compares
+   * *values*: the SSRCs we already hold are 32-bit numbers, so any attribute on a participant
+   * container whose value is exactly one of them identifies that participant's audio — whatever
+   * the attribute happens to be called this month.
+   *
+   * Bounded by construction: it runs only when an SSRC is known and unmapped, and a Meet call has
+   * a handful of tiles with a handful of attributes each.
+   */
+  function mapSpeakerSsrcs() {
+    const wanted = new Map();
+    for (const probe of state.speakerProbes.values()) {
+      const ssrc = probeSsrc(probe);
+      if (ssrc && !state.speakerOwners.has('ssrc:' + ssrc)) {
+        wanted.set(ssrc, probe);
+      }
+    }
+    if (!wanted.size) {
+      return;
+    }
+
+    let holders;
+    try {
+      holders = document.querySelectorAll(
+        '[data-participant-id], [data-requested-participant-id]'
+      );
+    } catch (err) {
+      return;
+    }
+    for (const holder of holders) {
+      const id =
+        holder.getAttribute('data-participant-id') ||
+        holder.getAttribute('data-requested-participant-id') ||
+        '';
+      const label = speakerNameFrom(holder.getAttribute('aria-label'));
+      if (!id && !label) {
+        continue;
+      }
+      for (const attribute of holder.attributes) {
+        const value = attribute.value;
+        // Only plausible SSRCs are compared, so this never walks long attribute values.
+        if (value && value.length <= 12 && wanted.has(value)) {
+          state.speakerOwners.set('ssrc:' + value, { id, name: label || null });
+          wanted.delete(value);
+        }
+      }
+      if (!wanted.size) {
+        return;
+      }
+    }
+  }
+
+  /*
+   * Meet's own speaking indicator, as the third opinion.
+   *
+   * Corroboration and fallback, never the primary signal — a track whose stream never lands on
+   * a tile is invisible to `mapSpeakerStreams`, and this is what still names that person. Read
+   * through configured selectors like everything else fragile in this file, so a Meet UI change
+   * is a Python edit.
+   *
+   * Edge-triggered on the same terms as a raised hand, and for the same reason: Meet re-renders
+   * the indicator on essentially every mutation, so reporting presence would put a flood on a
+   * wire that also carries audio.
+   */
+  function scanSpeakingIndicators() {
+    if (!speakerEnabled() || state.meetState !== 'joined') {
+      if (state.speakerDomActive.size) {
+        const now = Date.now();
+        for (const [key, entry] of Array.from(state.speakerDomActive)) {
+          sendDomSpeaker(key, entry, false, now);
+        }
+        state.speakerDomActive.clear();
+      }
+      return;
+    }
+
+    const now = Date.now();
+    const domMs = CONFIG.speakerDomScanMs || 400;
+    if (now - state.speakerLastDomAt < domMs) {
+      return;
+    }
+    state.speakerLastDomAt = now;
+
+    const found = new Map();
+    for (const selector of CONFIG.selectors.speaking || []) {
+      let nodes;
+      try {
+        nodes = document.querySelectorAll(selector);
+      } catch (err) {
+        continue;
+      }
+      for (const node of nodes) {
+        let holder;
+        try {
+          holder = node.closest('[data-participant-id], [data-requested-participant-id]');
+        } catch (err) {
+          holder = null;
+        }
+        /*
+         * **A participant container is required, and this is not a formality.**
+         *
+         * A selector matching wording matches wording *anywhere* — a menu item reading "Show who
+         * is speaking", a captions setting, a tooltip. None of those is inside a participant, and
+         * every one of them is present for as long as the panel that holds it is open. Keyed as a
+         * speaker, such a label would open a turn that never closes and hold the floor for the
+         * whole meeting.
+         *
+         * That is the hand indicator's lesson twice over: `HAND_EXCLUDE` for the control labels
+         * that read like the state, and `handResolve` returning null when nothing names anybody.
+         * Requiring the container enforces both at once — the energy path is what carries this
+         * feature, so a missed indicator costs very little and a phantom costs the answer.
+         */
+        if (!holder) {
+          continue;
+        }
+        const id =
+          holder.getAttribute('data-participant-id') ||
+          holder.getAttribute('data-requested-participant-id') ||
+          '';
+        // The phrase that matched is inside the label, so it comes out of the name.
+        const label = speakerNameFrom(holder.getAttribute('aria-label'));
+        const key = id || (label ? 'name:' + label.toLowerCase() : '');
+        if (!key) {
+          continue; // nothing names anybody, so there is nobody to attribute this to
+        }
+        found.set(key, { id, name: label || null, startedAt: now });
+      }
+    }
+
+    for (const [key, entry] of found) {
+      if (!state.speakerDomActive.has(key)) {
+        state.speakerDomActive.set(key, entry);
+        sendDomSpeaker(key, entry, true, now);
+      }
+    }
+    for (const [key, entry] of Array.from(state.speakerDomActive)) {
+      if (!found.has(key)) {
+        state.speakerDomActive.delete(key);
+        sendDomSpeaker(key, entry, false, now);
+      }
+    }
+  }
+
+  function sendDomSpeaker(key, entry, speaking, now) {
+    send(
+      encodeJson(TYPE.ACTIVE_SPEAKER, {
+        trackId: 'dom:' + key,
+        id: entry.id || '',
+        name: entry.name,
+        speaking: !!speaking,
+        source: SPEAKER_SOURCE_DOM,
+        level: 0,
+        heldMs: speaking ? 0 : Math.max(now - (entry.startedAt || now), 0),
+      })
+    );
+    state.speakerEventsSent += 1;
+    if (entry.name) {
+      state.speakerAttributed += 1;
+      if (!entry.caption) {
+        // Only the indicator counts towards the diagnostic's gate. A caption naming a speaker is
+        // a fine attribution and a poor substitute: it arrives after the words have settled, so
+        // the first seconds of every remark are still unattributed, and the report that would
+        // fix that must not be switched off by it.
+        state.speakerIndicatorAttributed += 1;
+      }
+    }
+  }
+
+  /*
+   * What the page has, when nothing has been attributed.
+   *
+   * The same instrument the hand-raise feature earned the hard way: a DOM-reading feature that
+   * finds nothing is indistinguishable from a quiet meeting, and guessing Meet's markup from the
+   * outside costs a round of live testing per guess. Bounded, because a meeting where nobody has
+   * spoken yet is a perfectly normal state to be in.
+   */
+  function reportSpeakerDiagnostics(now) {
+    const diagMs = CONFIG.speakerDiagMs || 0;
+    if (
+      !diagMs ||
+      !speakerEnabled() ||
+      state.meetState !== 'joined' ||
+      // **Attributed by something other than a caption**, not merely sent. Gating on "no edges at
+      // all" made the second live run undiagnosable — speech was detected perfectly and named
+      // nobody — and gating on *any* attribution made the third: Meet's captions named four
+      // speakers, the indicator selectors matched nothing all meeting, and this stayed silent.
+      state.speakerIndicatorAttributed > 0 ||
+      state.speakerDiagnostics >= 4 ||
+      now - state.speakerArmedAt < diagMs * (state.speakerDiagnostics + 1)
+    ) {
+      return;
+    }
+    state.speakerDiagnostics += 1;
+
+    let mediaElements = 0;
+    let streamsOnTiles = 0;
+    let participants = 0;
+    // Per element rather than a count, because the counts alone could not distinguish "audio is
+    // rendered somewhere we are not looking" from "the tiles carry no ids" — and the first live
+    // run needed exactly that distinction. Bounded, and it reports *shapes*: tag, track kinds,
+    // whether a participant ancestor exists, whether the stream is one we are analysing.
+    const elements = [];
+    const tiles = [];
+    try {
+      const probeStreams = new Set();
+      for (const probe of state.speakerProbes.values()) {
+        if (probe.streamId) {
+          probeStreams.add(probe.streamId);
+        }
+      }
+      for (const element of document.querySelectorAll('video, audio')) {
+        if (element.getAttribute('data-mc-bridge')) {
+          continue;
+        }
+        mediaElements += 1;
+        const stream = element.srcObject;
+        const inTile = !!element.closest(
+          '[data-participant-id], [data-requested-participant-id]'
+        );
+        if (stream && inTile) {
+          streamsOnTiles += 1;
+        }
+        if (elements.length < 8) {
+          elements.push({
+            tag: element.tagName.toLowerCase(),
+            hasStream: !!stream,
+            kinds: stream
+              ? stream
+                  .getTracks()
+                  .map((t) => t.kind)
+                  .join('+')
+              : '',
+            inTile,
+            // The question the whole mapping turns on: is the stream Meet renders here one of the
+            // audio streams we are measuring?
+            isProbeStream: !!stream && probeStreams.has(stream.id),
+          });
+        }
+      }
+
+      const holders = document.querySelectorAll(
+        '[data-participant-id], [data-requested-participant-id]'
+      );
+      participants = holders.length;
+      for (const holder of holders) {
+        if (tiles.length >= 4) {
+          break;
+        }
+        // Attribute *names* plus any short numeric values, which is what an SSRC would look like.
+        // Names alone would not show that the value is there under a name nobody guessed.
+        const numeric = [];
+        for (const attribute of holder.attributes) {
+          if (/^\d{4,12}$/.test(attribute.value)) {
+            numeric.push(attribute.name + '=' + attribute.value);
+          }
+        }
+        tiles.push({
+          attributes: Array.from(holder.attributes, (a) => a.name).slice(0, 16),
+          numeric,
+          hasMedia: !!holder.querySelector('video, audio'),
+        });
+      }
+    } catch (err) {
+      /* diagnostics must never throw into the scan */
+    }
+
+    report('speakerNothingSeen', {
+      seconds: Math.round((now - state.speakerArmedAt) / 1000),
+      // Both counters, because their difference is the diagnosis: edges with nothing attributed
+      // means detection works and naming does not.
+      edges: state.speakerEventsSent,
+      attributed: state.speakerAttributed,
+      // Split out, because "attributed" being non-zero while this is zero is its own diagnosis and
+      // the one this run produced: Meet's captions are naming speakers a beat late and the
+      // indicator selectors below have never matched anything at all.
+      attributedLive: state.speakerIndicatorAttributed,
+      captionsOn: state.captionsOn,
+      probes: state.speakerProbes.size,
+      probeSsrcs: Array.from(state.speakerProbes.values(), (p) => p.ssrc || '-'),
+      mapped: state.speakerOwners.size,
+      mediaElements,
+      streamsOnTiles,
+      participantNodes: participants,
+      probeErrors: state.speakerProbeErrors,
+      selectors: (CONFIG.selectors.speaking || []).length,
+      elements,
+      tiles,
+    });
+  }
+
+  function scanSpeakers() {
+    if (!speakerEnabled()) {
+      return;
+    }
+    if (state.meetState !== 'joined') {
+      state.speakerWasJoined = false;
+      return;
+    }
+    if (!state.speakerWasJoined) {
+      state.speakerWasJoined = true;
+      state.speakerArmedAt = Date.now();
+      state.speakerDiagnostics = 0;
+      report('speakersArmed', {
+        sampleMs: CONFIG.speakerSampleMs || 0,
+        selectors: (CONFIG.selectors.speaking || []).length,
+      });
+    }
+    mapSpeakerStreams(false);
+    scanSpeakingIndicators();
+    // After the indicator pass, because a caption naming somebody is the stronger claim and this
+    // is the order in which they are allowed to overwrite each other.
+    scanCaptions();
+    reportSpeakerDiagnostics(Date.now());
+  }
+
+  // ------------------------------------------------------------- captions
+
+  /*
+   * Meet's own captions, read for **who said what**.
+   *
+   * **Why this exists, when there is already a speaker detector.** Two live runs established that
+   * per-track energy answers *when* somebody is talking and that the page cannot reliably say
+   * *who*: Meet renders remote audio on elements outside the participant tile, so an audio
+   * stream's id never appears next to a name. Meanwhile the meeting kept producing the exact
+   * thing that was missing, in the DOM, unread — a caption panel where Meet writes the speaker's
+   * name and the words they just said, side by side, from its own transcription.
+   *
+   * So this is the attribution path that does not depend on inferring anything, and it answers a
+   * question none of the other signals could: *what* did each person say. An avatar asked "what
+   * did they ask you?" could previously only say it did not know.
+   *
+   * **Three properties, each earned from the features before it.**
+   *
+   * - *Captions must be turned on.* Like the chat panel, and bounded by wall clock for the same
+   *   reason — Meet has not drawn its control bar in the first seconds of a call. Unlike chat,
+   *   this is invisible to the meeting: captions are rendered locally for whoever enabled them,
+   *   so nobody else sees the avatar switch them on.
+   * - *A caption is not final when it appears.* Meet extends a line word by word as somebody
+   *   keeps talking, so forwarding on sight would send a dozen fragments of one sentence. A block
+   *   is emitted once it has stopped changing for `captionSettleMs`.
+   * - *The name beside a caption is also a speaking signal*, and a better one than any indicator
+   *   this file guesses at: Meet is telling us who is talking, in words. A block that is still
+   *   growing raises a `dom` speaker edge for its owner.
+   */
+  function ensureCaptions() {
+    const s = CONFIG.selectors;
+    if (matchesAny(s.captionsRegion)) {
+      if (!state.captionsOn) {
+        state.captionsOn = true;
+        report('captionsOn', { attempts: state.captionOpenAttempts });
+      }
+      return true;
+    }
+
+    const now = Date.now();
+    const windowMs = CONFIG.captionOpenWindowMs || 90000;
+    const retryMs = CONFIG.captionOpenRetryMs || 2000;
+
+    if (now - state.captionArmedAt > windowMs) {
+      if (!state.captionGaveUp) {
+        state.captionGaveUp = true;
+        report('captionsGaveUp', {
+          attempts: state.captionOpenAttempts,
+          seconds: Math.round((now - state.captionArmedAt) / 1000),
+          buttonsSeen: captionButtonLabels(),
+        });
+      }
+      return false;
+    }
+    if (now - state.captionLastAttemptAt < retryMs) {
+      return false;
+    }
+    state.captionLastAttemptAt = now;
+    state.captionOpenAttempts += 1;
+
+    let clicked = clickFirst(s.captionsButton);
+    if (!clicked) {
+      const button = findCaptionButtonByLabel();
+      if (button) {
+        try {
+          button.click();
+          clicked = true;
+        } catch (err) {
+          /* a control that refuses a synthetic click is reported as not clicked */
+        }
+      }
+    }
+    report('captionsOpenAttempt', { attempt: state.captionOpenAttempts, clicked: !!clicked });
+    return false;
+  }
+
+  /*
+   * The captions control, found by reading labels rather than by matching markup.
+   *
+   * The same fallback the chat button needed, and for the same reason: Meet's wording for this has
+   * been "Turn on captions", "Captions" and "Turn on captions (c)". A substring match on the
+   * rendered accessible name survives all of those; the *off* wording is excluded, because
+   * clicking that is how you turn the feature we want back off.
+   */
+  function findCaptionButtonByLabel() {
+    let nodes;
+    try {
+      nodes = document.querySelectorAll('button, div[role="button"]');
+    } catch (err) {
+      return null;
+    }
+    for (const node of nodes) {
+      const label = (
+        node.getAttribute('aria-label') ||
+        node.getAttribute('data-tooltip') ||
+        ''
+      ).toLowerCase();
+      if (!label || label.indexOf('caption') === -1) {
+        continue;
+      }
+      if (label.indexOf('turn off') !== -1 || label.indexOf('hide') !== -1) {
+        continue;
+      }
+      return node;
+    }
+    return null;
+  }
+
+  function captionButtonLabels() {
+    const found = [];
+    try {
+      for (const node of document.querySelectorAll('button, div[role="button"]')) {
+        const label = (
+          node.getAttribute('aria-label') ||
+          node.getAttribute('data-tooltip') ||
+          ''
+        ).trim();
+        if (label && label.toLowerCase().indexOf('caption') !== -1) {
+          found.push(label.slice(0, 80));
+        }
+        if (found.length >= 10) {
+          break;
+        }
+      }
+    } catch (err) {
+      /* diagnostics must never throw into the scan */
+    }
+    return found;
+  }
+
+  /*
+   * One caption block, split into the speaker and the words.
+   *
+   * `innerText` **is** used here, and this is the one place in the file where that is the right
+   * call rather than a mistake. The caption region is a handful of short lines, not the document,
+   * and the split this needs is exactly the one `innerText` performs: Meet renders the name and
+   * the caption as separate block elements, so the name is the first rendered line and the words
+   * are the rest. `textContent` would run them together — "Dev ChoudharyI want to know about
+   * Delhi" — with no way to tell where the name ended.
+   */
+  /*
+   * The speaker's name, from the avatar image beside the caption.
+   *
+   * **This is the signal the first live run proved was needed.** Captions captured perfectly and
+   * every single line came back unattributed, because the element the block selectors match holds
+   * only the words — Meet renders the name in a *sibling* of it. Climbing to a parent (below) is
+   * one answer; this is the better one, because Meet puts each caption's participant photo next to
+   * it and an image's `alt` **is** their name. An `alt` is an accessibility obligation, so it
+   * outlives the class names and nesting that moved underneath us.
+   */
+  function captionSpeakerFromImage(node) {
+    let scope = node;
+    // Two levels, not three. The photo has to belong to *this* caption: climbing further reaches
+    // the panel — and, in a grid layout, participant tiles — where the first `img[alt]` is
+    // whoever happens to be rendered nearby rather than whoever is talking. A missed name costs
+    // an "Someone"; a borrowed one puts the wrong person's name on a sentence.
+    for (let depth = 0; scope && depth < 2; depth += 1) {
+      let image;
+      try {
+        image = scope.querySelector('img[alt]');
+      } catch (err) {
+        image = null;
+      }
+      if (image) {
+        const alt = (image.getAttribute('alt') || '').trim();
+        // Meet also renders decorative images; a name is what a person would read.
+        if (alt && alt.length < 120 && alt.toLowerCase().indexOf('profile') === -1) {
+          return alt;
+        }
+      }
+      scope = scope.parentElement;
+    }
+    return '';
+  }
+
+  function captionLines(node) {
+    const raw = (node.innerText || '').trim();
+    if (!raw) {
+      return [];
+    }
+    return raw
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+  }
+
+  function parseCaptionBlock(node) {
+    let lines = captionLines(node);
+    if (!lines.length) {
+      return null;
+    }
+
+    /*
+     * **Climb until the name is in view.** The block selectors match the element holding the
+     * words, and Meet renders the name as a sibling of it — so reading the matched element alone
+     * produced a whole meeting of captions credited to "Someone", which is the failure this loop
+     * exists to fix. One or two levels up is the caption *row*, which contains both.
+     *
+     * Bounded, and it stops as soon as a second line appears: climbing further would eventually
+     * reach the panel and swallow every other speaker's line into one entry.
+     */
+    let scope = node;
+    for (let depth = 0; lines.length === 1 && scope.parentElement && depth < 2; depth += 1) {
+      scope = scope.parentElement;
+      const wider = captionLines(scope);
+      if (wider.length > 1) {
+        lines = wider;
+        break;
+      }
+    }
+
+    const fromImage = captionSpeakerFromImage(node);
+    if (lines.length === 1) {
+      // Still only the words. The image may still name them; otherwise this is a continuation
+      // block, which Meet renders without repeating the name.
+      return {
+        speaker: fromImage || null,
+        text: lines[0].slice(0, 2000),
+        // Reported so a wrong name is traceable to the thing that produced it. Three sources with
+        // different failure modes — a borrowed photo, a first line that was not a name, nothing at
+        // all — are indistinguishable in a log that only carries the result.
+        nameFrom: fromImage ? 'img' : 'none',
+      };
+    }
+    return {
+      // The image wins over the first rendered line: an `alt` is exactly a name, while a first
+      // line is a name *most* of the time and a timestamp or a language chip the rest.
+      speaker: (fromImage || lines[0]).slice(0, 120),
+      text: lines.slice(1).join(' ').slice(0, 2000),
+      nameFrom: fromImage ? 'img' : 'line',
+    };
+  }
+
+  function captionNodes() {
+    const s = CONFIG.selectors;
+    for (const selector of s.captionBlock || []) {
+      try {
+        const found = document.querySelectorAll(selector);
+        if (found.length) {
+          return Array.from(found);
+        }
+      } catch (err) {
+        /* a malformed selector must not stop the scan */
+      }
+    }
+    // Nothing matched a configured block selector. The region itself is then the block, which is
+    // what Meet renders in the single-speaker layout.
+    for (const selector of s.captionsRegion || []) {
+      try {
+        const region = document.querySelector(selector);
+        if (region) {
+          return [region];
+        }
+      } catch (err) {
+        /* as above */
+      }
+    }
+    return [];
+  }
+
+  function scanCaptions() {
+    if (!CONFIG.captionsEnabled) {
+      return;
+    }
+    if (state.meetState !== 'joined') {
+      state.captionWasJoined = false;
+      return;
+    }
+    if (!state.captionWasJoined) {
+      state.captionWasJoined = true;
+      state.captionOpenAttempts = 0;
+      state.captionGaveUp = false;
+      state.captionsOn = false;
+      state.captionArmedAt = Date.now();
+      state.captionLastAttemptAt = 0;
+      state.captionBlocks.clear();
+      report('captionsArmed', {});
+    }
+
+    if (!ensureCaptions()) {
+      return;
+    }
+
+    const now = Date.now();
+    const scanMs = CONFIG.captionScanMs || 400;
+    if (now - state.captionLastScanAt < scanMs) {
+      return;
+    }
+    state.captionLastScanAt = now;
+
+    const settleMs = CONFIG.captionSettleMs || 1200;
+    const seen = new Set();
+
+    for (const node of captionNodes()) {
+      const parsed = parseCaptionBlock(node);
+      if (!parsed || !parsed.text) {
+        continue;
+      }
+      // Keyed by speaker and the opening of the utterance, which is what stays put while the rest
+      // grows. An index would not: Meet recycles caption rows, and that is the same trap chat's
+      // message id fell into.
+      const key = (parsed.speaker || '?') + '|' + parsed.text.slice(0, 40);
+      seen.add(key);
+
+      const known = state.captionBlocks.get(key);
+      if (!known) {
+        state.captionBlocks.set(key, {
+          speaker: parsed.speaker,
+          text: parsed.text,
+          nameFrom: parsed.nameFrom,
+          changedAt: now,
+          sent: false,
+        });
+        // Somebody is mid-sentence and Meet has just named them. That is a speaking edge, and a
+        // better-attributed one than any indicator this file could match on.
+        raiseCaptionSpeaker(parsed.speaker, true, now);
+        continue;
+      }
+      if (known.text !== parsed.text || (parsed.speaker && known.speaker !== parsed.speaker)) {
+        known.text = parsed.text;
+        known.speaker = parsed.speaker || known.speaker;
+        known.nameFrom = parsed.speaker ? parsed.nameFrom : known.nameFrom;
+        known.changedAt = now;
+        raiseCaptionSpeaker(known.speaker, true, now);
+      }
+    }
+
+    for (const [key, block] of Array.from(state.captionBlocks)) {
+      if (block.sent) {
+        // Kept only so a re-render of the same line is not read as a new one; dropped once the
+        // block leaves the panel.
+        if (!seen.has(key)) {
+          state.captionBlocks.delete(key);
+        }
+        continue;
+      }
+      if (now - block.changedAt < settleMs) {
+        continue; // still being spoken
+      }
+      block.sent = true;
+      if (block.speaker) {
+        state.captionsAttributed += 1;
+      }
+      raiseCaptionSpeaker(block.speaker, false, now);
+      send(
+        encodeJson(TYPE.CAPTION, {
+          speaker: block.speaker,
+          text: block.text,
+          // Where the name came from, so a wrong one is traceable rather than merely wrong.
+          nameFrom: block.nameFrom || 'none',
+          // Reported, never acted on: only the page can see the name Meet wrote, and only Python
+          // knows which name is the avatar's own.
+          isSelf: !!block.speaker && !!CONFIG.displayName && block.speaker === CONFIG.displayName,
+        })
+      );
+      state.captionsSent += 1;
+    }
+
+    reportCaptionDiagnostics(now);
+  }
+
+  /*
+   * A caption's speaker, reported on the speaker channel.
+   *
+   * Keyed by name because that is all a caption gives, and prefixed so it cannot collide with a
+   * participant id. Edge-triggered through the same `speakerDomActive` map the indicator pass
+   * uses, so one person named by both routes is still one speaker.
+   */
+  function raiseCaptionSpeaker(speaker, speaking, now) {
+    if (!CONFIG.speakerTrackingEnabled || !speaker) {
+      return;
+    }
+    const key = 'caption:' + speaker.toLowerCase();
+    if (speaking) {
+      if (state.speakerDomActive.has(key)) {
+        const entry = state.speakerDomActive.get(key);
+        entry.seenAt = now;
+        return;
+      }
+      const entry = { id: '', name: speaker, startedAt: now, seenAt: now, caption: true };
+      state.speakerDomActive.set(key, entry);
+      sendDomSpeaker(key, entry, true, now);
+      return;
+    }
+    const entry = state.speakerDomActive.get(key);
+    if (entry) {
+      state.speakerDomActive.delete(key);
+      sendDomSpeaker(key, entry, false, now);
+    }
+  }
+
+  function reportCaptionDiagnostics(now) {
+    const diagMs = CONFIG.captionDiagMs || 0;
+    if (
+      !diagMs ||
+      // **Attributed**, not captured. A run that captured eleven caption lines and named nobody on
+      // any of them produced no diagnostic at all, because the gate asked whether captions were
+      // arriving rather than whether they were usable.
+      state.captionsAttributed > 0 ||
+      state.captionDiagnostics >= 3 ||
+      now - state.captionArmedAt < diagMs * (state.captionDiagnostics + 1)
+    ) {
+      return;
+    }
+    state.captionDiagnostics += 1;
+    let regionText = '';
+    let blockShapes = [];
+    let alts = [];
+    try {
+      for (const selector of CONFIG.selectors.captionsRegion || []) {
+        const region = document.querySelector(selector);
+        if (region) {
+          regionText = (region.innerText || '').slice(0, 300);
+          break;
+        }
+      }
+      // What each matched block *actually* contains, which is the question when captions arrive
+      // unattributed: one rendered line means the selector matched the words and the name is
+      // somewhere else, and the alts say whether the participant photo can supply it.
+      blockShapes = captionNodes()
+        .slice(0, 4)
+        .map((node) => {
+          const lines = captionLines(node);
+          return {
+            lines: lines.length,
+            first: (lines[0] || '').slice(0, 60),
+            hasImg: !!captionSpeakerFromImage(node),
+            parentLines: node.parentElement ? captionLines(node.parentElement).length : 0,
+          };
+        });
+      for (const selector of CONFIG.selectors.captionsRegion || []) {
+        const region = document.querySelector(selector);
+        if (!region) {
+          continue;
+        }
+        alts = Array.from(region.querySelectorAll('img[alt]'), (img) =>
+          (img.getAttribute('alt') || '').slice(0, 40)
+        ).slice(0, 6);
+        break;
+      }
+    } catch (err) {
+      /* diagnostics must never throw into the scan */
+    }
+    report('captionsNothingSeen', {
+      seconds: Math.round((now - state.captionArmedAt) / 1000),
+      on: state.captionsOn,
+      attempts: state.captionOpenAttempts,
+      blocks: state.captionBlocks.size,
+      captured: state.captionsSent,
+      attributed: state.captionsAttributed,
+      buttonsSeen: captionButtonLabels(),
+      blockShapes,
+      alts,
+      // The words the panel actually holds, so a block-selector fix is a reading rather than a
+      // guess. Truncated, and only while nothing has been attributed.
+      regionText,
+    });
+  }
+
+  /*
+   * The energy sampler runs on its own clock, and that is the point.
+   *
+   * Everything else this bridge observes is driven by Meet's DOM mutations, which is right for
+   * things that change when a person clicks something. Speech is not one of them: a meeting can
+   * sit visually still while somebody talks for a minute, and a turn sampled at the mutation
+   * rate would start late and end later. This timer touches no DOM, so running it faster than
+   * the scan floor costs a few array reads rather than a page layout.
+   */
+  function installSpeakerSampler() {
+    if (!speakerEnabled() || state.speakerTimer) {
+      return;
+    }
+    state.speakerTimer = setInterval(sampleSpeakers, CONFIG.speakerSampleMs || 200);
+  }
+
   function installPeerConnectionTap() {
     const Original = window.RTCPeerConnection;
     if (!Original) {
@@ -919,9 +2233,14 @@
       // speaking gate still covers the acoustic path on a host with speakers.
       pc.addEventListener('track', (event) => {
         if (event.track && event.track.kind === 'audio') {
-          attachRemoteTrack(event.track, event.streams && event.streams[0]).catch((err) =>
-            fail('ATTACH_REMOTE', err, false)
-          );
+          // The receiver travels with the track because it is the only thing that can name the
+          // *synchronisation source* behind it — see `probeSsrc`. Attribution needs a key Meet
+          // also puts in its DOM, and the stream id turned out not to be one.
+          attachRemoteTrack(
+            event.track,
+            event.streams && event.streams[0],
+            event.receiver
+          ).catch((err) => fail('ATTACH_REMOTE', err, false));
         }
       });
       pc.addEventListener('connectionstatechange', () =>
@@ -1177,33 +2496,96 @@
     if (own) {
       return own;
     }
-    const sender = chatSender(node) || '';
+    const sender = (chatSender(node) || {}).name || '';
     return `${sender}|${text}`;
   }
 
+  /*
+   * Who sent one rendered message.
+   *
+   * **Climbing is the whole fix, and it is the same fix `parseCaptionBlock` already carries.**
+   * The selectors match the element holding the *words* — a live run matched
+   * `div[jsname="dTKtvb"]`, whose `innerText` is the message text and nothing else — and Meet
+   * renders the name in the row *above* it. Looking only at the node and its immediate parent
+   * therefore found nothing, for every message, in every meeting: five forwarded messages,
+   * five `sender=null`, and an agent that could not say who had asked it anything.
+   *
+   * Returns `{ name, from }` rather than a bare string. Where a name came from is what makes a
+   * wrong one diagnosable instead of merely wrong, exactly as `nameFrom` does for captions.
+   */
   function chatSender(node) {
     const s = CONFIG.selectors;
-    const own = node.getAttribute('data-sender-name');
-    if (own) {
-      return own.trim();
-    }
-    for (const selector of s.chatSender || []) {
-      let found;
-      try {
-        found = node.querySelector(selector) || (node.parentElement
-          ? node.parentElement.querySelector(selector)
-          : null);
-      } catch (err) {
-        continue;
+
+    let scope = node;
+    // Three levels: the text node, the message row, and the group wrapper Meet puts the name
+    // in. Bounded for the reason the caption climb is — the next level up is the message list
+    // itself, where the first name found belongs to whoever spoke first rather than to this
+    // message.
+    for (let depth = 0; scope && depth < 4; depth += 1) {
+      const own = scope.getAttribute && scope.getAttribute('data-sender-name');
+      if (own && own.trim()) {
+        return { name: own.trim().slice(0, 120), from: depth === 0 ? 'attr' : 'ancestor-attr' };
       }
-      if (found) {
+      for (const selector of s.chatSender || []) {
+        let found;
+        try {
+          found = scope.querySelector(selector);
+        } catch (err) {
+          continue; // a malformed selector must not stop the scan
+        }
+        if (!found || found === node || node.contains(found)) {
+          // A match inside the message text is the text, not a name.
+          continue;
+        }
         const name = (found.getAttribute('data-sender-name') || found.innerText || '').trim();
-        if (name) {
-          return name.slice(0, 120);
+        if (name && name.length < 120) {
+          return { name, from: depth === 0 ? 'selector' : 'ancestor' };
         }
       }
+      scope = scope.parentElement;
     }
     return null;
+  }
+
+  /*
+   * Say, with evidence, that the panel rendered a message we could not attribute.
+   *
+   * The nameless-chat failure was silent for its entire life: `sender=null` is a legal value the
+   * Python side degrades gracefully on, so nothing anywhere said the markup had moved. This is
+   * what turns the next move into a selector change instead of a live debugging session — it
+   * prints what the row actually contains, which is the one thing a log of nulls never did.
+   */
+  function reportChatSenderMissing(node) {
+    if (state.chatSenderDiagnostics >= 3) {
+      return;
+    }
+    state.chatSenderDiagnostics += 1;
+
+    let row = node;
+    for (let depth = 0; row && row.parentElement && depth < 3; depth += 1) {
+      row = row.parentElement;
+    }
+    const attributes = [];
+    let scope = node;
+    for (let depth = 0; scope && depth < 4; depth += 1) {
+      if (scope.attributes) {
+        for (const attribute of Array.from(scope.attributes)) {
+          const pair = `${depth}:${attribute.name}=${String(attribute.value).slice(0, 40)}`;
+          if (attributes.indexOf(pair) === -1 && attributes.length < 40) {
+            attributes.push(pair);
+          }
+        }
+      }
+      scope = scope.parentElement;
+    }
+    report('chatSenderMissing', {
+      tried: (CONFIG.selectors.chatSender || []).length,
+      // What a person reading the panel would see, which is where the name has to be.
+      rowText: ((row && row.innerText) || '').slice(0, 300),
+      // Every attribute on the message and its first three ancestors: the replacement selector
+      // is almost certainly one of these, and this is the only way to see them from here.
+      attributes,
+    });
   }
 
   function scanChat() {
@@ -1235,6 +2617,10 @@
       state.chatArmedAt = Date.now();
       state.chatLastAttemptAt = 0;
       state.chatBaselineUntil = 0;
+      // A fresh call is a fresh list: carrying a name over from the previous one would attribute
+      // this meeting's first message to somebody who is not in it.
+      state.chatLastSender = null;
+      state.chatSenderDiagnostics = 0;
       // A rejoin renders the panel's history again; re-baselining stops the avatar answering
       // messages it has already seen, and `chatSeen` still guards the individual ids.
       state.chatBaselined = false;
@@ -1280,6 +2666,20 @@
       if (!text) {
         continue;
       }
+
+      /*
+       * Resolved for **every** row, including ones already forwarded, and before the dedupe
+       * check — because the name on a row we have already sent is what attributes the next one.
+       * Meet renders a run of messages from one person under a single heading, so skipping seen
+       * rows would throw away the only copy of the name the group has.
+       */
+      const found = chatSender(node);
+      if (found) {
+        state.chatLastSender = found.name;
+      }
+      const sender = found ? found.name : state.chatLastSender;
+      const senderFrom = found ? found.from : (sender ? 'group' : 'none');
+
       const id = chatMessageId(node, text);
       if (state.chatSeen.has(id)) {
         continue;
@@ -1289,12 +2689,19 @@
         continue; // history that predates the avatar
       }
 
-      const sender = chatSender(node);
+      if (!sender) {
+        reportChatSenderMissing(node);
+      } else {
+        state.chatAttributed += 1;
+      }
       send(
         encodeJson(TYPE.CHAT_MESSAGE, {
           id,
           text: text.slice(0, 4000),
           sender,
+          // Where the name came from, so a wrong one is traceable rather than merely wrong —
+          // and so `group` is visibly distinct from a name Meet wrote on this row itself.
+          senderFrom,
           // Compared against the name Meet shows for our own account. The bridge filters on
           // this rather than trusting it blindly, but the page is the only side that can see
           // which row is ours.
@@ -1752,6 +3159,47 @@
     }
   }
 
+  /*
+   * The name the signed-in Google account actually appears under.
+   *
+   * **The gap this closes was costing every self-check in the connector.** `CONFIG.displayName` is
+   * only what Meet is *asked* to call us, and it is asked only when the profile has lost its
+   * session — a signed-in profile renders the account's own name instead. So an avatar signed in
+   * as an account called "Backend Services" reported `selfName: "AI Avatar"`, matched nothing,
+   * and was counted as a *participant*: observed live as attendance reporting two people in a
+   * call with one other person in it. Speaker attribution then inherited the same error, because
+   * "is there exactly one other person here" is unanswerable while the avatar is one of them.
+   *
+   * Read from the account button, whose accessible name Google has kept in the shape
+   * "Google Account: <name> (<email>)" for years — an accessibility commitment rather than a
+   * build artefact, which is the same reason `selectors.py` prefers ARIA everywhere.
+   */
+  function accountName() {
+    for (const selector of CONFIG.selectors.accountName || []) {
+      let node;
+      try {
+        node = document.querySelector(selector);
+      } catch (err) {
+        continue;
+      }
+      if (!node) {
+        continue;
+      }
+      const label = (node.getAttribute('aria-label') || '').trim();
+      if (!label) {
+        continue;
+      }
+      // "Google Account: Backend Services\n(bot@example.com)" — the name is what sits between
+      // the colon and the address.
+      const afterColon = label.indexOf(':') >= 0 ? label.slice(label.indexOf(':') + 1) : label;
+      const name = afterColon.split('\n')[0].split('(')[0].trim();
+      if (name) {
+        return name.slice(0, 120);
+      }
+    }
+    return '';
+  }
+
   function scanRoster() {
     const s = CONFIG.selectors;
     const participants = [];
@@ -1780,17 +3228,42 @@
         // which a signed-in profile ignores in favour of the account's own name. Reported
         // rather than resolved here — the bridge decides what it means.
         const isSelf = /\(\s*you\s*\)|\byou\b\s*$/i.test(name);
-        participants.push({ id, name: name.slice(0, 120), isSelf });
+        /*
+         * Whether the microphone is off, which is the one language-independent answer this page
+         * has to "which of these people is the voice we are hearing".
+         *
+         * Read from the *whole* label rather than the first line, because Meet renders the mute
+         * state as part of the tile's status text and the name is only the first line of it. And
+         * reported as a tri-state: `null` means nothing in the label or the attributes said,
+         * which must widen the candidate list rather than narrow it.
+         */
+        let muted = null;
+        const pressed = node.getAttribute('data-is-muted') || node.getAttribute('data-muted');
+        if (pressed === 'true' || pressed === 'false') {
+          muted = pressed === 'true';
+        } else if (/\bmuted\b|\bmic off\b/i.test(raw)) {
+          muted = true;
+        } else if (/\bunmuted\b|\bis speaking\b|\bmicrophone on\b/i.test(raw)) {
+          muted = false;
+        }
+        participants.push({ id, name: name.slice(0, 120), isSelf, muted });
       }
       if (participants.length) {
         break;
       }
     }
 
+    // The account button first, then our own tile. The tile is the stronger signal and the reason
+    // it is not first is only cost: the button is one `querySelector`, and the tile search reads
+    // every `<video>`'s `srcObject`. In a live headless run the button was absent and the tile is
+    // what answered — see `selfTileName`.
+    const account = accountName() || selfTileName();
+
     // A signature rather than a deep compare: the roster is rescanned on every
     // DOM mutation in a UI that mutates constantly, and re-sending an identical
     // roster would flood the channel with no new information.
-    const signature = participants.map((p) => `${p.id}|${p.name}|${p.isSelf ? 1 : 0}`).join(';');
+    const signature =
+      participants.map((p) => `${p.id}|${p.name}|${p.isSelf ? 1 : 0}`).join(';') + '#' + account;
     if (signature === state.rosterSignature) {
       return;
     }
@@ -1799,6 +3272,9 @@
       encodeJson(TYPE.PARTICIPANTS, {
         participants,
         selfName: CONFIG.displayName,
+        // Reported alongside rather than instead of, because the two are different claims: one is
+        // configuration and one is an observation. Python decides which wins — and it is this one.
+        accountName: account || null,
         count: participants.length,
       })
     );
@@ -1836,6 +3312,9 @@
       scanRoster();
       scanChat();
       scanHands();
+      // Only the *identity* half runs here. The energy sampler that decides when somebody is
+      // speaking has its own timer, because speech does not mutate the DOM.
+      scanSpeakers();
     };
 
     const schedule = () => {
@@ -1875,6 +3354,7 @@
         attributeFilter: ['aria-label', 'data-participant-id', 'jsname'],
       });
       schedule();
+      installSpeakerSampler();
       // A periodic sweep as well: some Meet transitions replace text without a
       // mutation the observer is configured to see, and a missed 'ended' would
       // leave a session supervising a page that is no longer in a meeting.
@@ -2080,8 +3560,28 @@
     chatPanelOpen: state.chatPanelOpened,
     chatOpenAttempts: state.chatOpenAttempts,
     chatMessagesSent: state.chatMessagesSent,
+    // Beside the total, never folded into it: `chatMessagesSent > 0` with this at 0 is the
+    // nameless-chat failure, and it is invisible in any single number.
+    chatAttributed: state.chatAttributed,
     handsUp: state.handsUp.size,
     handRaisesSent: state.handRaisesSent,
+    // Speaker attribution, from the outside. `speakerProbes` at 0 with remote tracks present
+    // means the analysers never attached; `speakerOwners` at 0 with probes present means the
+    // energy is being measured and nothing on the page says whose it is.
+    speakerProbes: state.speakerProbes.size,
+    speakerOwners: state.speakerOwners.size,
+    speakersActive: Array.from(state.speakerProbes.values()).filter((p) => p.active).length,
+    speakerEventsSent: state.speakerEventsSent,
+    speakerAttributed: state.speakerAttributed,
+    // Attributions from a route fast enough to name a voice while it is still talking. Equal to
+    // `speakerAttributed` minus whatever the caption panel named.
+    speakerIndicatorAttributed: state.speakerIndicatorAttributed,
+    speakerProbeErrors: state.speakerProbeErrors,
+    captionsOn: state.captionsOn,
+    captionsSent: state.captionsSent,
+    captionsAttributed: state.captionsAttributed,
+    captionBlocks: state.captionBlocks.size,
+    ownVideoTracks: state.ownVideoTrackIds.size,
     playout: state.playoutStats,
     socketOpen: !!(state.socket && state.socket.readyState === 1),
     stages: stages.map((s) => s.stage + ':' + s.phase),

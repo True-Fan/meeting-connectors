@@ -13,6 +13,7 @@ import asyncio
 import json
 
 from src.avatar.client import AvatarClient
+from src.connectors.google_meet.meeting.active_speaker import SpeakerTracker
 from src.connectors.google_meet.meeting.attendance import AttendanceLedger
 from src.connectors.google_meet.meeting.attendance_announcer import (
     AttendanceAnnouncer,
@@ -22,6 +23,7 @@ from src.connectors.google_meet.meeting.participants import MeetParticipant, Mee
 from src.domain.avatar import AvatarProtocolVersion, AvatarServerHello
 from src.domain.context import FrameContext
 from src.domain.ids import CorrelationId, SessionId
+from src.services.media.clock import MediaClock
 from tests.fakes.avatar import FakeAvatarTransport
 
 
@@ -297,3 +299,104 @@ class TestSkippingTheHandshakeChange:
 
         assert await client.send_meeting_context("Aarav Sharma is here.") is False
         assert _contexts(transport) == []
+
+
+class TestOneBriefNotTwo:
+    """Attendance and the speaker travel in **one** frame.
+
+    **The regression this pins was reported from a live meeting, and it looked like an unrelated
+    bug.** Attendance was working: the ledger held "dev Choudhary", the brief was delivered, and
+    the log said so. Then speaker briefs — pushed every few seconds, far more often than the roster
+    changes — arrived on the same channel, and the agent, which keeps one slot for standing
+    context, was left holding only the most recent one. Asked who was in the meeting, the avatar
+    answered *"Someone is present in the meeting"*: it had been told about the speaker and its
+    knowledge of the roster had been evicted.
+
+    Two pushers cannot share one slot, so there is one pusher. The session wiring enforces it; this
+    asserts the brief a session actually sends.
+    """
+
+    async def test_the_brief_carries_both_facts(self) -> None:
+        client, transport = await _client()
+        ledger = AttendanceLedger()
+        ledger.observe_roster(_roster("dev Choudhary"))
+        tracker = SpeakerTracker(clock=MediaClock())
+        tracker.offer(
+            {"trackId": "t1", "id": "", "name": "dev Choudhary", "speaking": True, "level": 0.1}
+        )
+        announcer = AttendanceAnnouncer(
+            ledger=ledger, avatar=client, interval_s=0.05, settle_s=0.0, speakers=tracker
+        )
+
+        await announcer.start()
+        try:
+            await asyncio.sleep(0.15)
+        finally:
+            await announcer.stop()
+
+        (frame,) = _contexts(transport)
+        assert "Currently in the meeting" in frame["text"], "attendance must not be displaced"
+        assert "dev Choudhary is speaking right now" in frame["text"]
+
+    async def test_the_topic_is_unchanged_so_an_existing_agent_still_routes_it(self) -> None:
+        """Renaming the topic to suit a wider brief would be a breaking change dressed as a
+        tidy-up: an agent handling ``attendance`` would silently stop being told who is here."""
+        client, transport = await _client()
+        ledger = AttendanceLedger()
+        ledger.observe_roster(_roster("dev Choudhary"))
+        tracker = SpeakerTracker(clock=MediaClock())
+        tracker.offer({"trackId": "t1", "name": "dev Choudhary", "speaking": True})
+        announcer = AttendanceAnnouncer(
+            ledger=ledger, avatar=client, interval_s=0.05, settle_s=0.0, speakers=tracker
+        )
+
+        await announcer.start()
+        try:
+            await asyncio.sleep(0.15)
+        finally:
+            await announcer.stop()
+
+        assert _contexts(transport)[0]["topic"] == "attendance"
+
+    async def test_a_change_of_speaker_is_news_even_when_the_roster_is_still(self) -> None:
+        """Otherwise the agent's idea of who is talking freezes at the first speaker."""
+        client, transport = await _client()
+        ledger = AttendanceLedger()
+        ledger.observe_roster(_roster("dev Choudhary", "Priya Menon"))
+        tracker = SpeakerTracker(clock=MediaClock(), merge_gap_ms=0)
+        tracker.offer({"trackId": "t1", "name": "dev Choudhary", "speaking": True})
+        announcer = AttendanceAnnouncer(
+            ledger=ledger, avatar=client, interval_s=0.02, settle_s=0.0, speakers=tracker
+        )
+
+        await announcer.start()
+        try:
+            await asyncio.sleep(0.1)
+            tracker.offer({"trackId": "t1", "name": "dev Choudhary", "speaking": False})
+            tracker.offer({"trackId": "t2", "name": "Priya Menon", "speaking": True})
+            await asyncio.sleep(0.1)
+        finally:
+            await announcer.stop()
+
+        frames = _contexts(transport)
+        assert len(frames) >= 2
+        assert "Priya Menon is speaking right now" in frames[-1]["text"]
+
+    async def test_with_speaker_tracking_off_the_brief_is_byte_for_byte_what_it_was(self) -> None:
+        """The whole feature is additive or it is not safe. No tracker, no change."""
+        client, transport = await _client()
+        ledger = AttendanceLedger()
+        ledger.observe_roster(_roster("dev Choudhary"))
+        announcer = AttendanceAnnouncer(
+            ledger=ledger, avatar=client, interval_s=0.05, settle_s=0.0
+        )
+
+        await announcer.start()
+        try:
+            await asyncio.sleep(0.15)
+        finally:
+            await announcer.stop()
+
+        (frame,) = _contexts(transport)
+        assert frame["text"] == ledger.snapshot().agent_context()
+        assert frame["topic"] == "attendance"

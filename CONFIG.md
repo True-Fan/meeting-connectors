@@ -489,6 +489,14 @@ MC_GOOGLE_MEET__ATTENDANCE_PUSH_ENABLED=true   # tell the agent, so it can answe
 MC_GOOGLE_MEET__ATTENDANCE_PUSH_INTERVAL_S=5
 MC_GOOGLE_MEET__ATTENDANCE_PUSH_REQUIRE_NEGOTIATION=true   # false = skip the agent's
                                                            # handshake change; see below
+MC_GOOGLE_MEET__CAPTIONS_ENABLED=true          # record who said what; see below
+MC_GOOGLE_MEET__SPEAKER_TRACKING_ENABLED=true  # identify who is speaking; see below
+MC_GOOGLE_MEET__SPEAKER_PUSH_ENABLED=true      # tell the agent, silently
+MC_GOOGLE_MEET__SPEAKER_PUSH_INTERVAL_S=3
+MC_GOOGLE_MEET__SPEAKER_PUSH_REQUIRE_NEGOTIATION=true
+MC_GOOGLE_MEET__SPEAKER_HOLD_MS=1500           # how long somebody stays "the speaker"
+                                               # after they stop — speech has gaps
+MC_GOOGLE_MEET__SPEAKER_MERGE_GAP_MS=1200      # longer gap than this = a new turn
 
 # Not recommended. Only bootstraps an empty profile, and only works on an account with
 # no second factor — which is not a configuration for an account in customer meetings.
@@ -619,6 +627,236 @@ guessed at. Separately, the avatar was counting **itself** as an attendee, becau
 is only what Meet is *asked* to call it — a signed-in profile renders the Google account's own
 name instead. Self-detection now also uses Meet's "(you)" marker and the local part of
 `MC_GOOGLE_MEET__GOOGLE_EMAIL`.
+
+### Speakers — who is talking, and who said what
+
+`MC_GOOGLE_MEET__SPEAKER_TRACKING_ENABLED` (default `true`) answers two questions attendance
+cannot: **who is speaking right now**, and **who has spoken, in what order, and for how long**.
+
+**Read this part before changing anything here.** The audio the avatar receives is a *mix* — the
+page sums every remote track into one mono node before sampling it, which is what lets this
+connector run without a resampler anywhere. Attribution does not change that and could not be
+built from it. It is assembled from two observations taken *beside* the media path:
+
+* **the level of each remote track**, measured on an `AnalyserNode` branched off the node that
+  already feeds the mix. A branch, not a stage: the samples reaching the mix are identical and
+  arrive at the same time. Sampled every 200 ms, touching no DOM — it reads 512 bytes and does
+  arithmetic on them, which is why it can run faster than the DOM scans that force a layout.
+* **who it can only be.** If exactly one other person is in the meeting — an interview, which is
+  the case that matters most — whoever is speaking is that person. No markup is read, so nothing
+  Google ships can break it. This is the path that actually names the speaker today.
+
+Three weaker paths run alongside it and fill in the multi-person case: the participant tile a
+stream is rendered on (matched by `MediaStream.id`, then by the receiver's SSRC against any
+numeric attribute on a tile), the roster's `data-participant-id` → name mapping, and Meet's own
+speaking indicator. **The first live run is why the ordering is that way round:** levels were
+measured perfectly, three audio probes were active, and every turn came back "Someone" — because
+Meet does not render remote *audio* on an element inside the participant tile. The tile holds the
+video; the audio plays from elements Meet keeps elsewhere, so an audio stream's id never appears
+on a tile and never can.
+
+So the guarantees are: **no audio frame is retagged, re-timed, delayed, or re-mixed**, and every
+existing signal — `MIXED_SOURCE`, the 20 ms frame cadence, the 16 kHz capture context, the echo
+guard's strict mode — is exactly as it was. Turning this off changes ingest not at all.
+
+Read it back per session:
+
+```bash
+curl localhost:8000/sessions/ses_abc123/speakers
+```
+
+The response carries `current_speaker`, everyone `speaking_now` (plural, because people talk over
+each other), `talk_time_seconds` per person, the full `turns` list with start and end times, and
+an `agent_context` string written for a context window rather than for a parser.
+
+**Three behaviours worth knowing about, because each is a deliberate trade:**
+
+* **A pause does not end a turn.** Speech has gaps at every clause boundary, so stretches
+  separated by less than `SPEAKER_MERGE_GAP_MS` are one turn. Without it, one person talking for
+  a minute is forty turns and every talk-time figure is a sum of fragments.
+* **The current speaker survives a short silence** (`SPEAKER_HOLD_MS`). Asking who is speaking in
+  the gap between two sentences would otherwise answer "nobody" — true of that instant, and the
+  wrong answer to the question.
+* **Somebody who started talking before Meet drew their tile is renamed, not double-counted.**
+  The first sentence of a meeting is often heard before it can be attributed; the turn is
+  back-filled when the name arrives, including retroactively from the roster.
+* **A name arriving mid-remark claims the voice already being heard.** The energy path hears a
+  voice the instant it starts and cannot name it; Meet's caption names that voice a second or two
+  later. Both orders now collapse into one turn, so the agent is not told "Someone is speaking"
+  for the first half of every remark and then a name for the second half. It fails closed on
+  ambiguity — two anonymous voices, or somebody named already talking — because a confident wrong
+  name is worse than "Someone". Turns named this way are flagged `inferred`.
+
+**A muted participant is not the voice you are hearing, and that is what makes elimination work in
+a room of two.** Elimination is the most reliable attribution route here — no markup, nothing a
+Meet release can break — and it used to give up at two other participants, because naming one of
+two is a guess. But Meet writes `", muted"` into the same `aria-label` the roster already reads, so
+two others of whom one is muted is the same situation as one other: exactly one person it can be.
+That case cost a live meeting four minutes of wrong answers — one identity typing in the chat with
+its microphone off, another speaking, and captions naming the speaker only once they switched from
+Urdu to English. Mute state is a **tri-state**: unread (`null`) keeps somebody in the field of
+candidates, because an unreadable label must cost a name rather than invent one. And it narrows
+*speech* only — somebody muted can type in the chat all day, so a typed line is still eliminated
+against everyone present.
+
+**Speech and chat are different channels, and the brief says so.** A participant who has only
+typed has never taken the floor and never appears as a speaker. This mattered live: somebody spoke,
+the page could not name the voice, and the avatar — asked *"what is my name?"* — answered with the
+name of a **different** participant who had been typing. So an unattributed voice is now reported
+as unattributed *with the inference ruled out* ("do not assume it is whoever spoke or typed most
+recently"), a named one is marked as the person the avatar is being spoken to by, and the speaker
+paragraph states outright that it counts speech only. The guard is in the frame **before the first
+speaking edge**, not after it: somebody joining and talking immediately is the one moment the agent
+is asked a question by a voice it has been told nothing about, and it is precisely when the only
+name in the frame belongs to whoever was typing. An unattributed voice is also *narrowed* — "it is
+one of these people: A, B" — because naming the field is real information and withholding it is
+what left the model resolving the question from the chat history.
+
+**If speech is detected but nobody is named, the log now says so even when captions are working.**
+`speakerNothingSeen` reports `edges`, `attributed` and `attributedLive` — the last counting only
+routes fast enough to name a voice *while it is still talking*. Captions do not qualify: they land
+after Meet's transcription settles. Gating the report on `attributed` let four caption-derived
+names switch it off for a whole meeting in which the `speaking` selectors matched nothing at all,
+which is precisely the state it exists to explain. Those selectors remain **unverified against a
+live meeting**; the report prints the media elements, tiles and participant nodes the page actually
+has, so the next edit to them is a reading rather than another guess.
+
+**It also names a barge-in.** `SPEECH_INTERRUPT_ENABLED` previously told the agent "Someone
+raised their hand and wants to say something", because the mix carries no name. With speaker
+tracking on, the same handover names the person — the lookup happens on the frame that already
+triggered the interrupt, and a miss costs the name rather than the barge-in.
+
+**The push is silent, and that is not incidental.** Who is speaking is delivered as
+`kind="meeting_context"`, the same channel attendance uses — never as chat. A chat frame is a turn
+the avatar *says out loud*, so pushing speaker changes down it would have the avatar narrate the
+meeting: "Priya is speaking now", into the room, every time somebody took a breath. Sent on change
+only, so a still meeting sends nothing.
+
+**One brief, not two — and this one is a warning worth reading before adding a third.** An agent
+keeps *one* slot for standing context. Attendance and the speaker therefore travel in the same
+frame, under the unchanged `topic="attendance"`, from a single announcer. With two announcers the
+speaker brief — pushed every few seconds against a roster that changes once a meeting — displaced
+the attendance brief, and the avatar, asked who was in the meeting, answered *"Someone is present
+in the meeting"*: it had been told who was speaking and its knowledge of the roster had been
+evicted. That failure reads as attendance breaking, not as a push conflict, which is why the
+one-pusher rule is enforced in the session wiring and asserted in the tests.
+
+**A related fix, in the same area — and the third attempt at it, which is why it now rests on a
+fact rather than on a name.** The avatar used to count *itself* as a participant whenever its
+Google account's name was neither `DISPLAY_NAME` nor derived from `GOOGLE_EMAIL`: an account named
+"Backend Services" matched nothing, so attendance reported two people in a call with one other
+person, and attribution then credited that account with somebody else's speech.
+
+Name comparison failed three ways in live runs — `DISPLAY_NAME` is only what Meet is *asked* to
+call the avatar and a signed-in profile ignores it; Meet's "(you)" marker is not in the tile text
+the roster scan reads; and the Google account button is absent from the layout headless Chromium
+renders. So the page now identifies its own tile by **the track it published**: the self-view
+renders a camera clone the bridge minted and handed to Meet, so the tile whose `<video>` carries
+one of those track ids is the avatar's, whatever Meet calls it. `parse_roster` prefers that name
+over the configured one.
+
+That single fix corrects the attendance count, the chat and hand-raise self-filters, and both
+elimination paths — "is exactly one other person here" is only answerable once the avatar is not
+one of them.
+
+As with attendance, an agent that prefers to pull can set
+`MC_GOOGLE_MEET__SPEAKER_PUSH_ENABLED=false` and register a tool against the endpoint.
+
+**If nobody is ever attributed, the log says why rather than staying silent.** After 30 seconds in
+a call with nothing attributed, the page reports `meet_bridge.speaker_not_seen` with the counters
+that separate the two failures: `probes: 0` means the analysers never attached and the energy path
+is dead, while probes with `mapped: 0` means levels are being measured and nothing on the page
+says whose they are. That distinction is the fix, and it is a reading rather than a guess — the
+lesson the chat button and the hand indicator each cost a round of live testing to learn.
+
+### Transcript — who said what
+
+`MC_GOOGLE_MEET__CAPTIONS_ENABLED` (default `true`) is what makes the avatar able to answer
+*"what did they ask you?"* and *"what did Dev say?"* — for speech. **Chat is recorded in the same
+ledger** whenever `MC_GOOGLE_MEET__CHAT_ENABLED` is on, so a meeting held in the chat panel is a
+conversation the avatar can recall rather than one it answered and forgot (see *Typed lines* at the
+end of this section).
+
+**Why that needs its own feature, when the avatar obviously hears the meeting.** Two things are
+true at once and neither can become the other:
+
+* the agent's transcription receives **one mixed stream**, so it knows the words and can never know
+  whose they are;
+* this connector measures **audio levels**, so it knows who is talking and never what was said.
+
+Meet's caption panel is the one place in the meeting where a name and the words that person said
+appear together, because Meet transcribes per participant. So the page turns captions on, reads
+that panel, and Python keeps the ledger — see
+[transcript.py](src/connectors/google_meet/meeting/transcript.py).
+
+**Turning captions on is invisible to the meeting**, unlike opening the chat panel: Meet renders
+captions locally for whoever enabled them, and nobody else's caption setting changes.
+
+Read it back per session:
+
+```bash
+curl localhost:8000/sessions/ses_abc123/transcript
+```
+
+The recent lines also travel to the agent inside the meeting brief, so it can answer without a
+round trip — and, because each line is attributed, it can address the person who just spoke by
+name rather than answering into the room.
+
+**Three behaviours, each a deliberate trade:**
+
+* **A caption is not final when it appears.** Meet extends a line word by word while somebody
+  talks, so a line is forwarded only once it has stopped changing for `CAPTION_SETTLE_MS` (1.2 s).
+  Forwarding on sight would deliver one sentence as a dozen fragments.
+* **The avatar's own captioned turns are kept and marked**, not dropped. A transcript missing half a
+  conversation is not one; marking them stops the agent reading its own words back as a question.
+* **A caption is also the best speaker signal there is** — Meet naming somebody in words beats any
+  indicator this connector could match on — so it feeds the speaker tracker too.
+
+**"You" in a caption is the avatar, not a participant.** Captions render in the avatar's own
+browser, so Meet labels the *local* participant's lines "You" — and the local participant is the
+bridge. Those lines are kept (a transcript missing the avatar's half is not a conversation) and
+labelled `The avatar (you)`, which is what stops the agent reading its own greeting back as a
+question it was asked. The same rule removes the avatar from "who is speaking": it does not take
+the floor from itself.
+
+**Two honest caveats.** Captions are Meet's own ASR: wording is approximate and names and technical
+terms are often misheard, which is why the brief tells the agent so rather than presenting them as
+verbatim quotes. And they follow the meeting's caption language — a Hindi turn is captioned in
+Hindi only if Meet's caption language is set to it, otherwise it is transliterated or missed.
+
+**Where the name in a caption comes from, in order.** The block selectors match the element holding
+the *words*, and Meet renders the name in a sibling of it — a live run captured eleven lines and
+attributed none of them. So the reader tries, in order: the participant photo's `alt` (a name by
+definition, and an accessibility obligation rather than a build artefact), then the first rendered
+line of the caption row one or two levels up, and finally **elimination** — in a two-person meeting
+there is exactly one person the words can belong to, which needs no markup at all. Lines named that
+way are flagged `inferred` in the API response.
+
+**Typed lines are part of the conversation, and are marked as typed.** A live meeting was held
+entirely in chat — five questions typed, every one answered aloud — and the avatar, asked what had
+been discussed, described itself greeting somebody: each message had crossed the avatar socket once
+and been recorded nowhere, leaving a ledger of its own captioned voice. Chat now lands in the same
+ledger, rendered `Dev Choudhary (in chat): what is my name?`, and the brief tells the agent which
+lines were spoken and which were typed — an avatar must not report hearing somebody who never
+opened their microphone. Recorded **before** the `@mention` filter and including the avatar's own
+messages, because whether to *answer* a message is policy and what was *said* is history: a
+question two participants asked each other is not the avatar's to answer and is part of the
+conversation it will be asked to summarise.
+
+**If chat messages arrive with no sender, the log now says so.** Meet renders the sender's name in
+the row *above* the element the message selectors match — and groups consecutive messages from one
+person under a single heading — so a subtree search finds nothing, for every message, in every
+meeting. The page climbs to the row, carries a group's name forward to the messages under it, and
+falls back to **elimination** against the roster exactly as captions do. When every route misses,
+`chatSenderMissing` prints the row's text and every attribute on it and its ancestors, so the
+replacement selector is a reading rather than a guess; `chatMessagesSent` beside `chatAttributed`
+in `__MC_BRIDGE_STATS__` is what makes "chat works but names nobody" visible as a number.
+
+**If the transcript stays empty or unattributed, the log says which link failed.**
+`meet_bridge.captions_not_seen` reports `captions_on` (`false` = the button was never found, with
+the labels it did see), `captured` vs `attributed` (captions arriving but nameless), `block_shapes`
+(one rendered line means the selector matched the words and the name is elsewhere), `alts`, and
+`region_text` — the panel's actual contents. Every fix from here is a reading rather than a guess.
 
 ## 11.4 Container requirements
 

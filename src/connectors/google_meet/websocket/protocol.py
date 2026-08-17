@@ -144,6 +144,43 @@ class MeetMessageType(IntEnum):
     The page reports ``{id, name, isSelf}`` and makes no decision about whether to interrupt.
     Like ``CHAT_MESSAGE``, that judgement is the bridge's — see ``meeting/hand_raise.py``."""
 
+    ACTIVE_SPEAKER = 0x0E
+    """Page → bridge. One participant started or stopped speaking.
+
+    **Edge-triggered, like ``HAND_RAISE``, and for a stronger reason.** Speech is continuous:
+    a level signal would arrive several times a second per participant, on the same socket that
+    carries the meeting's audio. The page holds the current set and reports its transitions.
+
+    ``{trackId, id, name, speaking, source, level, heldMs}``. ``trackId`` is stable for the life
+    of the remote track and is the only field guaranteed to be present — ``id`` and ``name``
+    are filled in once the page can see which tile the stream is rendered on, which may be
+    *after* somebody has already started talking. A repeated ``speaking: true`` for the same
+    ``trackId`` is therefore an identity refresh rather than a new turn, so an open turn is
+    renamed instead of split (see ``meeting/active_speaker.py``).
+
+    ``source`` distinguishes the two independent observations: ``audio`` is per-track energy,
+    measured on an ``AnalyserNode`` branched off the source node that already feeds the mix, and
+    ``dom`` is Meet's own speaking indicator. The first says *when* and the second says *who*,
+    and neither is on the media path — **this message exists precisely so that attribution does
+    not have to be**. ``MIXED_SOURCE`` still holds for every audio frame: the capture graph
+    mixes before it samples, and adding a name to a frame would mean unmixing it."""
+
+    CAPTION = 0x0F
+    """Page → bridge. One settled line of Meet's own captions, with the name beside it.
+
+    **The only place in the page where a name and the words that person said appear together.**
+    Attribution here is built from audio levels and DOM observation, which say *who* is talking
+    but never *what*; the agent's transcription hears the words but receives one mixed stream and
+    so cannot attribute them. Meet's captions have both, because Meet transcribes per participant.
+
+    ``{speaker, text, isSelf}``. Sent when a caption has stopped changing — Meet extends a line
+    word by word as somebody keeps talking, so forwarding on sight would deliver a dozen fragments
+    of one sentence. The page decides only when a line is *final*; whether it is worth keeping,
+    whose it is, and what the agent is told are Python's (``meeting/transcript.py``).
+
+    Not on the media path in any sense: this is a DOM read of a small panel, rate limited like
+    chat, and it changes nothing about the audio the avatar sends or receives."""
+
     PAGE_EVENT = 0x0B
     """Page → bridge. Raw diagnostics — a track ended, the peer connection
     renegotiated, a device was revoked.

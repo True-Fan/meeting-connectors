@@ -312,3 +312,42 @@ class MeetingService:
         if connector_session is None:
             return None
         return getattr(connector_session, "attendance", None)
+
+    # -- who is speaking ---------------------------------------------------
+    #
+    # Duck-typed for exactly the reason attendance is, and the rule is worth restating rather
+    # than assumed: one connector can identify a speaker, because one connector has a browser to
+    # observe. Widening ``ConnectorSession`` would oblige Zoom and Teams to answer a question
+    # neither can — their audio arrives mixed too, and neither has a DOM to attribute it from.
+
+    def speaker_snapshot(self, session_id: SessionId) -> object | None:
+        """Who is speaking in this session's meeting, and who has, if its connector knows.
+
+        ``None`` covers the same three cases attendance's does — no such session, a connector
+        that does not track speakers, and tracking switched off — so the API maps it to a 404
+        rather than to an empty answer, which would read as "nobody has spoken".
+        """
+        tracker = self._speakers(session_id)
+        return tracker.snapshot() if tracker is not None else None
+
+    def _speakers(self, session_id: SessionId) -> Any | None:
+        connector_session = self._supervisor.get(session_id)
+        if connector_session is None:
+            return None
+        return getattr(connector_session, "speakers", None)
+
+    def transcript_snapshot(self, session_id: SessionId) -> object | None:
+        """What each participant said, if this session's connector records it.
+
+        Duck-typed like the two above, and ``None`` for the same three distinguishable cases — no
+        such session, a connector that cannot transcribe, and captions switched off — so the API
+        can say which rather than returning an empty conversation.
+        """
+        transcript = self._transcript(session_id)
+        return transcript.snapshot() if transcript is not None else None
+
+    def _transcript(self, session_id: SessionId) -> Any | None:
+        connector_session = self._supervisor.get(session_id)
+        if connector_session is None:
+            return None
+        return getattr(connector_session, "transcript", None)

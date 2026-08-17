@@ -188,6 +188,8 @@ def _router(
     speech: SpeechDetector | None,
     pcm: bytes = SPEECH,
     hands: ScriptedHandRaiseSource | None = None,
+    speaker_provider: object | None = None,
+    voice_prompt_template: str = "",
 ) -> tuple[MediaRouter, Pacer, FakeAvatarTransport]:
     clock = MediaClock()
     pacer = Pacer(
@@ -217,6 +219,8 @@ def _router(
         hand_raise_mute_ms=800,
         speech=speech,
         voice_prompt=PROMPT,
+        speaker_provider=speaker_provider,  # type: ignore[arg-type]
+        voice_prompt_template=voice_prompt_template,
     )
     return router, pacer, transport
 
@@ -357,3 +361,88 @@ class TestTheHandover:
             assert transport.sent_control == []
             assert not pacer.is_muted
             assert router.stats["forwarded"] > 5
+
+
+NAMED_TEMPLATE = "{name} wants to say something. Stop talking and let them speak."
+
+
+class TestWhoInterrupted:
+    """Naming the person who took the floor by talking.
+
+    The inbound mix carries no attribution on any connector, so this leg has always reported
+    "Someone" — true, and the least useful thing an interruption can say to an agent that is
+    about to answer whoever just spoke. A connector able to identify the speaker *beside* the
+    media path may now supply the name, and the important half of that sentence is "beside":
+    nothing here changes what is on the audio path, and the lookup happens on the frame that
+    already triggered the barge-in.
+    """
+
+    async def test_the_speaker_is_named_when_the_connector_knows_them(
+        self, frame_ctx: FrameContext
+    ) -> None:
+        router, pacer, transport = _router(
+            frame_ctx,
+            speech=SpeechDetector(),
+            speaker_provider=lambda: "Priya Menon",
+            voice_prompt_template=NAMED_TEMPLATE,
+        )
+        async with _avatar_talking(pacer, frame_ctx), _running(router):
+            await _wait_for(lambda: len(transport.sent_control) > 0)
+
+            frame = transport.sent_control[0]
+            assert "Priya Menon wants to say something" in frame
+            assert "Someone" not in frame
+
+    async def test_an_unknown_speaker_still_takes_the_floor(
+        self, frame_ctx: FrameContext
+    ) -> None:
+        """A miss costs the name and never the handover — the two are decided independently,
+        which is what stops attribution from ever delaying the avatar falling silent."""
+        router, pacer, transport = _router(
+            frame_ctx,
+            speech=SpeechDetector(),
+            speaker_provider=lambda: None,
+            voice_prompt_template=NAMED_TEMPLATE,
+        )
+        async with _avatar_talking(pacer, frame_ctx), _running(router):
+            await _wait_for(lambda: len(transport.sent_control) > 0)
+
+            assert PROMPT in transport.sent_control[0]
+            assert pacer.stats["interrupted"] >= 1
+
+    async def test_a_provider_that_raises_costs_the_name_and_nothing_else(
+        self, frame_ctx: FrameContext
+    ) -> None:
+        """This runs on the inbound audio leg. An exception escaping it would take the leg
+        down, and with it the meeting's audio in both directions — for a display name."""
+
+        def broken() -> str:
+            raise RuntimeError("the tracker is unhappy")
+
+        router, pacer, transport = _router(
+            frame_ctx,
+            speech=SpeechDetector(),
+            speaker_provider=broken,
+            voice_prompt_template=NAMED_TEMPLATE,
+        )
+        async with _avatar_talking(pacer, frame_ctx), _running(router):
+            await _wait_for(lambda: len(transport.sent_control) > 0)
+
+            assert PROMPT in transport.sent_control[0]
+            assert router.stats["forwarded"] > 0, "the inbound leg kept running"
+
+    async def test_a_broken_template_costs_the_wording_rather_than_the_feature(
+        self, frame_ctx: FrameContext
+    ) -> None:
+        """The template is operator-supplied, so a stray brace must not reach the agent as an
+        exception on the audio leg — the same trade ``render_prompt`` makes."""
+        router, pacer, transport = _router(
+            frame_ctx,
+            speech=SpeechDetector(),
+            speaker_provider=lambda: "Priya Menon",
+            voice_prompt_template="{nome} said {",
+        )
+        async with _avatar_talking(pacer, frame_ctx), _running(router):
+            await _wait_for(lambda: len(transport.sent_control) > 0)
+
+            assert PROMPT in transport.sent_control[0]

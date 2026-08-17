@@ -28,6 +28,7 @@ from src.connectors.google_meet.meeting.chat import (
     parse_chat_message,
     strip_mention,
 )
+from src.connectors.google_meet.meeting.participants import MeetParticipant, MeetRoster
 from src.domain.avatar import (
     AVATAR_CHAT_MIN_VERSION,
     AVATAR_PROTOCOL_VERSION,
@@ -227,6 +228,99 @@ class TestMentionMatching:
 
     def test_no_names_means_nothing_is_addressed(self) -> None:
         assert strip_mention("@AI Avatar hello", ()) is None
+
+
+class TestAttribution:
+    """Putting a name on a message the page could not name.
+
+    **The failure, in full, because the fix looks optional until you see it.** A live meeting
+    forwarded five typed questions to the agent and every one carried ``sender=None`` — the page's
+    sender selectors search the message's own subtree, and Meet renders the name in the row above
+    it. The agent is told ``"<sender>: <text>"`` and has no other way to learn who is talking to
+    it, so it received five anonymous lines, answered *"I don't know your name"*, and could not say
+    who had asked it anything. The roster had named the only other participant in the call before
+    the first of those messages was sent.
+
+    Reading the markup properly is fixed in ``bridge.js``. This is the half that cannot break with
+    Meet's next redesign.
+    """
+
+    def _source(self, **kwargs: object) -> MeetChatSource:
+        return MeetChatSource(clock=MediaClock(), require_mention=False, **kwargs)  # type: ignore[arg-type]
+
+    def _roster(self, *names: str, self_name: str = "AI Avatar") -> MeetRoster:
+        return MeetRoster(
+            participants=(
+                *(
+                    MeetParticipant(page_id=f"p{index}", display_name=name)
+                    for index, name in enumerate(names)
+                ),
+                MeetParticipant(page_id="self", display_name=self_name, is_self=True),
+            ),
+            self_name=self_name,
+        )
+
+    async def test_an_unattributed_message_is_credited_to_the_only_other_person(self) -> None:
+        source = self._source()
+        await source.start()
+        source.observe_roster(self._roster("Backend Services"))
+
+        assert source.offer({"text": "what is my name?"}, message_id="m1")
+
+        message = await asyncio.wait_for(anext(source.messages()), timeout=1)
+        assert message.sender == "Backend Services"
+
+    async def test_a_name_the_page_read_is_never_overridden(self) -> None:
+        source = self._source()
+        await source.start()
+        source.observe_roster(self._roster("Backend Services"))
+
+        assert source.offer({"text": "hello", "sender": "Priya"}, message_id="m1")
+
+        message = await asyncio.wait_for(anext(source.messages()), timeout=1)
+        assert message.sender == "Priya"
+
+    async def test_with_two_others_it_stays_unattributed(self) -> None:
+        """A confidently wrong "Priya asked…" is worse for every answer downstream than a
+        question with no name on it."""
+        source = self._source()
+        await source.start()
+        source.observe_roster(self._roster("Dev", "Priya"))
+
+        assert source.offer({"text": "hello"}, message_id="m1")
+
+        message = await asyncio.wait_for(anext(source.messages()), timeout=1)
+        assert message.sender is None
+
+    async def test_the_avatar_is_never_the_only_other_person(self) -> None:
+        """Self-detection can fail, leaving the avatar as the sole "other" in the roster.
+        Attributing a message to it would have the agent answer itself by name."""
+        source = self._source(mention_names=("AI Avatar",))
+        await source.start()
+        source.observe_roster(
+            MeetRoster(participants=(MeetParticipant(page_id="p0", display_name="AI Avatar"),))
+        )
+
+        assert source.offer({"text": "hello"}, message_id="m1")
+
+        message = await asyncio.wait_for(anext(source.messages()), timeout=1)
+        assert message.sender is None
+
+    def test_the_roster_also_teaches_it_the_name_it_answers_to(self) -> None:
+        """One listener, both facts. ``display_name`` is not the name a signed-in profile joins
+        under, so the roster is the only place the mention name can come from — and the roster is
+        now also what names an unattributed sender."""
+        source = self._source()
+        source.observe_roster(self._roster("Dev", self_name="Backend Services"))
+
+        assert "Backend Services" in source.mention_names
+
+    def test_a_malformed_roster_costs_nothing(self) -> None:
+        """This runs on the bridge's read loop, which is the media channel."""
+        source = self._source()
+        source.observe_roster("not a roster")  # type: ignore[arg-type]
+
+        assert source.offer({"text": "hello"}, message_id="m1")
 
 
 class TestMentionPolicy:

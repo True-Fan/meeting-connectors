@@ -19,6 +19,7 @@ from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
 from typing import Any
 
+from src.connectors.google_meet.meeting.participants import MeetRoster
 from src.domain.health import ComponentHealth
 from src.domain.meeting import ChatMessage
 from src.infrastructure.logging import get_logger
@@ -144,6 +145,7 @@ class MeetChatSource:
         "_dropped",
         "_ignored",
         "_mention_names",
+        "_others",
         "_queue",
         "_received",
         "_require_mention",
@@ -169,6 +171,8 @@ class MeetChatSource:
         self._started = False
         self._require_mention = require_mention
         self._mention_names: tuple[str, ...] = ()
+        # Everyone but the avatar, from the roster — what ``_only_other`` eliminates against.
+        self._others: tuple[str, ...] = ()
         self._warned_nameless = False
         for name in mention_names:
             self.observe_self_name(name)
@@ -207,6 +211,48 @@ class MeetChatSource:
         self._mention_names = (*self._mention_names, cleaned)
         logger.info("meet_chat.mention_name", name=cleaned, total=len(self._mention_names))
 
+    def observe_roster(self, roster: MeetRoster) -> None:
+        """Learn the avatar's rendered name, and who else is in the meeting. Never raises.
+
+        Registered as a roster listener, so this runs on the bridge's read loop — dict work over
+        a handful of names, on rosters the bridge has already deduplicated.
+
+        The second half is what ``_only_other`` needs. It is the same elimination the transcript
+        and the speaker tracker each do, applied where it was missing: a message whose sender the
+        page could not read is still, in a two-person meeting, from the one other person present.
+        """
+        try:
+            self.observe_self_name(roster.self_name)
+            for participant in roster.participants:
+                if participant.is_self:
+                    self.observe_self_name(participant.display_name)
+            others: list[str] = []
+            for participant in roster.others:
+                name = " ".join(str(participant.display_name or "").split())
+                if not name or self._is_self(name):
+                    continue
+                if not any(name.casefold() == known.casefold() for known in others):
+                    others.append(name)
+            self._others = tuple(others)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("meet_chat.roster_failed", error=str(exc))
+
+    def _is_self(self, name: str | None) -> bool:
+        if not name:
+            return False
+        return any(name.casefold() == known.casefold() for known in self._mention_names)
+
+    def _only_other(self) -> str | None:
+        """The single other participant, when there is exactly one and it is not us.
+
+        Fails closed on two or more: naming one of them would be a guess, and a confidently wrong
+        "Priya asked…" is worse for every downstream answer than an unattributed question.
+        """
+        if len(self._others) != 1:
+            return None
+        candidate = self._others[0]
+        return None if self._is_self(candidate) else candidate
+
     async def start(self) -> None:
         self._started = True
 
@@ -238,6 +284,17 @@ class MeetChatSource:
         if message is None:
             return False
 
+        attributed_by = str(body.get("senderFrom") or "page") if message.sender else "none"
+        if message.sender is None and not message.is_self:
+            # **The name matters as much as the words, and it was missing on every message.** The
+            # agent is told "<sender>: <text>" and has no other way to learn who is talking to it;
+            # with no sender it received an anonymous line and answered "I don't know your name"
+            # to somebody the roster had named all along.
+            inferred = self._only_other()
+            if inferred is not None:
+                message = replace(message, sender=inferred)
+                attributed_by = "elimination"
+
         message = self._addressed(message)
         if message is None:
             return False
@@ -258,6 +315,10 @@ class MeetChatSource:
         logger.info(
             "meet_chat.received",
             sender=message.sender,
+            # How the name was arrived at: a selector on the row, the group heading above it,
+            # elimination against the roster, or nothing. ``sender=None`` was logged for a whole
+            # meeting and said nothing about *why*, which is the only reason it survived.
+            attributed_by=attributed_by,
             chars=len(message.text),
             is_self=message.is_self,
             total=self._received,

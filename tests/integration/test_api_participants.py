@@ -15,21 +15,32 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.api.app import create_app
+from src.connectors.google_meet.meeting.active_speaker import SpeakerTracker
 from src.connectors.google_meet.meeting.attendance import AttendanceLedger
 from src.connectors.google_meet.meeting.participants import MeetParticipant, MeetRoster
+from src.connectors.google_meet.meeting.transcript import MeetTranscript
 from src.containers import Container
 from src.domain.health import HealthReport
 from src.domain.ids import new_correlation_id, new_session_id
 from src.domain.meeting import MeetingContext, MeetingPlatform
 from src.domain.session import SessionContext
+from src.services.media.clock import MediaClock
 
 
 class _StubMeetSession:
-    """The shape ``SessionSupervisor`` drives, plus the ``attendance`` property Meet adds."""
+    """The shape ``SessionSupervisor`` drives, plus the two properties Meet adds."""
 
-    def __init__(self, session: SessionContext, ledger: AttendanceLedger | None) -> None:
+    def __init__(
+        self,
+        session: SessionContext,
+        ledger: AttendanceLedger | None,
+        speakers: SpeakerTracker | None = None,
+        transcript: MeetTranscript | None = None,
+    ) -> None:
         self._session = session
         self._ledger = ledger
+        self._speakers = speakers
+        self._transcript = transcript
 
     @property
     def session(self) -> SessionContext:
@@ -38,6 +49,14 @@ class _StubMeetSession:
     @property
     def attendance(self) -> AttendanceLedger | None:
         return self._ledger
+
+    @property
+    def speakers(self) -> SpeakerTracker | None:
+        return self._speakers
+
+    @property
+    def transcript(self) -> MeetTranscript | None:
+        return self._transcript
 
     async def start(self) -> None: ...
 
@@ -68,7 +87,12 @@ def client(container: Container) -> Iterator[TestClient]:
         yield test_client
 
 
-def _supervise(container: Container, ledger: AttendanceLedger | None) -> str:
+def _supervise(
+    container: Container,
+    ledger: AttendanceLedger | None,
+    speakers: SpeakerTracker | None = None,
+    transcript: MeetTranscript | None = None,
+) -> str:
     """Make a stub session visible to ``MeetingService``, and return its id.
 
     Registered into the supervisor's lookup rather than through ``supervise()``, which also
@@ -86,7 +110,7 @@ def _supervise(container: Container, ledger: AttendanceLedger | None) -> str:
         ),
     )
     container.session_supervisor()._sessions[session.session_id] = _StubMeetSession(
-        session, ledger
+        session, ledger, speakers, transcript
     )
     return session.session_id
 
@@ -151,6 +175,102 @@ class TestGetParticipants:
         assert "attendance" in response.json()["detail"].lower()
 
 
+def _speaking(*, name: str | None = "Priya Menon", track: str = "t1") -> dict[str, object]:
+    return {
+        "trackId": track,
+        "id": "",
+        "name": name,
+        "speaking": True,
+        "source": "audio",
+        "level": 0.09,
+    }
+
+
+class TestGetSpeakers:
+    """The same duck-typed seam, for the speaker tracker.
+
+    Registered through the supervisor for the reason attendance is: what is under test is that
+    ``MeetingService`` reaches ``speakers`` by ``getattr`` and never learns Google Meet exists.
+    A renamed attribute would turn every answer into a 404, silently.
+    """
+
+    def test_it_reports_who_is_speaking_now(
+        self, client: TestClient, container: Container
+    ) -> None:
+        tracker = SpeakerTracker(clock=MediaClock())
+        tracker.offer(_speaking())
+        session_id = _supervise(container, None, tracker)
+
+        body = client.get(f"/sessions/{session_id}/speakers").json()
+
+        assert body["current_speaker"] == "Priya Menon"
+        assert body["speaking_now"] == ["Priya Menon"]
+        assert body["turns"][0]["speaking"] is True
+        assert body["events"] == 1
+
+    def test_it_reports_the_turns_and_the_time_each_person_held_the_floor(
+        self, client: TestClient, container: Container
+    ) -> None:
+        tracker = SpeakerTracker(clock=MediaClock(), merge_gap_ms=0)
+        tracker.offer(_speaking(name="Aarav Sharma", track="t1"))
+        tracker.offer({**_speaking(name="Aarav Sharma", track="t1"), "speaking": False})
+        tracker.offer(_speaking(name="Priya Menon", track="t2"))
+        session_id = _supervise(container, None, tracker)
+
+        body = client.get(f"/sessions/{session_id}/speakers").json()
+
+        assert [t["speaker"] for t in body["turns"]] == ["Aarav Sharma", "Priya Menon"]
+        assert dict(body["talk_time_seconds"]).keys() == {"Aarav Sharma", "Priya Menon"}
+        assert "Priya Menon is speaking right now" in body["agent_context"]
+
+    def test_a_session_that_does_not_track_speakers_is_a_404(
+        self, client: TestClient, container: Container
+    ) -> None:
+        """Tracking switched off must not read as "nobody has spoken"."""
+        session_id = _supervise(container, AttendanceLedger(), None)
+
+        response = client.get(f"/sessions/{session_id}/speakers")
+
+        assert response.status_code == 404
+        assert "speaker" in response.json()["detail"].lower()
+
+    def test_unknown_session_is_a_404(self, client: TestClient) -> None:
+        assert client.get("/sessions/ses_missing/speakers").status_code == 404
+
+
+class TestGetTranscript:
+    """The attributed conversation, over the same duck-typed seam."""
+
+    def test_it_reports_who_said_what(self, client: TestClient, container: Container) -> None:
+        transcript = MeetTranscript()
+        transcript.offer({"speaker": "Dev Choudhary", "text": "Tell me about India Gate"})
+        transcript.offer({"speaker": "Priya Menon", "text": "And Delhi?"})
+        session_id = _supervise(container, None, None, transcript)
+
+        body = client.get(f"/sessions/{session_id}/transcript").json()
+
+        assert body["speakers"] == ["Dev Choudhary", "Priya Menon"]
+        assert [line["text"] for line in body["lines"]] == [
+            "Tell me about India Gate",
+            "And Delhi?",
+        ]
+        assert "Dev Choudhary: Tell me about India Gate" in body["agent_context"]
+
+    def test_a_session_without_captions_is_a_404(
+        self, client: TestClient, container: Container
+    ) -> None:
+        """Captions switched off must not read as "nobody said anything"."""
+        session_id = _supervise(container, AttendanceLedger(), None, None)
+
+        response = client.get(f"/sessions/{session_id}/transcript")
+
+        assert response.status_code == 404
+        assert "transcript" in response.json()["detail"].lower()
+
+    def test_unknown_session_is_a_404(self, client: TestClient) -> None:
+        assert client.get("/sessions/ses_missing/transcript").status_code == 404
+
+
 class TestSeedInvitees:
     def test_seeding_makes_never_joined_answerable(
         self, client: TestClient, container: Container
@@ -201,6 +321,9 @@ class TestPlatformBlindness:
         assert "invitees" not in create, (
             "the invite list is a separate call so the join contract stays platform-blind"
         )
-        assert {"/sessions/{session_id}/participants", "/sessions/{session_id}/invitees"} <= set(
-            schema["paths"]
-        )
+        assert {
+            "/sessions/{session_id}/participants",
+            "/sessions/{session_id}/invitees",
+            "/sessions/{session_id}/speakers",
+            "/sessions/{session_id}/transcript",
+        } <= set(schema["paths"])
