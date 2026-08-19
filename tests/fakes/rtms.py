@@ -106,6 +106,30 @@ class FakeRtmsTransport:
             }
         )
 
+    def push_transcript(
+        self, text: str, *, user_id: int = 42, user_name: str = "Human"
+    ) -> None:
+        """One line of Zoom's live transcription, in the envelope shape RTMS uses.
+
+        The envelope rather than a bare string, because that is what the multi-stream
+        subscription produces and it is the shape that carries the name — which is the
+        entire reason this stream is subscribed to at all.
+        """
+        self.push(
+            {
+                "msg_type": int(RtmsMessageType.MEDIA_DATA_TRANSCRIPT),
+                "content": {"data": text, "user_id": user_id, "user_name": user_name},
+            }
+        )
+
+    def push_chat(self, text: str, *, user_id: int = 42, user_name: str = "Human") -> None:
+        self.push(
+            {
+                "msg_type": int(RtmsMessageType.MEDIA_DATA_CHAT),
+                "content": {"data": text, "user_id": user_id, "user_name": user_name},
+            }
+        )
+
     def push_keepalive(self, timestamp: int = 12345) -> None:
         self.push({"msg_type": int(RtmsMessageType.KEEP_ALIVE_REQ), "timestamp": timestamp})
 

@@ -16,24 +16,54 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+from collections.abc import Callable
 from contextlib import suppress
 from hmac import compare_digest
+from typing import Any
 
 from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import WebSocketException
 from websockets.http11 import Request, Response
 
+from src.connectors.zoom_web.page.protocol import decode_event
 from src.infrastructure.logging import get_logger
 
 logger = get_logger(__name__)
 
 TOKEN_QUERY_KEY = "token"
 
+EventHandler = Callable[[dict[str, Any]], None]
+"""What a decoded page event is handed to.
+
+**Synchronous and obliged not to raise**, because it is called from this server's read loop.
+An async handler would let a slow listener hold up the socket that also carries the avatar's
+voice into the page, and an exception would drop the connection — which is the avatar going
+mute because a hand-raise observer had a bad day. Every handler in this connector is written
+to that rule, and ``_dispatch`` enforces it anyway."""
+
 
 class PageAudioServer:
-    """Serves the avatar's PCM to the one page that presents this session's token."""
+    """Serves the avatar's PCM to the page, and receives what only the page can see.
 
-    __slots__ = ("_clients", "_host", "_port", "_ready", "_server", "_token")
+    **Named for what it was, and it now carries a second, much smaller thing.** Audio out is
+    still the whole reason it exists: everything about the socket — the ephemeral port, the
+    per-session token, the broadcast to every attached frame — is shaped by that. The return
+    direction is a handful of JSON events a minute reporting a raised hand, which is the one
+    signal Zoom's API does not offer and a browser can see. Renaming the class for a feature
+    that is a rounding error on its traffic would cost every reader who knows it by this name.
+    """
+
+    __slots__ = (
+        "_clients",
+        "_events_dropped",
+        "_events_received",
+        "_handler",
+        "_host",
+        "_port",
+        "_ready",
+        "_server",
+        "_token",
+    )
 
     def __init__(self, *, host: str = "127.0.0.1") -> None:
         self._host = host
@@ -42,6 +72,9 @@ class PageAudioServer:
         self._server: Server | None = None
         self._clients: set[ServerConnection] = set()
         self._ready = asyncio.Event()
+        self._handler: EventHandler | None = None
+        self._events_received = 0
+        self._events_dropped = 0
 
     @property
     def endpoint(self) -> str:
@@ -55,6 +88,24 @@ class PageAudioServer:
     @property
     def attached_pages(self) -> int:
         return len(self._clients)
+
+    @property
+    def events_received(self) -> int:
+        return self._events_received
+
+    @property
+    def events_dropped(self) -> int:
+        """Frames the page sent that were not usable events. Non-zero means script skew."""
+        return self._events_dropped
+
+    def set_event_handler(self, handler: EventHandler | None) -> None:
+        """Register what page events are delivered to. Replaces any previous handler.
+
+        One handler rather than a listener list, because there is one consumer and a fan-out
+        with no second subscriber is a shape maintained for nobody. The session fans out in
+        Python if it ever needs to, where the cost of getting it wrong is visible.
+        """
+        self._handler = handler
 
     async def start(self) -> None:
         """Bind the loopback socket. Idempotent."""
@@ -135,12 +186,50 @@ class PageAudioServer:
         self._ready.set()
         logger.info("zoom_web.page_connected", attached=len(self._clients))
         try:
-            # The page never speaks; holding the handler open is what keeps the
-            # connection alive for us to send on.
-            async for _ in connection:
-                pass
+            # Iterating is also what keeps the connection alive for us to send on, which
+            # is the only thing this loop used to do — the page had nothing to say.
+            async for message in connection:
+                self._dispatch(message)
         except WebSocketException:
             pass
         finally:
             self._clients.discard(connection)
             logger.info("zoom_web.page_disconnected", attached=len(self._clients))
+
+    def _dispatch(self, message: str | bytes) -> None:
+        """Decode one page frame and hand it to the handler. Never raises.
+
+        **Every frame from every attached page is dispatched**, and the duplication that
+        implies is deliberate. ``add_init_script`` runs in every frame Chromium creates, so
+        several sockets exist and any of them may be the one whose DOM has the participant
+        panel in it — there is no way here to tell which. Filtering to one would risk
+        listening to the wrong frame; dispatching all of them costs a duplicate hand-raise
+        event, which is exactly what the per-participant cooldown downstream is for.
+
+        The handler's exceptions are swallowed for the reason ``RtmsService._notify``
+        swallows its observer's: this is the loop that carries the avatar's voice into the
+        page, and a bookkeeping listener may not be able to close it.
+        """
+        event = decode_event(message)
+        if event is None:
+            self._events_dropped += 1
+            if self._events_dropped == 1:
+                logger.warning(
+                    "zoom_web.page_event_unusable",
+                    note="the page sent a frame that is not a JSON event; the injected "
+                    "script and this build may have drifted apart",
+                )
+            return
+
+        self._events_received += 1
+        handler = self._handler
+        if handler is None:
+            return
+        try:
+            handler(event)
+        except Exception as exc:
+            logger.warning(
+                "zoom_web.page_event_handler_failed",
+                event_type=event.get("type"),
+                error=str(exc),
+            )

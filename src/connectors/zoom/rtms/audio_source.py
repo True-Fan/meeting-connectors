@@ -35,6 +35,7 @@ from src.connectors.zoom.rtms.mapping import (
     negotiated_audio_format,
     rtms_attachment,
 )
+from src.connectors.zoom.rtms.observations import MeetingObserver
 from src.connectors.zoom.rtms.service import RtmsService, TransportFactory
 from src.domain.context import FrameContext
 from src.domain.health import ComponentHealth, ComponentState
@@ -79,6 +80,7 @@ class RtmsAudioSource:
         "_detail",
         "_meeting_uuid",
         "_metrics",
+        "_observer",
         "_per_participant_audio",
         "_policy",
         "_queue",
@@ -89,6 +91,9 @@ class RtmsAudioSource:
         "_signature",
         "_state",
         "_stream_id",
+        "_subscribe_chat",
+        "_subscribe_events",
+        "_subscribe_transcript",
         "_task",
         "_transport_factory",
     )
@@ -109,6 +114,10 @@ class RtmsAudioSource:
         transport_factory: TransportFactory | None = None,
         attach_wait_poll_s: float = DEFAULT_ATTACH_WAIT_POLL_S,
         attach_wait_timeout_s: float = DEFAULT_ATTACH_WAIT_TIMEOUT_S,
+        observer: MeetingObserver | None = None,
+        subscribe_transcript: bool = False,
+        subscribe_chat: bool = False,
+        subscribe_events: bool = False,
     ) -> None:
         # The RTMS attachment (meeting_uuid, stream id, signaling url, signature) is
         # deliberately *not* a constructor argument: it may not exist yet. ``session``
@@ -131,6 +140,14 @@ class RtmsAudioSource:
         self._transport_factory = transport_factory
         self._attach_wait_poll_s = attach_wait_poll_s
         self._attach_wait_timeout_s = attach_wait_timeout_s
+        # Carried rather than acted on: this class owns retry and health, and the service
+        # owns the protocol. These four are protocol, so they are handed to every service
+        # this source builds — including the one a reconnect builds, which is what stops a
+        # dropped connection from silently returning without the text streams.
+        self._observer = observer
+        self._subscribe_transcript = subscribe_transcript
+        self._subscribe_chat = subscribe_chat
+        self._subscribe_events = subscribe_events
 
         self._queue: BoundedFrameQueue[AudioFrame] = BoundedFrameQueue(
             name="rtms_inbound",
@@ -223,7 +240,19 @@ class RtmsAudioSource:
                 return
 
     def health(self) -> ComponentHealth:
-        return ComponentHealth(name=COMPONENT_NAME, state=self._state, detail=self._detail)
+        """Current state, with a refused text subscription named in the detail.
+
+        A degraded text subscription never changes the *state*: audio is flowing, the
+        session is serving, and reporting otherwise would have the supervisor act on a
+        feature that is off. It appears in the detail because the symptom shows up somewhere
+        else entirely — an avatar that hears everything and can name nobody — and an operator
+        should not have to correlate that with a warning logged at attach time.
+        """
+        detail = self._detail
+        degraded = self._current.text_degraded if self._current is not None else None
+        if degraded:
+            detail = f"{detail}; {degraded}" if detail else degraded
+        return ComponentHealth(name=COMPONENT_NAME, state=self._state, detail=detail)
 
     # -- internals ---------------------------------------------------------
 
@@ -323,6 +352,10 @@ class RtmsAudioSource:
             per_participant_audio=self._per_participant_audio,
             metrics=self._metrics,
             transport_factory=self._transport_factory,
+            observer=self._observer,
+            subscribe_transcript=self._subscribe_transcript,
+            subscribe_chat=self._subscribe_chat,
+            subscribe_events=self._subscribe_events,
         )
 
     async def _supervise(self, service: RtmsService) -> None:

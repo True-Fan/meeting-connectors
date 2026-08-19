@@ -687,6 +687,291 @@ class ZoomWebSettings(BaseModel):
             return None
         return value.expanduser().resolve()
 
+    echo_gate_hangover_ms: int | None = None
+    """How long after the avatar stops publishing the echo gate keeps withholding inbound
+    audio. ``None`` uses the shared ``MC_MEDIA__ECHO_GATE_HANGOVER_MS`` (200 ms).
+
+    **This connector needs a far longer hangover than the shared default, and the reason is
+    specific to it.** RTMS delivers the meeting's mix *including the avatar*, so the avatar's
+    own voice comes back — page → Zoom encode → Zoom mix → RTMS → us — with a round trip well
+    over a second. A mixed stream carries no per-frame attribution, so ``SelfAudioFilter``
+    cannot bite (it matches on a name that is only present with per-participant audio), which
+    leaves the speaking gate as the only defence. At 200 ms the gate reopens long before the
+    *tail* of each utterance arrives, and that tail is forwarded to the agent, transcribed,
+    and answered.
+
+    Observed exactly that way in a live meeting with the human's microphone muted — so the
+    only audio in the mix was the avatar's own. Every "user" turn the agent received was the
+    final word of the avatar's own preceding sentence:
+
+        avatar: "...কোনো সাহায্য প্রয়োজন?"   →   user: "প্রয়োজন।"
+        avatar: "...কীভাবে সাহায্য করতে পারি।" →   user: "পারি।"
+
+    The agent then answered its own words, in a loop.
+
+    **Why 200 ms was right where it was chosen and wrong here.** It was tuned for a connector
+    whose barge-in depends on *hearing* the interruption — a shut gate drops the interrupting
+    voice along with the echo, so the window had to stay small. This connector does not
+    detect barge-in from audio at all: it uses Zoom's ``ACTIVE_SPEAKER_CHANGE`` event on the
+    signaling socket, which arrives whether or not the gate is withholding frames. So the
+    gate can be as conservative as the echo requires, and costs nothing it used to cost.
+
+    Raise it if the agent still answers its own tail; lower it if the first word of a reply
+    to the avatar is being clipped. The gate is also released the moment an interruption is
+    delivered, so a barge-in does not have to wait this out — see ``MediaRouter._yield_floor``.
+    """
+
+    # -- meeting awareness -------------------------------------------------
+    #
+    # **Almost everything below is served by RTMS rather than by the browser**, which is
+    # the structural difference from ``GoogleMeetSettings``. Zoom reports who joined, who
+    # left, who is speaking, what each person said and what they typed — each with a name
+    # attached — so these switches turn *subscriptions and ledgers* on and off rather than
+    # DOM observers. The one exception is ``hand_raise_enabled``, because RTMS has no
+    # hand-raise event and the indicator exists only on screen.
+
+    rtms_transcript_enabled: bool = True
+    """Subscribe to Zoom's live transcript, so the avatar knows **who said what**.
+
+    This is what makes an avatar able to answer *"what did they ask you?"* and *"what did
+    Dev say?"*, and those questions are otherwise unanswerable in principle: the avatar's
+    own transcription lives in the agent, which receives one mixed stream and knows the
+    words without knowing whose they are, while this connector knows who is speaking
+    without knowing the words. Zoom transcribes per participant, so its transcript is the
+    only place the two arrive together.
+
+    **Requires RTMS transcription to be enabled for the app on the Zoom account.** If it is
+    not, Zoom refuses the data handshake — and because a refused handshake ends the whole
+    connection, the connector retries once with audio alone rather than letting the avatar
+    go deaf. The reason then appears in the ingest component's health detail. Set this
+    false to stop asking.
+
+    Invisible to the meeting: nobody sees the avatar enable anything, and no participant's
+    own caption setting changes."""
+
+    rtms_chat_enabled: bool = True
+    """Subscribe to the meeting's chat over RTMS.
+
+    Zoom delivers each message with the sender's name, so no panel is opened and nothing is
+    scraped — the whole visible-UI-action objection that makes ``chat_enabled`` a judgement
+    call on Google Meet does not apply here. Same handshake caveat as
+    ``rtms_transcript_enabled``.
+
+    This controls whether messages *arrive*. Whether the avatar answers them is
+    ``chat_enabled``, and whether they are remembered is ``transcript_enabled`` — three
+    different questions that were one setting until it became clear they were not."""
+
+    rtms_events_enabled: bool = True
+    """Subscribe to participant join/leave and active-speaker events.
+
+    The source of attendance, of who-is-speaking, and of voice barge-in. Best-effort by
+    construction: some accounts deliver these unsolicited, so a rejected subscription is
+    never allowed to fail an attach that otherwise succeeded."""
+
+    chat_enabled: bool = True
+    """Forward meeting chat to the avatar agent, so a typed question gets a spoken answer.
+
+    Requires ``rtms_chat_enabled``, which is what makes the messages arrive at all. Turn
+    this off — with ``rtms_chat_enabled`` left on — for an avatar that never replies to the
+    chat but still remembers what was typed when asked to summarise the meeting."""
+
+    chat_require_mention: bool = True
+    """Answer only chat messages that ``@``-tag the avatar, ignoring the rest of the room.
+
+    Meeting chat is a conversation between people — links, greetings, participants
+    answering each other — and an avatar that replies to every line is interrupting a room
+    that was not talking to it. With this on, "@AI Avatar what is the notice period?" is
+    answered while "sounds good, thanks!" and "did the avatar join?" are not.
+
+    Zoom's chat box offers an ``@`` autocomplete, but what reaches RTMS is plain text with
+    no participant token in it — so the ``@`` is the only deliberate signal that survives
+    the wire, and it is **required**. What follows it is matched loosely, ignoring case and
+    optional separators, so ``@AI Avatar``, ``@ai_avatar`` and ``@AIAvatar`` all count; the
+    name must still stand as whole words, so ``@Aisha`` does not trigger an avatar named
+    "AI". The mention is stripped before the text reaches the agent.
+
+    Set false to answer every message — reasonable for a one-to-one meeting, where
+    everything typed is addressed to the avatar anyway."""
+
+    chat_mention_names: list[str] = Field(default_factory=list)
+    """Extra names the avatar answers to after an ``@``, on top of its ``display_name``.
+
+    Worth setting when the joined name is long or awkward to type and people will shorten
+    it — an avatar joining as "TrueFan Interview Avatar" gets ``["Gunika", "bot"]`` so
+    ``@Gunika`` and ``@bot`` are recognised too."""
+
+    transcript_enabled: bool = True
+    """Keep a ledger of what each person said — spoken and typed — for the whole meeting.
+
+    Fed by whichever of ``rtms_transcript_enabled`` and ``rtms_chat_enabled`` are on, and
+    it is worth having with either: a meeting held largely in chat still has a conversation
+    to remember, and gating the ledger on the transcript alone would leave that deployment
+    able to answer every question except what was asked.
+
+    Read it back with ``GET /sessions/{id}/transcript``. The recent lines are also folded
+    into the brief pushed to the agent."""
+
+    attendance_enabled: bool = True
+    """Keep a record of who was in the meeting, so the agent can be asked about it later.
+
+    On by default because it costs nothing: no scanning, no visible action, and no extra
+    traffic — it accumulates the participant events ``rtms_events_enabled`` already
+    subscribes to.
+
+    What it makes answerable: who is here now, who was here and left, who rejoined, and —
+    when the session has been seeded via ``POST /sessions/{id}/invitees`` — who was invited
+    and never turned up. Read it back with ``GET /sessions/{id}/participants``."""
+
+    speaker_tracking_enabled: bool = True
+    """Identify who is speaking, and keep that attribution for the whole meeting.
+
+    On by default because it costs nothing the meeting can hear: the audio the avatar
+    receives is a mix and stays one — no frame is retagged, re-timed or delayed — and the
+    attribution comes from Zoom's own ``ACTIVE_SPEAKER_CHANGE`` events, which travel on the
+    signaling socket rather than the media one.
+
+    What it makes answerable: who is talking right now, who has spoken, in what order and
+    for how long each. Read it with ``GET /sessions/{id}/speakers``. It also names a
+    barge-in: with this off, somebody talking over the avatar is reported to the agent as
+    "Someone"."""
+
+    context_push_enabled: bool = True
+    """Push the meeting brief to the avatar agent, so it can answer without a round trip.
+
+    Who is here, who is talking, and what has been said — as **one** frame, because an agent
+    has one slot for standing context and two pushers competing for it evict each other.
+
+    Delivered as ``kind="meeting_context"``, which is **not** the channel chat and
+    interruptions use. That distinction is the point: a chat frame is a turn the avatar
+    answers out loud, and an avatar announcing "Aarav Sharma is in the meeting" every time
+    somebody reconnects is worse than one that says nothing. An agent that has not
+    implemented the kind negotiates below ``1.2`` and receives nothing, with one warning
+    logged naming the fix.
+
+    Turn it off if the agent reads the HTTP endpoints instead — a tool-calling agent gets
+    fresher data that way, at the cost of a round trip mid-answer."""
+
+    context_push_interval_s: float = Field(default=3.0, ge=0.5, le=120.0)
+    """How often the ledgers are checked for changes worth pushing.
+
+    Not how often anything is sent: a meeting where nothing changed sends nothing at all,
+    because the brief is standing context and resending an identical one is noise in the
+    agent's context window. Three seconds is the timescale a speaker changes on, which is
+    the fastest thing in the brief."""
+
+    context_push_require_negotiation: bool = True
+    """Only send the brief to an agent that negotiated protocol ``1.2`` or above.
+
+    **Set this to False to skip the agent's handshake change.** Adding meeting context to
+    an existing agent otherwise takes two edits — reply ``"1.2"`` in the server hello, *and*
+    handle ``kind="meeting_context"`` — and forgetting the first silently disables the
+    feature while the second looks done.
+
+    Safe for any agent that **ignores control frames it does not recognise**, which is the
+    usual behaviour and the only requirement. Leave it on if the agent instead raises on an
+    unknown kind. It changes who is sent the frame, never the frame's kind: meeting context
+    never travels on the channel the avatar speaks from."""
+
+    voice_interrupt_enabled: bool = True
+    """**Let somebody talking over the avatar stop it mid-sentence.**
+
+    The fix for an avatar that speaks until it finishes whatever anybody says. When Zoom
+    reports the floor moving to a participant *while the avatar is talking*, the avatar's
+    queued audio is dropped and the agent is sent ``hand_raise_prompt`` — so it stops and
+    says "ok, go ahead" before listening to the question. Both halves matter: dropping the
+    queued audio disposes of speech that already exists, and only telling the agent stops
+    it generating the rest of the sentence.
+
+    **Driven by Zoom's active-speaker event rather than by audio energy**, which is the one
+    place this connector cannot copy the Google Meet one. RTMS delivers the meeting's mix
+    *including the avatar*, so the echo gate withholds every inbound frame while the avatar
+    talks — an energy detector would be deaf during the only window barge-in exists for.
+    The event travels on the signaling socket, so it arrives regardless, and it names the
+    person.
+
+    Only fires while the avatar is actually speaking. Somebody starting to talk into a
+    silence is just the meeting happening, and interrupting nothing would send the agent a
+    "stop talking" message on every sentence anybody utters.
+
+    Turn it off for a meeting where the avatar should hold the floor through interruptions
+    — a presentation, or a scripted read-out. A raised hand still interrupts."""
+
+    hand_raise_enabled: bool = True
+    """Stop the avatar and hand over when a participant raises their hand.
+
+    **The one feature here read from the browser rather than from RTMS**, and that is a
+    genuine gap rather than an oversight: Zoom's RTMS event list has no hand-raise event in
+    it, so the indicator exists only on screen. The injected script watches for it and
+    reports the moment a hand goes up; every judgement about what that means is made in
+    Python.
+
+    Unlike everything else on this connector it therefore depends on selectors matching a
+    UI Zoom is free to change. It degrades to silence rather than to an error, which is why
+    the observer reports diagnostics — see ``hand_raise_open_panel`` for the most common
+    reason it finds nothing."""
+
+    hand_raise_open_panel: bool = True
+    """Open the participants panel once, so raised hands are in the DOM to be seen.
+
+    **The indicator does not exist in a panel nobody opened.** With it closed Zoom renders a
+    raised hand as a transient toast and, on some layouts, nothing at all — so the observer
+    would be correct, running, and permanently blind. This is the one visible action the
+    avatar takes inside the meeting, which is why it is a switch; clicked once per session,
+    never toggled.
+
+    Turn it off if the avatar's screen is being shared and the panel would be in the way,
+    accepting that hand raises will probably not be seen."""
+
+    hand_raise_prompt: str = ""
+    """What the agent is told when somebody asks for the floor — by hand **or** by voice.
+
+    Empty uses the wording that ships with the connector, which asks it to stop and hand
+    over in a few words. ``{name}`` is substituted with the person's name, or "Someone" when
+    nothing attributed the request. Nothing else is substituted, and a template that fails
+    to render costs the wording rather than the feature.
+
+    **This steers the avatar's reply; it is not the reply.** The bridge contains no AI and
+    speaks none of its own words — the agent composes what is said, and this is the
+    instruction it receives. Change it to change the register: an interview avatar might
+    want ``"{name} has a question. Stop talking and invite them to ask it."``"""
+
+    hand_raise_cooldown_s: float = Field(default=10.0, ge=0)
+    """How long the same participant is ignored after the avatar has yielded to them.
+
+    Both inputs repeat: the page re-reads a hand that has not moved, and Zoom re-reports the
+    same active speaker through a conversation. Either can produce a burst, and an avatar
+    interrupted repeatedly never gets far enough to say "go ahead" — which looks far more
+    broken than a slightly late reaction. Zero disables it, which is only sensible in a very
+    quiet room."""
+
+    hand_raise_mute_ms: int = Field(default=800, ge=0)
+    """How long avatar audio keeps being discarded after an interrupt.
+
+    **This is what makes barge-in audible rather than theoretical.** When the floor is
+    claimed the agent's speech is already in flight — sent over the socket, sitting in the
+    decoder — and dropping only what is queued for publication buys a couple of hundred
+    milliseconds before the same sentence resumes. Holding the line while the rest drains is
+    what turns that into stopping.
+
+    The trade runs both ways: too short and the interrupted sentence comes back, too long and
+    the beginning of the *reply* is clipped. 800 ms covers a typical in-flight buffer and is
+    shorter than the round trip the agent needs to answer, so the "go ahead" lands intact."""
+
+    speaker_hold_ms: int = Field(default=1_500, ge=0)
+    """How long somebody stays "the current speaker" after the floor moves off them.
+
+    Speech has gaps at every clause boundary. Without a hold, asking who is speaking during
+    the pause between two sentences answers "nobody" — true of that instant, and the wrong
+    answer to the question. It is also what stops a barge-in landing in a gap from being
+    attributed to no one."""
+
+    speaker_merge_gap_ms: int = Field(default=1_200, ge=0)
+    """How long a gap may be before it ends a turn rather than punctuating one.
+
+    What makes the history read like a conversation instead of like a waveform: without it,
+    two people alternating quickly produce dozens of turns and "who has been speaking"
+    answers with the same names over and over."""
+
     def is_configured(self) -> bool:
         return self.enabled
 

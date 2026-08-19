@@ -337,6 +337,21 @@ class MediaRouter:
         """Stop the avatar and hand the floor over. The two actions above, in that order."""
         speaking = self._pacer.is_speaking
         dropped = self._pacer.interrupt(hold_ms=self._hand_raise_mute_ms)
+        # **Open the gate immediately, because yielding the floor means we want to hear
+        # them.** The gate withholds inbound audio for ``hangover_ms`` after the avatar
+        # last published, which on a connector whose own voice loops back through the
+        # conference has to be long enough to cover that round trip — a second or more.
+        # Waiting it out here would drop the opening of the very question the interruption
+        # was raised for, which is the feature failing in the least visible way possible:
+        # the avatar stops, says "go ahead", and never hears the first half of the answer.
+        #
+        # The cost is the avatar's own in-flight tail arriving unguarded for a moment. That
+        # is the trade taken deliberately: during a barge-in, hearing the person beats
+        # suppressing an echo, and the pacer has already stopped feeding the loop.
+        #
+        # A no-op where the gate is disabled (Google Meet) or nothing yields the floor
+        # (Zoom SDK, Teams), so no other connector changes behaviour.
+        self._echo_guard.reset()
         logger.info(
             "router.floor_yielded",
             trigger=trigger,
