@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass, field
 
 from src.domain.ids import SessionId
+from src.domain.meeting import MeetingPlatform
 from src.domain.session import SessionContext
 from src.infrastructure.logging import get_logger
 
@@ -85,6 +86,36 @@ class SessionRegistry:
     def by_meeting_number(self, meeting_number: str) -> SessionContext | None:
         session_id = self._by_meeting_number.get(meeting_number)
         return self._by_id.get(session_id) if session_id else None
+
+    def sole_session_awaiting_rtms(self) -> SessionContext | None:
+        """The one Zoom session still waiting to be bound, if there is exactly one.
+
+        The mirror of ``take_any_pending_rtms``, for the opposite arrival order. An
+        operator creates a session by **meeting number**; ``meeting.rtms_started``
+        identifies the meeting only by **UUID** — it carries no meeting number at
+        all — so a session created before the webhook cannot be found by
+        ``by_meeting_uuid``: its UUID is still ``None``. Without this fallback the
+        payload parks with nobody left to claim it, and ingest waits out its full
+        timeout for a webhook that already arrived.
+
+        **The browser connector makes this the normal case rather than a race.** It
+        joins the meeting first and RTMS starts afterwards, so the session always
+        exists before the webhook.
+
+        Returns ``None`` unless exactly one candidate exists: with two unbound Zoom
+        sessions the correct target is genuinely unknowable, and binding the wrong
+        one is worse than waiting.
+        """
+        candidates = [
+            session
+            for session in self._by_id.values()
+            if session.meeting.platform
+            in (MeetingPlatform.ZOOM, MeetingPlatform.ZOOM_WEB)
+            and session.meeting.meeting_uuid is None
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
 
     def all_sessions(self) -> tuple[SessionContext, ...]:
         return tuple(self._by_id.values())

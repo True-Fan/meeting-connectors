@@ -21,6 +21,8 @@ import asyncio
 import random
 from typing import Any
 
+from pydantic import ValidationError
+
 from src.connectors.zoom.exceptions import (
     KeepAliveTimeoutError,
     RtmsConnectionError,
@@ -281,12 +283,17 @@ class RtmsService:
             self._log_event(message)
 
     def _enqueue_audio(self, message: dict[str, Any]) -> None:
-        wire = MediaDataAudio.model_validate(message)
+        # ``model_validate`` used to sit outside this block, and a ``ValidationError``
+        # is a ``ValueError`` rather than an ``RtmsProtocolError`` — so an unexpected
+        # payload shape did not merely drop a frame, it escaped the media pump and
+        # unwound the task group, killing a live connection. Validation belongs on the
+        # same footing as decoding: lossy input, never a reason to hang up.
         try:
+            wire = MediaDataAudio.model_validate(message)
             frame = to_audio_frame(
                 wire, audio_format=self._audio_format, ctx=self._ctx, clock=self._clock
             )
-        except RtmsProtocolError as exc:
+        except (RtmsProtocolError, ValidationError) as exc:
             # One malformed frame must not tear down a live meeting. Count it and
             # keep going — this is lossy input, not a broken contract.
             logger.warning("rtms.audio.malformed", error=str(exc))

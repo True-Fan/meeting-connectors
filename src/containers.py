@@ -26,6 +26,8 @@ from src.connectors.zoom.config import ZoomConnectorConfig
 from src.connectors.zoom.oauth.router import build_router as build_zoom_oauth_router
 from src.connectors.zoom.session.zoom_session import ZoomSessionFactory
 from src.connectors.zoom.webhook.router import build_router as build_zoom_webhook_router
+from src.connectors.zoom_web.config import ZoomWebConnectorConfig
+from src.connectors.zoom_web.session.zoom_web_session import ZoomWebSessionFactory
 from src.domain.meeting import MeetingPlatform
 from src.infrastructure.logging import get_logger
 from src.infrastructure.metrics import MetricsCollector
@@ -44,6 +46,7 @@ def build_connector_registry(
     zoom_factory: ZoomSessionFactory,
     teams_factory: Callable[[], TeamsSessionFactory],
     google_meet_factory: Callable[[], GoogleMeetSessionFactory] | None = None,
+    zoom_web_factory: Callable[[], ZoomWebSessionFactory] | None = None,
 ) -> ConnectorRegistry:
     """Register every connector this deployment can serve.
 
@@ -86,6 +89,15 @@ def build_connector_registry(
         platform=MeetingPlatform.GOOGLE_MEET,
         configured=settings.google_meet.is_configured(),
         factory=google_meet_factory,
+    )
+    # Opt-in via MC_ZOOM_WEB__ENABLED. It has no credentials of its own to infer
+    # "wanted" from, and it carries a host dependency (a capture device) that should
+    # never appear in a deployment that did not ask for it.
+    _register_optional(
+        registry,
+        platform=MeetingPlatform.ZOOM_WEB,
+        configured=settings.zoom_web.is_configured(),
+        factory=zoom_web_factory,
     )
 
     logger.info("connectors.registered", platforms=sorted(registry.supported()))
@@ -184,6 +196,14 @@ class Container(containers.DeclarativeContainer):
 
     google_meet_config = providers.Singleton(GoogleMeetConnectorConfig.from_settings, settings)
 
+    zoom_web_config = providers.Singleton(ZoomWebConnectorConfig.from_settings, settings)
+
+    zoom_web_session_factory = providers.Singleton(
+        ZoomWebSessionFactory,
+        config=zoom_web_config,
+        metrics=metrics,
+    )
+
     google_meet_session_factory = providers.Singleton(
         GoogleMeetSessionFactory,
         config=google_meet_config,
@@ -201,6 +221,7 @@ class Container(containers.DeclarativeContainer):
         zoom_factory=zoom_session_factory,
         teams_factory=providers.Delegate(teams_session_factory),
         google_meet_factory=providers.Delegate(google_meet_session_factory),
+        zoom_web_factory=providers.Delegate(zoom_web_session_factory),
     )
 
     meeting_service = providers.Singleton(

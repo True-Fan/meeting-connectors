@@ -165,20 +165,65 @@ class KeepAliveRequest(BaseModel):
     timestamp: int = 0
 
 
+class AudioContentEnvelope(BaseModel):
+    """The per-participant form of ``content``.
+
+    Subscribing ``AUDIO_MULTI_STREAMS`` changes the shape of every audio message:
+    Zoom stops sending ``content`` as a bare base64 string and sends an object
+    carrying the PCM *and* the speaker it came from. The attribution is the reason
+    to ask for multi-stream at all, so it arrives attached to the audio.
+    """
+
+    model_config = _WIRE_CONFIG
+
+    data: str = ""
+    user_id: int | None = None
+    user_name: str | None = None
+
+
 class MediaDataAudio(BaseModel):
     """``msg_type 14`` — one audio frame.
 
-    ``content`` is base64-encoded PCM. Decoding happens in ``mapping.py``, not here,
-    so the wire model stays a faithful description of the wire.
+    ``content`` is base64-encoded PCM in one of two shapes, and **which one depends
+    on the subscription**: a bare string for a mixed stream, an
+    ``AudioContentEnvelope`` when ``AUDIO_MULTI_STREAMS`` is negotiated. Both are
+    described rather than normalised, so the model stays a faithful description of
+    the wire; ``audio_base64`` and ``speaker`` are the boundary ``mapping.py`` reads
+    through.
+
+    Declaring only the string form is not a cosmetic error. This connector requests
+    multi-stream by default, so **every** frame fails validation — and because that
+    failure escapes the media pump it takes the whole RTMS connection down with it.
+    The observable result is a session that attaches, reports healthy, and hears
+    nothing, having negotiated the very option that broke it.
     """
 
     model_config = _WIRE_CONFIG
 
     msg_type: int
-    content: str
+    content: str | AudioContentEnvelope
     user_id: int | None = None
     user_name: str | None = None
     timestamp: int | None = None
+
+    def audio_base64(self) -> str:
+        """The base64 PCM, whichever shape carried it."""
+        if isinstance(self.content, AudioContentEnvelope):
+            return self.content.data
+        return self.content
+
+    def speaker(self) -> tuple[int | None, str | None]:
+        """``(user_id, user_name)``, preferring the envelope's attribution.
+
+        Multi-stream puts the speaker inside ``content``; the top-level fields are
+        the mixed stream's way of saying the same thing. Falling back keeps one call
+        site correct for both.
+        """
+        if isinstance(self.content, AudioContentEnvelope) and (
+            self.content.user_id is not None or self.content.user_name is not None
+        ):
+            return self.content.user_id, self.content.user_name
+        return self.user_id, self.user_name
 
 
 class EventUpdate(BaseModel):

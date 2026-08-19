@@ -34,6 +34,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         env=settings.env,
         zoom_ingest_configured=settings.zoom.is_configured(),
         zoom_publish_configured=settings.zoom.is_publish_configured(),
+        zoom_rtms_auto_start=settings.zoom.is_rtms_auto_start_configured(),
         avatar_url=settings.avatar.url,
     )
     try:

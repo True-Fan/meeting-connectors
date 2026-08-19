@@ -190,7 +190,10 @@ class MeetingService:
         payload belongs to waiting forever for a webhook that had already been
         consumed. The guard is what keeps the two connectors' races from touching.
         """
-        if session.meeting.platform is not MeetingPlatform.ZOOM:
+        if session.meeting.platform not in (
+            MeetingPlatform.ZOOM,
+            MeetingPlatform.ZOOM_WEB,
+        ):
             return
 
         binding = None
@@ -217,6 +220,11 @@ class MeetingService:
         Returns the session when one was found, otherwise ``None``.
         """
         session = self._registry.by_meeting_uuid(binding.meeting_uuid)
+        if session is None:
+            # Created before the webhook, so its UUID is still unset and the exact
+            # match above cannot find it. ``meeting.rtms_started`` carries no meeting
+            # number to match on instead, so fall back to the sole unbound session.
+            session = self._registry.sole_session_awaiting_rtms()
         if session is None:
             # Webhook arrived first. Park it; ``create_session`` will claim it.
             self._registry.park_pending_rtms(binding)

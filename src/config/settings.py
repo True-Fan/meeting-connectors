@@ -68,6 +68,25 @@ class ZoomSettings(BaseModel):
     sdk_key: str = ""
     sdk_secret: SecretStr = SecretStr("")
 
+    account_id: str = ""
+    s2s_client_id: str = ""
+    s2s_client_secret: SecretStr = SecretStr("")
+    """Server-to-Server OAuth credentials — a *separate* app from the General App
+    above. Needs the ``meeting:update:participant_rtms_app_status`` scope."""
+
+    rtms_auto_start: bool = True
+    """Ask Zoom to start RTMS ourselves when a session is created.
+
+    Zoom only emits ``meeting.rtms_started`` if RTMS was explicitly triggered, and
+    tears the stream down again if nobody attaches within about a minute. Triggering
+    it by hand means racing that window; triggering it here means the session is
+    already registered and waiting when the webhook lands. Inert unless the S2S
+    credentials above are set, so it cannot fire from an unconfigured deployment."""
+
+    api_base_url: str = "https://api.zoom.us"
+    oauth_base_url: str = "https://zoom.us"
+    api_timeout_s: float = Field(default=10.0, gt=0.0, le=60.0)
+
     rtms_send_rate_ms: int = Field(default=20, ge=20, le=1000, multiple_of=20)
     """RTMS audio delivery interval. 20 ms is the protocol floor; the samples
     default to 100, which donates 80 ms of latency at the first hop (doc 003 §3.2)."""
@@ -90,6 +109,20 @@ class ZoomSettings(BaseModel):
     def is_publish_configured(self) -> bool:
         """True when Meeting SDK publish credentials are present."""
         return bool(self.sdk_key and self.sdk_secret.get_secret_value())
+
+    def is_rtms_auto_start_configured(self) -> bool:
+        """True when we can ask Zoom to start RTMS ourselves.
+
+        Requires the General App ``client_id`` too: it names the app RTMS starts
+        for, and Zoom rejects the call without it.
+        """
+        return bool(
+            self.rtms_auto_start
+            and self.account_id
+            and self.s2s_client_id
+            and self.s2s_client_secret.get_secret_value()
+            and self.client_id
+        )
 
 
 class TeamsSettings(BaseModel):
@@ -579,6 +612,85 @@ class AvatarSettings(BaseModel):
     counts it — it must never block the ingest reader (doc 003 §7.2)."""
 
 
+class ZoomWebSettings(BaseModel):
+    """Zoom joined with a browser, publishing through a virtual microphone.
+
+    Publishing works the same way the Google Meet connector's does — a synthetic
+    ``MediaStreamTrack`` injected into the page — with one extra requirement Meet does
+    not have: a **persistent profile with a microphone already selected**. Zoom will
+    not start its capture pipeline until its device menu has a selection, and that
+    selection lives in the Chromium profile.
+
+    Ingest comes over RTMS, Zoom's own API, which carries the audio and the speaker's
+    name and needs nothing from the browser at all.
+    """
+
+    enabled: bool = False
+    """Opt-in, like every connector after the first. It takes no credentials of its
+    own — the meeting number and passcode arrive in the request — so there is nothing
+    to infer "wanted" from, and it carries a host dependency that should be a
+    deliberate choice."""
+
+    display_name: str = "AI Avatar"
+
+    per_participant_audio: bool = False
+    """Ask RTMS for one **mixed** stream rather than a stream per participant.
+
+    The opposite of the SDK connector's default, and for a reason specific to this
+    one: here the avatar is *in* the meeting, so RTMS carries at least two speakers.
+    ``AUDIO_MULTI_STREAMS`` then delivers their audio as separate streams, which this
+    pipeline drains into a single sequential one — splicing two speakers together and
+    handing the transcriber audio that is chopped between them. Observed live: an
+    English question came back as Indonesian fragments, and transcripts lagged by
+    fourteen seconds.
+
+    A mixed stream is one coherent conversation, which is what the transcriber wants.
+    The cost is losing per-speaker attribution — so the avatar's own voice can no
+    longer be filtered by name, and ``EchoGuard`` runs in strict gate mode instead.
+    That is the case the strict gate exists for, and it is armed by *audible* avatar
+    audio only, so a participant can still interrupt.
+    """
+
+    join_timeout_s: float = Field(default=90.0, gt=0)
+    """Generous, because it spans a waiting room: failing early turns a slow host
+    into an error."""
+    join_poll_interval_s: float = Field(default=2.0, gt=0)
+
+    headless: bool = True
+    no_sandbox: bool = False
+
+    profile_dir: Path | None = None
+    """A persistent Chromium profile, signed in to Zoom with a microphone chosen.
+
+    **This is what makes the synthetic microphone work**, and it is the one piece of
+    setup this connector needs. Chromium stores the per-origin device choice in
+    ``Default/Preferences``; with a throwaway profile Zoom has no microphone selected,
+    never starts its capture pipeline, and publishes nothing however good the injected
+    track is. Prepared once, interactively — see ``docs`` and
+    ``scripts/zoom_web_login.py``.
+
+    ``None`` falls back to a throwaway profile, which is fine for exercising the join
+    and useless for being heard."""
+
+    @field_validator("profile_dir")
+    @classmethod
+    def _expand(cls, value: Path | None) -> Path | None:
+        """Expand ``~`` and make the path absolute.
+
+        Pydantic parses ``~/.mc/zoom-web-profile`` into a *relative* path whose
+        first component is literally ``~``, so Chromium silently launches with an
+        empty profile in the working directory. Everything then looks correct — the
+        avatar joins and reports healthy — while Zoom has no microphone selected and
+        publishes nothing, which is the hardest failure in this connector to see.
+        """
+        if value is None:
+            return None
+        return value.expanduser().resolve()
+
+    def is_configured(self) -> bool:
+        return self.enabled
+
+
 class MediaSettings(BaseModel):
     """Media pipeline geometry and queue depths."""
 
@@ -657,6 +769,7 @@ class Settings(BaseSettings):
     zoom: ZoomSettings = Field(default_factory=ZoomSettings)
     teams: TeamsSettings = Field(default_factory=TeamsSettings)
     google_meet: GoogleMeetSettings = Field(default_factory=GoogleMeetSettings)
+    zoom_web: ZoomWebSettings = Field(default_factory=ZoomWebSettings)
     avatar: AvatarSettings = Field(default_factory=AvatarSettings)
     media: MediaSettings = Field(default_factory=MediaSettings)
     sidecar: SidecarSettings = Field(default_factory=SidecarSettings)

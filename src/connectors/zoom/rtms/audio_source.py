@@ -21,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import AsyncIterator
-from contextlib import suppress
 
 from pydantic import SecretStr
 
@@ -195,8 +194,19 @@ class RtmsAudioSource:
         if task is not None:
             task.cancel()
             # We cancelled it deliberately; its cancellation is not an error.
-            with suppress(asyncio.CancelledError):
+            #
+            # Anything *else* it raises is a failure that already happened — the task
+            # died earlier and has been holding the exception since. Re-raising it
+            # here attributes someone else's crash to whoever called ``stop``, and
+            # aborts their teardown half-done: a ``DELETE /sessions/{id}`` that leaves
+            # the avatar sitting in the meeting, because the caller never reached the
+            # line that closes the browser. Report it and finish releasing.
+            try:
                 await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.warning("rtms.ingest_task_failed", error=str(exc))
         if self._current is not None:
             await self._current.detach()
             self._current = None

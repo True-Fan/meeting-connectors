@@ -33,3 +33,5 @@ out/
 # Google Meet connector: the persistent Chromium profile holds a live Google
 # session cookie, and per-session working copies are cloned beside it. Never commit.
 .meet/
+
+~/.mc/zoom-web-profile/

@@ -33,6 +33,16 @@ class MeetingPlatform(StrEnum):
     TEAMS = "teams"
     GOOGLE_MEET = "google_meet"
 
+    ZOOM_WEB = "zoom_web"
+    """The same Zoom meetings as ``ZOOM``, but joined with a browser.
+
+    A separate member rather than a flag, because the two are different connectors
+    with different failure modes and different host requirements. ``ZOOM`` publishes
+    through a native sidecar built against the Meeting SDK; this one drives Chromium
+    and publishes through a virtual microphone. Both ingest over RTMS. Choosing one
+    is choosing which machinery runs, which belongs in the request rather than being
+    inferred from configuration."""
+
 
 @dataclass(frozen=True, slots=True)
 class ParticipantRef:

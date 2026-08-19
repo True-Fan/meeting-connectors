@@ -276,7 +276,12 @@ def test_shared_code_routes_on_the_domain_enum_not_on_a_connector() -> None:
     from src.domain.meeting import MeetingPlatform
 
     assert _modules_under("src.domain")  # guard against a silent path change
-    assert {p.value for p in MeetingPlatform} == {"zoom", "teams", "google_meet"}
+    assert {p.value for p in MeetingPlatform} == {
+        "zoom",
+        "teams",
+        "google_meet",
+        "zoom_web",
+    }
 
     # The enum carries identity only: no urls, no ports, no SDK hints. Anything more and
     # shared code would start making platform decisions from domain data.

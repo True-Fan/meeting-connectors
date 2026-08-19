@@ -100,9 +100,15 @@ def to_audio_frame(
             a whole number of samples for the negotiated format.
     """
     try:
-        pcm = base64.b64decode(message.content, validate=True)
+        pcm = base64.b64decode(message.audio_base64(), validate=True)
     except (binascii.Error, ValueError) as exc:
         raise RtmsProtocolError("audio content is not valid base64") from exc
+
+    if not pcm:
+        # Zero bytes is not silence, it is a frame with no audio in it — reachable
+        # when the per-participant envelope arrives without its ``data``. The length
+        # check below accepts it, because zero divides evenly.
+        raise RtmsProtocolError("audio content is empty")
 
     if len(pcm) % audio_format.bytes_per_frame:
         raise RtmsProtocolError(
@@ -110,9 +116,10 @@ def to_audio_frame(
             f"for {audio_format}"
         )
 
+    user_id, user_name = message.speaker()
     participant = (
-        ParticipantRef(user_id=message.user_id, display_name=message.user_name)
-        if message.user_id is not None
+        ParticipantRef(user_id=user_id, display_name=user_name)
+        if user_id is not None
         else None
     )
 

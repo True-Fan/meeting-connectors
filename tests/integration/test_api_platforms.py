@@ -75,7 +75,7 @@ class TestRequestContract:
         # behaviour moved — the two assertions that guard those are above and below, and
         # both were untouched.
         platform_enum = schema["components"]["schemas"]["MeetingPlatform"]["enum"]
-        assert sorted(platform_enum) == ["google_meet", "teams", "zoom"]
+        assert sorted(platform_enum) == ["google_meet", "teams", "zoom", "zoom_web"]
 
     def test_an_unknown_platform_is_a_422(self, client: TestClient) -> None:
         """Validation, not a 500: the enum is the contract."""

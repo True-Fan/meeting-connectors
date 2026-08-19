@@ -43,6 +43,14 @@ class KeepAliveTimeoutError(RtmsError):
     """
 
 
+class RtmsTriggerError(RtmsError):
+    """Asking Zoom to start RTMS failed.
+
+    Never fatal to a session: the operator may still trigger RTMS by hand, or the
+    account may auto-start it, so ingest can arrive without us.
+    """
+
+
 class PublisherError(ZoomError):
     """Base class for Meeting SDK publisher errors."""
 
