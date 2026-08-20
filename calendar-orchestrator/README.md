@@ -1,7 +1,8 @@
 # calendar-orchestrator
 
 Watches the bot's Google Calendar and triggers `meeting-connectors`' `POST /sessions`
-1 minute before any meeting that has a Google Meet link on it — no manual cURL needed.
+1 minute before any meeting that has a **Google Meet or Zoom** link on it — no manual cURL
+needed.
 
 ```
 Google Calendar  --poll-->  calendar-orchestrator  --schedule-->  APScheduler job
@@ -9,14 +10,22 @@ Google Calendar  --poll-->  calendar-orchestrator  --schedule-->  APScheduler jo
                                                                  (T‑minus 60s)
                                                                         v
                                                      POST http://localhost:8000/sessions
-                                                     {"platform":"google_meet","meeting_number":"..."}
+                                                     {"platform":"google_meet","meeting_number":"abc-defg-hij"}
+                                                     {"platform":"zoom_web","meeting_number":"838...","passcode":"..."}
                                                                         v
                                                           meeting-connectors bridge (bot joins)
 ```
 
-It also joins **on demand**: when someone clicks "Add people" in a meeting that is already
-running, Google Meet emails the bot, and a second poller watching that inbox puts it in the
-call within seconds. That path is opt-in — see [Instant invites](#instant-invites-gmail-polling).
+It also joins **on demand**: when someone clicks "Add people" in a running Google Meet, or
+**Invite → Email** in a running Zoom meeting, that mail lands in the bot's inbox and a second
+poller puts it in the call within seconds — the Zoom form is recognised by its subject, since
+Zoom sends it from the host's own mailbox. See
+[Direct invites](#direct-invites-three-shapes-three-ways-in). The whole inbox
+path is opt-in — see [Instant invites](#instant-invites-gmail-polling).
+
+**Which platform a meeting is on is decided per meeting, not per deployment.** A Meet code
+resolves to the bridge's `google_meet` connector and a Zoom link to `zoom_web`; the same
+calendar and the same inbox can carry both. See [Platforms](#platforms).
 
 It is a standalone service on purpose: it never touches a meeting itself, only decides
 *when* to ask the existing bridge to join one. The bridge stays exactly as it is today.
@@ -28,8 +37,9 @@ calendar-orchestrator/
 ├── app/
 │   ├── main.py              FastAPI app: lifespan wiring + /health, /jobs, /sync
 │   ├── config.py            Settings (pydantic-settings, ORCH_ env prefix)
+│   ├── meeting_link.py      Recognises a Meet code or Zoom link in free text
 │   ├── models.py            CalendarEvent
-│   ├── calendar_service.py  Polls Calendar API, extracts Meet links
+│   ├── calendar_service.py  Polls Calendar API, extracts joinable links
 │   ├── scheduler.py         Reconciles events -> APScheduler jobs (add/reschedule/remove)
 │   ├── bot_client.py        POSTs to the bridge, with retries
 │   ├── state.py             Durable "already joined" dedup store
@@ -38,7 +48,8 @@ calendar-orchestrator/
 │   │                        -- instant invites (Gmail polling), see below --
 │   ├── gmail_poller.py      One poll cycle: inbox -> filter -> dedupe -> trigger
 │   ├── gmail_service.py     Async wrapper over the Gmail API (list, get, mark read)
-│   ├── invite_parser.py     Is this email a live invite, and what is the Meet code?
+│   ├── invite_parser.py     Is this email a live invite, and which meeting is it for?
+│   ├── ics.py               Reads invite.ics: unfolds it, and says when the event is
 │   └── gmail_state.py       Durable "already processed" message-id store
 ├── scripts/
 │   └── oauth_bootstrap.py   One-time interactive sign-in for OAuth mode
@@ -55,10 +66,13 @@ bot's calendar (`ORCH_CALENDAR_ID`, default `primary`) starting within the next
 `ORCH_SCHEDULING__LOOKAHEAD_HOURS` hours. Because it's reading the bot's own calendar, any
 event returned is, by definition, one the bot was invited to. For each one:
 
-1. Skip it if it has no Google Meet link (checks `conferenceData.entryPoints`, falls back
-   to `hangoutLink`) or if it's cancelled.
-2. Extract the meeting code from the Meet URL — `https://meet.google.com/veg-fkxv-rhg` ->
-   `veg-fkxv-rhg`.
+1. Skip it if it names no joinable meeting, or if it's cancelled. Four places are searched,
+   **in descending order of authority**: `conferenceData.entryPoints`, `hangoutLink`,
+   `location`, then `description`. Google fills the first two itself, so they are facts; the
+   last two are free text that can contain last week's link in a copied agenda.
+2. Extract the meeting from whichever link was found — `https://meet.google.com/veg-fkxv-rhg`
+   -> `veg-fkxv-rhg` on `google_meet`, `https://us05web.zoom.us/j/83843212151` ->
+   `83843212151` on `zoom_web`, with the passcode if the event carries one.
 3. Schedule (or reschedule) an APScheduler job keyed on the event id, to fire
    `ORCH_SCHEDULING__JOIN_LEAD_TIME_S` seconds (default 60) before the event's start time.
 4. Any previously-scheduled job whose event no longer appears in the fresh list (cancelled,
@@ -77,6 +91,131 @@ double join.
 `ORCH_SCHEDULING__LATE_JOIN_GRACE_S` (default 120s) — e.g. the service was briefly down —
 it joins immediately instead of skipping. Older than that, it logs the meeting as missed
 rather than joining minutes into an already-underway call.
+
+## Platforms
+
+Both platforms travel the same two routes — calendar and inbox — and the same three filter
+steps. Nothing branches on platform except the link pattern itself (`app/meeting_link.py`),
+which is why Zoom needed no second poller, no second state file and no second code path.
+
+| | Google Meet | Zoom |
+|---|---|---|
+| bridge connector | `google_meet` | `zoom_web` |
+| meeting id | `abc-defg-hij` | `83843212151` |
+| passcode | n/a | sent when the invite spells it out |
+| calendar source | `hangoutLink`, `conferenceData` | `conferenceData`, `location`, `description` |
+| invite sender | `meetings-noreply@google.com` | `no-reply@zoom.us`, `no-reply@zoom.com` |
+
+**`zoom_web`, not `zoom`.** The bridge has two Zoom connectors: `zoom` uses the Meeting SDK
+and needs the meeting to be hosted on an account with RTMS enabled *for this app*, and
+`zoom_web` joins as an ordinary browser participant and needs nothing from the host. A
+meeting the bot was invited to is by definition somebody else's, so that entitlement is
+exactly what is not available — every invite therefore resolves to `zoom_web`.
+
+### Two things to know about Zoom passcodes
+
+**The `pwd=` in a Zoom link is not the passcode.** It is an encrypted token Zoom's own client
+exchanges for entry; the bridge types into the passcode box instead, which rejects it. So the
+passcode is read from the invite's `Passcode: 139601` line (or Google Calendar's `password`
+field, or the one-tap dial-in string), and an invite carrying only the token yields **no**
+passcode rather than a wrong one — the join then relies on the meeting having no passcode or
+a waiting room the host admits from.
+
+If that becomes a problem, the fix is on the bridge side: `ZoomWebJoiner` builds
+`https://app.zoom.us/wc/{id}/join` and could carry the token as `?pwd=`. That is a change to
+the Zoom connector, deliberately not made here.
+
+### Direct invites: three shapes, three ways in
+
+A meeting can reach the bot's inbox in three shapes, and they differ in what can be trusted
+about them. All three still require the body to name a real meeting.
+
+| shape | identified by | sender | acted on when |
+|---|---|---|---|
+| Zoom **in-meeting** invite | subject `Please join Zoom meeting in progress` | the host's own mailbox | always |
+| **Calendar invitation** | the `invite.ics` part | the organiser's own address | only if the meeting is **live now** |
+| Zoom invite **pasted** anywhere | the body's invite block | anyone | always |
+| Zoom/Meet **system** invite | subject marker | `no-reply@zoom.us` etc. | sender must be allow-listed |
+
+#### Zoom in-meeting invite
+
+```
+From:    Any Host <whoever@example.com>         <-- the HOST's mailbox, not Zoom's
+Subject: Please join Zoom meeting in progress   <-- this is the handle
+         https://us05web.zoom.us/j/85666054587?pwd=...
+         Meeting ID: 856 6605 4587
+         Passcode: 2A4veB
+```
+
+Zoom composes this from **your own mailbox**, so the sender is unknowable in advance and the
+subject is the only handle. `ORCH_GMAIL__ANY_SENDER_SUBJECT_MARKERS` lists subjects acted on
+whoever sent them; it ships containing exactly that string, so it works with no setup.
+
+#### Calendar invitation / a Zoom invite pasted anywhere
+
+```
+From:    Any Organiser <organiser@example.com>   <-- the ORGANISER, or anyone
+Subject: test zoom                               <-- the EVENT's title. Arbitrary.
+
+         Join Zoom Meeting
+         https://us05web.zoom.us/j/85273228350?pwd=...
+         Meeting ID: 852 7322 8350               <-- this is the handle
+         Passcode: f4eVwN
+```
+
+Neither field carries a signal: the subject is whatever the organiser named the event, in any
+language, and the sender is their own mailbox. So **the body is the handle** — a Zoom join
+link *plus* a labelled `Meeting ID:` or `Passcode:` line. That is the block Zoom generates,
+and it survives being pasted into a calendar event, forwarded, or reformatted.
+
+Deliberately stricter than "there is a Zoom link somewhere". A colleague writing *"we used to
+meet at zoom.us/j/123456789"* has a link and no invitation, and must not move the bot.
+
+When the message **does** carry an `invite.ics`, that decides instead — including deciding to
+refuse:
+
+> **Only invitations for a meeting already running are joined.** An invitation to next
+> Tuesday's standup arrives *now*, and every other filter would pass it — fresh mail, real
+> link, genuine organiser. Joining on receipt would put the bot in a meeting six days early.
+> So an ics overrules the body signature, and anything scheduled is left to the calendar
+> poller, which joins it at `join_lead_time_s` before it starts.
+
+`METHOD:CANCEL` and `METHOD:REPLY` are ignored — a cancellation carries the same event, link
+and times as the invitation, and acting on it would join a meeting that was just called off.
+
+The ics is **unfolded** before it is read. iCalendar wraps lines at 75 octets, and a Zoom join
+URL is longer than that — read raw, the URL is truncated mid-token while the meeting number
+(nearer the front) still comes out right, so the bot joins the correct meeting holding a
+broken link and nothing reports a problem.
+
+Switches: `ORCH_GMAIL__ACCEPT_ZOOM_INVITE_BODIES=false`,
+`ORCH_GMAIL__ACCEPT_CALENDAR_INVITATIONS=false`, `ORCH_GMAIL__CALENDAR_INVITE_LEAD_S=300`.
+
+> **What these open routes accept.** Anyone who can email the bot a Zoom invitation block —
+> or a valid `.ics` for a live meeting, or that exact Zoom subject — can make it join, with a
+> link of their choosing. There is no cryptographic difference between the host's invite and
+> a stranger's; both are ordinary mail. The mitigations are that the block signature is
+> specific rather than any mention of Zoom, that the bot's address is not usually published,
+> and that stale invites age out via `MAX_INVITE_AGE_S`.
+
+### Everything else is still sender-gated
+
+`ORCH_GMAIL__ALLOWED_SENDERS` governs every other invite, and takes three entry forms:
+
+| entry | grants |
+|---|---|
+| `no-reply@zoom.us` | that one mailbox |
+| `@yourcompany.com` | anybody at that domain |
+| `*` | anybody at all |
+
+```bash
+ORCH_GMAIL__ALLOWED_SENDERS='["no-reply@zoom.us","meetings-noreply@google.com","@yourcompany.com"]'
+```
+
+A domain entry is an exact match on the part after `@` — `@company.com` admits
+`priya@company.com` and rejects `bad@notcompany.com` and `bad@company.com.evil.net`. Matching
+is always on the **parsed** address, never the raw header: a display name reading
+`no-reply@zoom.us` is something anyone can set.
 
 ## Setup
 

@@ -115,14 +115,19 @@ async def _run_join(event: CalendarEvent, state: TriggeredEventStore, settings: 
         return
 
     logger.info(
-        "triggering bot join for %r (%s) -> meeting %s",
+        "triggering bot join for %r (%s) -> %s meeting %s",
         event.summary,
         event.event_id,
+        event.platform,
         event.meeting_code,
     )
     try:
         await trigger_bot_join(
-            event.meeting_code, settings.bridge, attendees=event.attendees
+            event.meeting_code,
+            settings.bridge,
+            attendees=event.attendees,
+            platform=event.platform,
+            passcode=event.passcode,
         )
     except BotTriggerError:
         logger.exception("failed to trigger bot join for %s", event.event_id)

@@ -23,6 +23,20 @@ class CalendarEvent:
     """Google's RFC3339 ``updated`` field, kept as an opaque string for comparison only."""
     meeting_code: str
     meeting_url: str
+    platform: str = "google_meet"
+    """Which bridge connector serves this meeting.
+
+    **Defaulted rather than required, which is what keeps this change invisible to the
+    existing path.** Every event this service handled before Zoom was a Meet event, and every
+    caller that builds a ``CalendarEvent`` without naming a platform still gets one. A Zoom
+    meeting scheduled into the same calendar sets ``zoom_web``.
+
+    Named ``platform`` because that is the field the bridge's ``POST /sessions`` takes; the
+    string is passed through verbatim rather than translated, so there is one vocabulary."""
+    passcode: str | None = None
+    """The passcode a participant types, when the platform has one and the invite spelled it
+    out. Always ``None`` for Meet, which has no equivalent. See ``meeting_link`` for why a
+    Zoom ``pwd=`` token is deliberately not used here."""
     attendees: tuple[str, ...] = ()
     """Who was invited, best display name first.
 
@@ -39,8 +53,12 @@ class CalendarEvent:
 
 
 class MissingConferenceDataError(ValueError):
-    """Raised when an event has no extractable Google Meet link.
+    """Raised when an event names no meeting the bot could join.
 
     Caught and skipped by the calendar service — an event without conferencing isn't a
     meeting the bot has anything to join, not a failure worth surfacing.
+
+    Named for Google Meet because that is all this service once handled; it now covers a Zoom
+    link too. Kept under the old name rather than renamed, because the name appears in
+    deployed log lines and the meaning is unchanged: there is nothing here to join.
     """

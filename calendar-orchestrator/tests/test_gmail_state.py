@@ -87,4 +87,8 @@ def test_query_ors_multiple_senders():
 
     query = service.build_query()
 
-    assert "(from:a@example.com OR from:b@example.com)" in query
+    # Substring-per-term rather than the whole parenthesised group: the group now also
+    # carries a ``subject:`` term for the in-meeting invite, which has no ``from:`` that
+    # could ever match it (``GmailSettings.any_sender_subject_markers``). What this test is
+    # actually about — that several senders are OR-ed rather than AND-ed — is unchanged.
+    assert "from:a@example.com OR from:b@example.com" in query

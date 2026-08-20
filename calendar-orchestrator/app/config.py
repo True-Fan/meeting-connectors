@@ -84,6 +84,14 @@ class BridgeSettings(BaseModel):
 
     url: str = "http://localhost:8000/sessions"
     platform: str = "google_meet"
+    """Fallback platform, used only when the link itself did not identify one.
+
+    **No longer the platform every join is sent with.** A meeting's platform is a property of
+    the invite — a Zoom link means ``zoom_web``, a Meet code means ``google_meet`` — so it is
+    decided per meeting by ``meeting_link`` and this is what remains for the case where
+    something reached the bridge without going through that. Left at its old default and its
+    old name so an existing ``.env`` keeps working and keeps meaning the same thing."""
+
     timeout_s: float = Field(default=10.0, gt=0)
     max_retries: int = Field(default=2, ge=0)
     retry_backoff_s: float = Field(default=2.0, gt=0)
@@ -141,21 +149,144 @@ class GmailSettings(BaseModel):
     message actually fetched costs another 5 units, which is why the query is narrowed to
     the invite sender rather than filtering a broad result set in Python."""
 
-    allowed_senders: tuple[str, ...] = ("meetings-noreply@google.com",)
+    allowed_senders: tuple[str, ...] = (
+        "meetings-noreply@google.com",
+        "no-reply@zoom.us",
+        "noreply@zoom.us",
+        "no-reply@zoom.com",
+    )
     """Only mail whose ``From:`` address matches exactly is considered, and the value is
     pushed into the Gmail query so the poll never retrieves anything else.
 
     **This is the security boundary.** Everything downstream makes the bot join a meeting,
-    so anything a human could forge — a forwarded invite, a lookalike domain — must fail
-    here."""
+    so anything a human could forge — a lookalike domain, a spoofed display name — must fail
+    here. Matched against the parsed address, never the raw header, because a display name
+    reading ``meetings-noreply@google.com`` is something anyone can set.
+
+    Three entry forms, widening in this order (see ``invite_parser.sender_allowed``):
+
+    * ``someone@example.com`` — that mailbox only.
+    * ``@example.com`` — anybody at that domain.
+    * ``*`` — anybody at all.
+
+    Zoom's addresses are additions, not replacements: a deployment that had this list at its
+    default keeps accepting exactly the Meet invites it accepted before, and gains Zoom's
+    *scheduled* invitations, which come from ``no-reply@zoom.us`` (or ``@zoom.com`` on some
+    tenants — which one a given account uses is not something this service can discover).
+
+    **A direct in-meeting invite does not come from Zoom, and that is why it needs a
+    decision from you.** Clicking *Invite → Email* in a running meeting composes the mail
+    from the **host's own mailbox**, so it arrives from a colleague at
+    ``someone@example.com`` or ``someone@yourcompany.com``. There is no system address to
+    allow-list, so out of the box that invite is ignored — which is the safe default and
+    also, for most deployments, the wrong one.
+
+    To accept them, name the senders you trust::
+
+        ORCH_GMAIL__ALLOWED_SENDERS='["no-reply@zoom.us","meetings-noreply@google.com","@yourcompany.com"]'
+
+    A domain entry is the proportionate choice: it grants the people who already share your
+    Workspace and nobody else. ``*`` grants everyone who can reach the mailbox, which is
+    reasonable for an unpublished test address and not for anything else."""
 
     subject_markers: tuple[str, ...] = (
+        # Google Meet
         "Happening now:",
         "is inviting you to a video call",
+        # Zoom's scheduled invitation, which really does come from Zoom's own address.
+        "is inviting you to a scheduled zoom meeting",
+        "zoom meeting invitation",
+        "invitation: ",
     )
-    """Matched case-insensitively against the subject; any one hit is enough. Meet uses the
-    same sender for mail that must not trigger a join (recordings ready, missed call), so
-    the sender check alone is not sufficient."""
+    """Matched case-insensitively against the subject; any one hit is enough.
+
+    Both platforms use one sender address for mail that must not trigger a join — recording
+    ready, missed call, cloud storage nearly full — so the sender check alone is not
+    sufficient. This is the second half of that filter, and it is a substring match so a
+    subject carrying the meeting's own title around the marker still hits."""
+
+    any_sender_subject_markers: tuple[str, ...] = (
+        "please join zoom meeting in progress",
+    )
+    """Subjects trusted enough to act on **whoever sent them**.
+
+    This exists for one case, and it is the case the whole direct-invite feature is for:
+    clicking **Invite → Email** inside a running Zoom meeting. No calendar event is created,
+    so the calendar poller structurally cannot see it, and Zoom composes the mail from the
+    **host's own mailbox** — so there is no system address to allow-list and no way to
+    predict the sender. Identifying it by subject is the only handle there is.
+
+    ``allowed_senders`` is skipped for a message matching one of these. Everything else still
+    applies: the body must still yield a real Zoom link (``meeting_link``), the invite must
+    still be newer than ``max_invite_age_s``, and the join is still de-duplicated against
+    meetings the bridge already has.
+
+    **What that costs, stated plainly.** Anyone who can email the bot, using this exact
+    subject and a Zoom link, can make it join that meeting. There is no cryptographic
+    difference between the host's invite and a stranger's — both are ordinary mail. The
+    mitigations are that the subject is an exact Zoom string rather than anything a person
+    would type by accident, that the bot's address is not usually published, and that
+    ``max_invite_age_s`` bounds how long any one message stays actionable.
+
+    **Emptying this tuple turns the behaviour off** and restores sender-only trust::
+
+        ORCH_GMAIL__ANY_SENDER_SUBJECT_MARKERS='[]'
+
+    To keep the subject working but only from known senders, move the string into
+    ``subject_markers`` instead — that list is still gated by ``allowed_senders``."""
+
+    accept_calendar_invitations: bool = True
+    """Act on a Google Calendar invitation, whoever the organiser is.
+
+    A calendar invitation has **neither** handle the other routes use: Google sends it *as
+    the organiser*, so the ``From:`` is an ordinary personal address, and the subject is the
+    event's own title — ``test zoom``, ``Standup``, anything, in any language. What it does
+    have is an ``invite.ics`` part, and that is what identifies it. A structural fact beats a
+    string somebody chose: it cannot be produced by accident and does not depend on wording.
+
+    **Only invitations for a meeting that is already running are acted on**, which is the
+    condition that keeps this from trampling the calendar poller. An invitation to next
+    Tuesday's standup arrives *now* and would otherwise pass every filter — fresh mail, real
+    link, genuine organiser — putting the bot in a meeting six days early. So the inbox path
+    claims only what it alone can do: react to a meeting in progress, the case the calendar
+    poller structurally cannot reach in time. Anything scheduled is left for that poller to
+    join at ``join_lead_time_s`` before it starts.
+
+    Exposure is the same shape as ``any_sender_subject_markers``: anyone who can email the
+    bot a valid ``.ics`` for a live meeting with a Zoom or Meet link in it can make it join.
+    Set false to require an allow-listed sender for these too."""
+
+    accept_zoom_invite_bodies: bool = True
+    """Act on a message whose **body** is a Zoom invitation, whoever sent it and whatever it
+    is called.
+
+    The last of the three routes in, and the one that catches what the other two structurally
+    cannot: a Zoom meeting added to a calendar event. Its subject is the *event's* title —
+    whatever the organiser typed, in any language — and it comes from their own mailbox, so
+    neither the subject markers nor ``allowed_senders`` holds any signal. What is invariant is
+    the invite text Zoom generates.
+
+    The signature is a join link **plus** a labelled ``Meeting ID:`` or ``Passcode:`` line,
+    not merely a link: a colleague writing "we used to meet at zoom.us/j/123456789" has a
+    link and no invitation, and must not move the bot.
+
+    **An ics, where the message has one, overrules this entirely** — including when it says
+    the meeting is next week. Otherwise a body match would walk straight past the timing gate
+    and join six days early.
+
+    Where there is no ics there is no timing to check, so the bounds are the ones that always
+    apply: ``max_invite_age_s`` (a stale message ages out), the join de-duplication, and the
+    fact that the bot's address is not usually published. Exposure is the same shape as the
+    other two open routes — anyone who can email the bot a Zoom invitation can make it join
+    that meeting. Set false to require an allow-listed sender for these."""
+
+    calendar_invite_lead_s: int = Field(default=300, ge=0)
+    """How far before an invited meeting's start time it still counts as "happening now".
+
+    Covers the ordinary case of somebody creating the event a few minutes before the meeting
+    and the bot being expected in it at the top of the hour. Kept well under
+    ``scheduling.join_lead_time_s``'s sibling concerns: this is about deciding *whether* the
+    inbox path owns an invitation at all, not about when to join."""
 
     unread_only: bool = True
     """Restrict the poll to unread mail. Narrows the query to the handful of messages that

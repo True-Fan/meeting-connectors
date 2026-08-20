@@ -1,4 +1,9 @@
-"""Polls the bot's Google Calendar and extracts joinable Google Meet events.
+"""Polls the bot's Google Calendar and extracts joinable meetings.
+
+Google Meet and Zoom both, since a Zoom meeting scheduled through the Google Calendar add-on
+is an ordinary calendar event with a Zoom link on it — the calendar does not care who hosts
+the conference, and neither does this poller. Which connector serves it is decided by
+``meeting_link`` and carried on the event as ``platform``.
 
 Polling rather than push notifications (Google Calendar supports webhook "watch" channels)
 on purpose: watch channels need a publicly reachable HTTPS callback URL and expire on their
@@ -11,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -20,13 +25,14 @@ from googleapiclient.discovery import Resource, build
 from googleapiclient.errors import HttpError
 
 from app.config import Settings
+from app.meeting_link import MeetingLink, find_meeting_link, find_zoom_passcode
 from app.models import CalendarEvent, MissingConferenceDataError
 
 logger = logging.getLogger(__name__)
 
-# Matches the meeting code out of a Meet URL, e.g. "https://meet.google.com/veg-fkxv-rhg"
-# -> "veg-fkxv-rhg". Meet codes are three lowercase-letter groups separated by hyphens.
-_MEET_CODE_RE = re.compile(r"meet\.google\.com/([a-z]+-[a-z]+-[a-z]+)")
+# The Meet pattern used to live here and a copy of it lived in ``invite_parser``, with a
+# comment on each saying the two had to agree. Both now call ``meeting_link``, which is also
+# what taught this path to recognise Zoom without a second copy of a second pattern.
 
 
 class CalendarSyncError(RuntimeError):
@@ -47,7 +53,7 @@ class CalendarService:
         )
 
     async def list_upcoming_meetings(self) -> list[CalendarEvent]:
-        """Fetch events starting within the lookahead window that carry a Meet link.
+        """Fetch events starting within the lookahead window that carry a joinable link.
 
         Events without conferencing, and cancelled events, are silently excluded — this is
         a list of things to *join*, not a mirror of the calendar.
@@ -66,7 +72,7 @@ class CalendarService:
             try:
                 events.append(_parse_event(raw))
             except MissingConferenceDataError:
-                continue  # not a Meet event — e.g. a plain calendar block
+                continue  # no conferencing on it — e.g. a plain calendar block
             except (KeyError, ValueError) as exc:
                 logger.warning("skipping malformed event %s: %s", raw.get("id"), exc)
         return events
@@ -98,15 +104,17 @@ def _parse_event(raw: dict) -> CalendarEvent:
     if start.tzinfo is None:
         start = start.replace(tzinfo=UTC)
 
-    meeting_url, meeting_code = _extract_meet_link(raw)
+    link = _extract_meeting_link(raw)
 
     return CalendarEvent(
         event_id=raw["id"],
         summary=raw.get("summary", "(no title)"),
         start=start,
         updated=raw.get("updated", ""),
-        meeting_code=meeting_code,
-        meeting_url=meeting_url,
+        meeting_code=link.meeting_number,
+        meeting_url=link.url,
+        platform=link.platform,
+        passcode=link.passcode,
         attendees=_extract_attendees(raw),
     )
 
@@ -138,19 +146,58 @@ def _extract_attendees(raw: dict) -> tuple[str, ...]:
     return tuple(names)
 
 
-def _extract_meet_link(raw: dict) -> tuple[str, str]:
-    """Look in ``conferenceData`` first (the structured, current field), then fall back to
-    ``hangoutLink`` (older events / simpler conferencing setups still populate only this)."""
-    for entry_point in raw.get("conferenceData", {}).get("entryPoints", []):
-        if entry_point.get("entryPointType") == "video":
-            uri = entry_point.get("uri", "")
-            match = _MEET_CODE_RE.search(uri)
-            if match:
-                return uri, match.group(1)
+def _extract_meeting_link(raw: dict) -> MeetingLink:
+    """Find the meeting this event is for, on whichever platform hosts it.
 
-    hangout_link = raw.get("hangoutLink", "")
-    match = _MEET_CODE_RE.search(hangout_link)
-    if match:
-        return hangout_link, match.group(1)
+    **Searched in descending order of authority**, which matters more now than it did when
+    only Meet was handled. Google fills ``conferenceData`` and ``hangoutLink`` itself, so
+    those are facts; ``location`` and ``description`` are free text a human or a Zoom add-on
+    wrote, and can contain last week's link in a copied agenda. Taking the structured fields
+    first means the loose ones are only consulted when nothing structured exists.
 
-    raise MissingConferenceDataError(f"event {raw.get('id')} has no Google Meet link")
+    That ordering is also what keeps a **Zoom meeting scheduled from Google Calendar**
+    working: the Zoom add-on writes a proper ``conferenceData`` entry point, while a meeting
+    somebody pasted into the description reaches the last resort — and both are joinable.
+
+    Raises:
+        MissingConferenceDataError: nothing joinable is named anywhere on the event.
+    """
+    structured: list[str] = []
+    for entry_point in raw.get("conferenceData", {}).get("entryPoints", []) or ():
+        if not isinstance(entry_point, dict):
+            continue
+        if entry_point.get("entryPointType") != "video":
+            continue
+        structured.append(str(entry_point.get("uri", "")))
+        # Google's own field for a conferencing passcode, which the Zoom add-on populates.
+        # Appended as ``Passcode: x`` rather than parsed separately so it goes through the
+        # single matcher in ``meeting_link`` — one definition of what a passcode looks like.
+        for key in ("password", "passcode", "accessCode"):
+            value = str(entry_point.get(key) or "").strip()
+            if value:
+                structured.append(f"Passcode: {value}")
+
+    hangout_link = str(raw.get("hangoutLink", ""))
+    notes = str(raw.get("conferenceData", {}).get("notes", ""))
+
+    link = find_meeting_link(
+        "\n".join(structured),
+        hangout_link,
+        notes,
+        str(raw.get("location", "")),
+        str(raw.get("description", "")),
+    )
+    if link is None:
+        raise MissingConferenceDataError(f"event {raw.get('id')} names no joinable meeting")
+
+    # The passcode may be in the description while the link is in ``conferenceData`` — the
+    # Zoom add-on splits them exactly that way. Only ever filled in, never overridden.
+    if link.is_zoom and link.passcode is None:
+        passcode = find_zoom_passcode(
+            "\n".join(structured),
+            str(raw.get("location", "")),
+            str(raw.get("description", "")),
+        )
+        if passcode is not None:
+            link = replace(link, passcode=passcode)
+    return link

@@ -159,13 +159,19 @@ class GmailPoller:
             return False
 
         logger.info(
-            "instant invite from %s (%r) -> joining meeting %s",
+            "instant invite from %s (%r) -> joining %s meeting %s",
             invite.sender,
             invite.subject,
+            invite.platform,
             code,
         )
         try:
-            await trigger_bot_join(code, self._settings.bridge)
+            await trigger_bot_join(
+                code,
+                self._settings.bridge,
+                platform=invite.platform,
+                passcode=invite.passcode,
+            )
         except BotTriggerError as exc:
             # bot_client has already exhausted its own retries. Left unrecorded so the next
             # cycle tries again, bounded by max_attempts and by the invite ageing out.

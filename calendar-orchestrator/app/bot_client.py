@@ -28,6 +28,8 @@ async def trigger_bot_join(
     settings: BridgeSettings,
     *,
     attendees: tuple[str, ...] = (),
+    platform: str | None = None,
+    passcode: str | None = None,
 ) -> None:
     """POST to the bridge to make the bot join ``meeting_code``.
 
@@ -35,13 +37,28 @@ async def trigger_bot_join(
     treated as non-retryable since retrying an identical bad request just wastes the retry
     budget on a call that will fail the same way every time.
 
+    ``platform`` and ``passcode`` come from the invite — a Zoom link resolves to ``zoom_web``
+    and carries a passcode, a Meet code to ``google_meet`` and carries none. Both are keyword
+    arguments with ``None`` defaults rather than a new required parameter, so every existing
+    call site and test that passes neither still sends exactly the request it sent before:
+    ``settings.platform``, no passcode.
+
+    ``passcode`` is omitted from the payload entirely when absent rather than sent as null.
+    The bridge defaults it to ``None`` itself, and a meeting with no passcode and a meeting
+    whose passcode we could not read are the same request as far as it is concerned.
+
     ``attendees`` is the calendar event's invite list. It is sent as a **second, separate call**
-    after the join succeeds, for two reasons: the join contract stays exactly the platform-blind
+    after the join succeeds, for two reasons: the join contract stays the small
     ``{platform, meeting_number}`` the bridge README documents, and the invite list is optional
     enrichment — a bridge that rejects or has never heard of it must not cost us a meeting the
     bot would otherwise have joined. So that call is best-effort and never raises.
     """
-    payload = {"platform": settings.platform, "meeting_number": meeting_code}
+    payload: dict[str, str] = {
+        "platform": platform or settings.platform,
+        "meeting_number": meeting_code,
+    }
+    if passcode:
+        payload["passcode"] = passcode
     last_exc: Exception | None = None
 
     async with httpx.AsyncClient(timeout=settings.timeout_s) as client:
