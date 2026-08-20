@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -621,8 +622,8 @@ class ZoomWebSettings(BaseModel):
     not start its capture pipeline until its device menu has a selection, and that
     selection lives in the Chromium profile.
 
-    Ingest comes over RTMS, Zoom's own API, which carries the audio and the speaker's
-    name and needs nothing from the browser at all.
+    Ingest has two modes — see ``ingest_mode``, which is the single most consequential
+    setting in this class.
     """
 
     enabled: bool = False
@@ -632,6 +633,45 @@ class ZoomWebSettings(BaseModel):
     deliberate choice."""
 
     display_name: str = "AI Avatar"
+
+    ingest_mode: Literal["browser", "rtms"] = "browser"
+    """Where the meeting's audio and everything the avatar knows about the meeting comes from.
+
+    ``browser`` — **the default, and the reason it is the default is availability rather
+    than quality.** The page taps Zoom's own playout graph for audio, and reads the roster,
+    the active speaker, the chat and the captions off the DOM. It needs nothing from the
+    Zoom account hosting the meeting: no RTMS entitlement, no app authorisation, no
+    server-to-server credentials. The avatar joins an ordinary meeting as an ordinary
+    browser participant, which is the only thing that works when the meeting belongs to
+    whoever booked it rather than to the operator.
+
+    ``rtms`` — Zoom's Real-Time Media Streams. **A better signal in every respect**, and
+    worth selecting wherever it is available. Audio, transcript, chat and participant events
+    all arrive as data with a name attached, nothing depends on markup Zoom can rename, and
+    no panel is opened in front of the meeting. It requires the meeting to be hosted on an
+    account with RTMS enabled for this app, plus ``MC_ZOOM__*`` credentials.
+
+    What actually changes when you switch:
+
+    ============================  ==========================  =========================
+    signal                        ``rtms``                    ``browser``
+    ============================  ==========================  =========================
+    audio                         RTMS stream                 tapped from Zoom's playout
+    audio contains the avatar     yes — needs a strict gate    no — gate is a backstop
+    barge-in trigger              ``ACTIVE_SPEAKER_CHANGE``   audio energy + DOM
+    who is present                participant events          participants panel
+    who is speaking               active-speaker events       speaking indicator
+    what was said                 Zoom's per-speaker ASR      captions, if switched on
+    what was typed                chat events                 chat panel
+    two people named "Dev"        told apart by user id       one person
+    survives a Zoom UI change     yes                         selectors may need an edit
+    ============================  ==========================  =========================
+
+    The hand-raise observer reads the page in **both** modes: RTMS has no hand-raise event.
+
+    Everything downstream of ingest is identical. The ledgers, the announcer, the interrupt
+    source and every HTTP endpoint consume the same observation types either way, so a
+    session's API surface does not depend on this."""
 
     per_participant_audio: bool = False
     """Ask RTMS for one **mixed** stream rather than a stream per participant.
@@ -719,16 +759,152 @@ class ZoomWebSettings(BaseModel):
     Raise it if the agent still answers its own tail; lower it if the first word of a reply
     to the avatar is being clipped. The gate is also released the moment an interruption is
     delivered, so a barge-in does not have to wait this out — see ``MediaRouter._yield_floor``.
+
+    **None of the above applies under ``ingest_mode="browser"``, and leaving a large value
+    set there is actively harmful.** Everything here follows from RTMS delivering the mix
+    with the avatar in it. The page tap does not: Zoom does not play a participant their own
+    microphone, and the synthetic microphone is built in an ``AudioContext`` that never
+    connects to a destination, so the avatar's voice is structurally absent from the tapped
+    audio. The gate therefore runs as a *backstop* rather than as the only defence, and
+    barge-in is detected from audio energy — which a long hangover would make deaf, exactly
+    the failure this connector used to have. Leave it unset in browser mode.
     """
+
+    # -- browser ingest ----------------------------------------------------
+    #
+    # Read only when ``ingest_mode`` is ``browser``. These tune the page-side observers
+    # that stand in for the RTMS streams; the *consumer* switches further down
+    # (``attendance_enabled``, ``transcript_enabled``, …) still decide whether a signal is
+    # wanted at all, in both modes. An observer whose consumer is off is never started, so
+    # a deployment that has turned everything off scans nothing.
+
+    capture_frame_ms: int = Field(default=20, ge=10, le=60)
+    """Length of one tapped audio frame, in milliseconds.
+
+    20 ms is what every other leg in this repository uses and there is no reason to differ:
+    it is the Opus frame size, it is what ``AVATAR_INPUT_FORMAT`` is paced at, and a
+    mismatch here would make the pacer's arithmetic approximate for no gain."""
+
+    observe_interval_ms: int = Field(default=700, ge=100, le=5_000)
+    """How often the page scans the DOM for the roster, the speaker, the chat and captions.
+
+    **Shared by all four, and one timer rather than four**, because they run on the renderer
+    thread that also encodes the avatar's audio and feeds the capture graph. Four independent
+    intervals means four chances per period to land on top of an audio callback, for no
+    benefit — none of these needs to run at a different rate from the others.
+
+    Lower it and the avatar reacts sooner to a chat message at the cost of renderer time;
+    raise it if the browser is CPU-starved. The hand observer keeps its own faster timer
+    (``handScanMs``), because an interruption is the one signal where latency is the feature."""
+
+    speaker_min_ms: int = Field(default=300, ge=0, le=5_000)
+    """How long Zoom must keep drawing somebody as the active speaker before it is believed.
+
+    Zoom's speaking indicator is an animation driven by an audio level, so it flickers
+    between syllables and between two people talking at once. Without a floor the tracker is
+    handed a new turn several times a second and the agent a new "current speaker" with it.
+
+    This is the page-side floor only. ``speaker_hold_ms`` and ``speaker_merge_gap_ms`` do the
+    rest on the Python side, where they already existed for the same reason on Google Meet."""
+
+    captions_enabled: bool = True
+    """Read Zoom's live-transcript panel, when something has switched it on.
+
+    This is *reading*, not enabling — see ``captions_auto_enable``. Costs nothing and finds
+    nothing in a meeting with captions off, which is why it can default to true.
+
+    Under ``ingest_mode="browser"`` this is the only source of **who said what**, and that
+    question is otherwise unanswerable in principle: the agent's own transcription receives
+    one mixed stream and knows the words without knowing whose they are, while the speaker
+    observer knows who is talking without knowing the words."""
+
+    captions_auto_enable: bool = False
+    """Click Zoom's captions control if the panel is not already open.
+
+    **Off by default because it is visible to everybody in the meeting.** It is the avatar
+    reaching into somebody else's call and turning a feature on, which is a different kind of
+    act from reading a panel that is already there — the same judgement
+    ``hand_raise_open_panel`` makes, with a larger blast radius.
+
+    Turn it on where the deployment owns the meetings, or where participants have been told.
+    The transcript is substantially less useful without it: with captions off, the avatar can
+    say who spoke and cannot say what they said."""
+
+    chat_open_panel: bool = True
+    """Open the chat panel so its messages can be read.
+
+    Unlike captions this changes nothing for anybody else — the panel is local to the
+    avatar's own client, and nobody is notified. It is still a switch because it is a visible
+    action on the avatar's screen, which matters when the avatar is screen-shared."""
+
+    roster_leave_grace_s: float = Field(default=8.0, ge=0)
+    """How long somebody must be absent from the page before they count as having left.
+
+    **Departures are debounced and arrivals are not**, and a live run is why. The roster is
+    read off Zoom's tile grid, which is re-laid-out constantly — speaker view to gallery view,
+    a panel opening, somebody sharing a screen. A run logged ``zoom_attendance.left`` and then
+    ``rejoined`` forty-four seconds later with the person never having moved: the tile count
+    went from two to one and back.
+
+    That is expensive rather than cosmetic. Every flap re-pushes the meeting brief to the
+    agent, so the avatar is told the room emptied and refilled, and speaker attribution by
+    elimination briefly has nobody to name.
+
+    The asymmetry is deliberate: there is no layout in which Zoom invents a participant, so an
+    arrival is believed at once. Raise this if the roster still flaps; lower it if a real
+    departure takes too long to reach the agent. Unused under ``ingest_mode="rtms"``, where
+    joins and leaves are Zoom's own events and exact."""
+
+    speech_interrupt_threshold: int = Field(default=350, ge=0)
+    """Floor under the energy a voice must reach to take the floor from the avatar, in
+    int16 RMS.
+
+    **A floor, not the trigger.** The trigger is ``max(this, room_noise * 3)``, learned from
+    the meeting — so this only decides how quiet a room has to be before the learned floor
+    stops mattering, and its job is to stop a near-silent meeting setting a bar low enough
+    that line noise interrupts the avatar. See ``services/media/speech_detector.py``.
+
+    **Only reachable under ``ingest_mode="browser"``.** Energy-based barge-in requires the
+    echo gate to be open, which requires the avatar's own voice to be absent from inbound
+    audio — true of the page tap and false of RTMS. Under RTMS the trigger is Zoom's
+    active-speaker event instead and this is not read.
+
+    Raise it if the avatar stops for a keyboard or a passing truck; lower it if a softly
+    spoken interruption is ignored. One caveat before tuning: a participant listening on
+    speakers has their own echo canceller, and while the avatar is talking that canceller
+    suppresses their voice too — no threshold here can recover audio that never arrived."""
+
+    panel_ready_timeout_ms: int = Field(default=10_000, ge=0)
+    """How long to wait for a panel's container before reading it anyway.
+
+    **A fallback, not the mechanism.** The chat and caption observers take their baseline —
+    what was already on screen and must not be answered — when the panel becomes *readable*,
+    which is detected by its container element existing whether or not it holds anything.
+    That distinction is what separates "open and empty" from "not rendered yet", and a live
+    run showed the cost of not making it: a chat panel that opened empty stayed unarmed until
+    somebody typed, then recorded that person's question as backlog and answered nothing.
+
+    This governs only the case where every container selector has been renamed by Zoom. The
+    observer then arms on a timer instead, which risks reading a backlog aloud — the lesser of
+    the two failures, and visible in the log rather than silent."""
+
+    caption_settle_ms: int = Field(default=1_200, ge=0, le=10_000)
+    """How long a caption's text must stop changing before it counts as final.
+
+    Zoom rewrites a caption element in place while it revises its guess, so a reader without
+    this emits a dozen partial versions of one sentence. Too low and the agent is handed half
+    a question; too high and it answers late. Only settled lines reach the transcript."""
 
     # -- meeting awareness -------------------------------------------------
     #
-    # **Almost everything below is served by RTMS rather than by the browser**, which is
-    # the structural difference from ``GoogleMeetSettings``. Zoom reports who joined, who
-    # left, who is speaking, what each person said and what they typed — each with a name
-    # attached — so these switches turn *subscriptions and ledgers* on and off rather than
-    # DOM observers. The one exception is ``hand_raise_enabled``, because RTMS has no
-    # hand-raise event and the indicator exists only on screen.
+    # **What serves these depends on ``ingest_mode``**, and that is the one thing to hold in
+    # mind reading them. Under ``rtms`` they turn *subscriptions and ledgers* on and off:
+    # Zoom reports who joined, who left, who is speaking, what each person said and what they
+    # typed, each with a name attached. Under ``browser`` the same switches turn *DOM
+    # observers* on and off and the connector looks much more like ``GoogleMeetSettings``.
+    #
+    # ``hand_raise_enabled`` is read the same way in both, because RTMS has no hand-raise
+    # event and the indicator exists only on screen.
 
     rtms_transcript_enabled: bool = True
     """Subscribe to Zoom's live transcript, so the avatar knows **who said what**.

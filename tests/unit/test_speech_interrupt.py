@@ -342,6 +342,51 @@ class TestTheHandover:
 
             assert len(transport.sent_control) == 1
 
+    async def test_a_silent_avatar_is_not_interrupted_by_somebody_talking_to_it(
+        self, frame_ctx: FrameContext
+    ) -> None:
+        """**Somebody speaking to a silent avatar is a question, not an interruption.**
+
+        Note that every other test in this class wraps its body in ``_avatar_talking``: the
+        intent was always that a voice interrupts a *speaking* avatar, and the check was
+        simply never written. A live Zoom-web meeting is what surfaced it, because browser
+        ingest is the first connector whose echo gate is open enough for this leg to fire at
+        all.
+
+        What it looked like: ``router.floor_yielded ... trigger=voice was_speaking=False`` on
+        every utterance, so the agent was handed "somebody wants to say something, reply
+        briefly like ok, go ahead" *in front of* the question it was being asked. It dutifully
+        said "Ok, go ahead." and then answered — on every single turn.
+
+        The rule is the one doc 008 §4 already states for a hand versus a voice: a hand
+        interrupts a silent avatar, a voice does not.
+        """
+        router, pacer, transport = _router(frame_ctx, speech=SpeechDetector())
+        async with _running(router):  # deliberately no `_avatar_talking`
+            await _wait_for(lambda: router.stats["forwarded"] > 20)
+
+            assert transport.sent_control == [], "nothing was being said to interrupt"
+            assert not pacer.is_muted
+            assert router.stats["forwarded"] > 20, "and the speech still reached the agent"
+
+    async def test_the_detector_stays_calibrated_while_the_avatar_is_silent(
+        self, frame_ctx: FrameContext
+    ) -> None:
+        """The gate must not starve the detector of the quiet it learns from.
+
+        Applying it by skipping ``observe`` would leave the noise floor at its initial value
+        through the whole silent stretch, so the first frame after the avatar started talking
+        would read as a barge-in — turning the fix into a differently-shaped version of the
+        same bug.
+        """
+        detector = SpeechDetector()
+        router, _pacer, transport = _router(frame_ctx, speech=detector, pcm=ROOM_TONE)
+        async with _running(router):
+            await _wait_for(lambda: router.stats["forwarded"] > 30)
+
+            assert detector.noise_floor > 0, "the room was never measured"
+            assert transport.sent_control == []
+
     async def test_a_quiet_meeting_interrupts_nothing(self, frame_ctx: FrameContext) -> None:
         router, pacer, transport = _router(frame_ctx, speech=SpeechDetector(), pcm=ROOM_TONE)
         async with _avatar_talking(pacer, frame_ctx), _running(router):

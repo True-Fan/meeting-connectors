@@ -27,3 +27,15 @@ def playout_worklet() -> str:
     available is a blob the page builds from this text.
     """
     return (_HERE / "playout_worklet.js").read_text(encoding="utf-8")
+
+
+@lru_cache(maxsize=1)
+def capture_worklet() -> str:
+    """The capture worklet source — the meeting's audio, at the avatar's input format.
+
+    Travels to the page as a string for the same reason ``playout_worklet`` does. Read
+    unconditionally rather than only under browser ingest: it is a few kilobytes, cached
+    for the process, and making the read conditional would put a file-I/O branch on the
+    session-start path to save nothing measurable.
+    """
+    return (_HERE / "capture_worklet.js").read_text(encoding="utf-8")

@@ -173,6 +173,29 @@ class AttendanceSnapshot:
         else:
             lines.append("Nobody else is currently in the meeting — the avatar is alone.")
 
+        if len(here) == 1:
+            # **Stated outright, because the agent demonstrably will not infer it.** A live
+            # run gave the agent exactly the line above — "Currently in the meeting (1): Dev
+            # Choudhary" — and it still answered "I'm sorry, but I don't know your name" when
+            # asked by voice. The same question typed into the chat was answered correctly,
+            # because a chat message arrives with its sender attached and a spoken turn does
+            # not: the avatar hears one mixed stream carrying no attribution at all.
+            #
+            # With exactly one other participant the inference is not a guess — there is
+            # nobody else the voice could belong to — so it is the brief's job to make it,
+            # not the agent's. At two or more this stays silent for the reason every other
+            # elimination in this connector fails closed: naming one of several would be a
+            # guess, and greeting the wrong person by name is worse than not knowing.
+            # ``label``, not the record: ``present`` holds ``AttendanceRecord``s, and
+            # interpolating one puts a dataclass repr — timestamps, user ids and all — into
+            # the agent's context window. ``_join_names`` above is why the line before this
+            # one reads correctly and this one would not have.
+            only = here[0].label
+            lines.append(
+                f'"{only}" is the only other person here, so anyone speaking to the avatar '
+                f'right now is "{only}" — answer with that name when asked who they are.'
+            )
+
         gone = self.departed
         if gone:
             lines.append(f"Was in the meeting but has left ({len(gone)}): {_join_names(gone)}.")

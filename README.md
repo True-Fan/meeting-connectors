@@ -50,6 +50,9 @@ Read in order — each supersedes the previous for its own scope.
 | [004](docs/design/004-sidecar-ipc-protocol.md) | 🔒 Zoom: Python ↔ C++ sidecar IPC protocol, **frozen**. |
 | [005](docs/design/005-teams-connector-architecture.md) | **Teams connector architecture**, and every shared change it required. |
 | [006](docs/design/006-teams-sidecar-ipc-protocol.md) | Teams: Python ↔ .NET sidecar IPC protocol. Independent of 004 by design. |
+| [007](docs/design/007-google-meet-connector-architecture.md) | **Google Meet connector architecture** — a browser as the whole media path. |
+| [008](docs/design/008-zoom-web-meeting-awareness.md) | Zoom-web meeting awareness over RTMS. Authoritative for `INGEST_MODE=rtms`. |
+| [009](docs/design/009-zoom-web-browser-ingest.md) | **Zoom-web without RTMS** — audio tapped from the page, so any account works. Supersedes 008 §2/§4 for `INGEST_MODE=browser`. |
 
 ## Quick start
 

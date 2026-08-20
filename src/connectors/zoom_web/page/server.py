@@ -25,7 +25,7 @@ from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import WebSocketException
 from websockets.http11 import Request, Response
 
-from src.connectors.zoom_web.page.protocol import decode_event
+from src.connectors.zoom_web.page.protocol import decode_audio, decode_event
 from src.infrastructure.logging import get_logger
 
 logger = get_logger(__name__)
@@ -41,6 +41,14 @@ voice into the page, and an exception would drop the connection — which is the
 mute because a hand-raise observer had a bad day. Every handler in this connector is written
 to that rule, and ``_dispatch`` enforces it anyway."""
 
+AudioHandler = Callable[[bytes], None]
+"""What one tapped PCM buffer from the page is handed to.
+
+Synchronous and non-raising for the same reason, and with one addition that matters more
+here: this fires **fifty times a second**. It must not block. ``PageAudioSource`` satisfies
+that by doing nothing but a bounded ``put_nowait``, so a router that has stopped pulling
+costs dropped frames at a counted point rather than a stalled read loop."""
+
 
 class PageAudioServer:
     """Serves the avatar's PCM to the page, and receives what only the page can see.
@@ -54,6 +62,9 @@ class PageAudioServer:
     """
 
     __slots__ = (
+        "_audio_dropped",
+        "_audio_handler",
+        "_audio_received",
         "_clients",
         "_events_dropped",
         "_events_received",
@@ -73,8 +84,11 @@ class PageAudioServer:
         self._clients: set[ServerConnection] = set()
         self._ready = asyncio.Event()
         self._handler: EventHandler | None = None
+        self._audio_handler: AudioHandler | None = None
         self._events_received = 0
         self._events_dropped = 0
+        self._audio_received = 0
+        self._audio_dropped = 0
 
     @property
     def endpoint(self) -> str:
@@ -97,6 +111,30 @@ class PageAudioServer:
     def events_dropped(self) -> int:
         """Frames the page sent that were not usable events. Non-zero means script skew."""
         return self._events_dropped
+
+    @property
+    def audio_received(self) -> int:
+        """Tapped audio frames accepted from the page.
+
+        **Zero is the diagnosis for the whole browser-ingest mode.** The tap is the one part
+        of it that depends on where Zoom renders its audio rather than on what it renders,
+        so an operator whose avatar is deaf needs to know whether frames are arriving at all
+        before looking at anything else. Surfaced through ``PageAudioSource.health``."""
+        return self._audio_received
+
+    @property
+    def audio_dropped(self) -> int:
+        """Binary frames from the page that were not decodable audio."""
+        return self._audio_dropped
+
+    def set_audio_handler(self, handler: AudioHandler | None) -> None:
+        """Register where tapped meeting audio goes. ``None`` discards it.
+
+        ``None`` is the normal state under RTMS ingest: the page is not asked to tap
+        anything, so nothing arrives, and a frame that did arrive would be a script left
+        over from a previous configuration rather than something to route.
+        """
+        self._audio_handler = handler
 
     def set_event_handler(self, handler: EventHandler | None) -> None:
         """Register what page events are delivered to. Replaces any previous handler.
@@ -197,7 +235,54 @@ class PageAudioServer:
             logger.info("zoom_web.page_disconnected", attached=len(self._clients))
 
     def _dispatch(self, message: str | bytes) -> None:
-        """Decode one page frame and hand it to the handler. Never raises.
+        """Route one page frame by its transport type. Never raises.
+
+        **Binary is audio and text is an event**, which is the split ``page/protocol.py``
+        describes. Routing on the frame type rather than on a parsed discriminator is what
+        keeps the audio path free of a JSON decode fifty times a second — and it is a
+        property the WebSocket transport already guarantees, so nothing is being inferred.
+        """
+        if isinstance(message, bytes | bytearray):
+            self._dispatch_audio(bytes(message))
+            return
+        self._dispatch_event(message)
+
+    def _dispatch_audio(self, message: bytes) -> None:
+        """Hand one tapped PCM buffer to the audio handler. Never raises.
+
+        Decoded before the handler check rather than after, so that ``audio_dropped`` counts
+        page/bridge script skew in both modes: a page sending frames nobody registered for is
+        a different fault from a page sending frames nobody can parse, and only the second
+        should look like a protocol problem.
+        """
+        pcm = decode_audio(message)
+        if pcm is None:
+            self._audio_dropped += 1
+            if self._audio_dropped == 1:
+                logger.warning(
+                    "zoom_web.page_audio_unusable",
+                    note="the page sent a binary frame that is not a tapped audio frame; "
+                    "the injected script and this build may have drifted apart",
+                )
+            return
+
+        self._audio_received += 1
+        if self._audio_received == 1:
+            # The counterpart of ``ZoomWebMediaSink``'s first-publish line, and the one that
+            # answers "is the tap working at all" without an operator having to reason about
+            # where Zoom renders its audio.
+            logger.info("zoom_web.first_audio_tapped", samples=len(pcm) // 2)
+
+        handler = self._audio_handler
+        if handler is None:
+            return
+        try:
+            handler(pcm)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("zoom_web.page_audio_handler_failed", error=str(exc))
+
+    def _dispatch_event(self, message: str | bytes) -> None:
+        """Decode one page event and hand it to the handler. Never raises.
 
         **Every frame from every attached page is dispatched**, and the duplication that
         implies is deliberate. ``add_init_script`` runs in every frame Chromium creates, so

@@ -940,3 +940,143 @@ script runs again after navigating from the sign-in probe to the meeting.
 | `no conference audio for 45s with 2 other participant(s) present` | The watchdog. The browser is alive and the capture graph has lost its inputs or been suspended — the one failure every other check reports as healthy. |
 | Avatar joins, is visible, but never speaks | Check `google_meet_publisher` in `GET /sessions/{id}`: `audio=0` with a healthy bridge means Meet is holding a track it was never told to publish. |
 | Renderer keeps crashing (`rejoins` climbing) | `/dev/shm` too small, or memory pressure. §11.4. |
+
+---
+
+# 12. Zoom, joined with a browser (`zoom_web`)
+
+**The connector to use when the meeting is not yours.** The SDK connector (`zoom`) and this
+connector's `rtms` ingest mode both need the *host's* account to have RTMS enabled for the
+app. When the avatar joins meetings booked by customers, candidates or prospects, that
+entitlement does not exist and cannot be obtained — so this mode joins as an ordinary
+browser participant and takes everything from the page.
+
+Full reasoning, and what it costs, in [doc 009](docs/design/009-zoom-web-browser-ingest.md).
+
+## 12.1 What you need
+
+| | |
+|---|---|
+| A Zoom account for the **avatar** | Any account, including free. It is a participant, not a host. |
+| Chromium/Chrome on the host | Same binary the Google Meet connector uses — §11.1. |
+| A persistent Chromium profile | **The one piece of real setup.** §12.2. |
+| A Zoom Marketplace app | **No.** Not in `browser` mode — no credentials, no webhook, no ngrok. |
+| RTMS enabled on the host's account | **No.** That is the entire point. |
+
+## 12.2 Prepare the profile — once, interactively
+
+**This is not optional and it is not about signing in.** Zoom will not start its capture
+pipeline until its device menu has a microphone *selected*, and that selection lives in the
+Chromium profile (`Default/Preferences`). With a throwaway profile the avatar joins, reports
+healthy, and publishes nothing at all — however good the injected audio track is. It is the
+hardest failure in this connector to see, because everything else looks correct.
+
+```bash
+# Launch headed against the profile directory, join any test meeting, and pick a
+# microphone in Zoom's audio menu. Any device will do — the page patch answers the
+# deviceId Zoom then asks for; nothing reads the real hardware.
+poetry run python scripts/zoom_web_login.py
+```
+
+Then point the connector at it:
+
+```bash
+MC_ZOOM_WEB__ENABLED=true
+MC_ZOOM_WEB__PROFILE_DIR=~/.mc/zoom-web-profile
+```
+
+## 12.3 `.env` checklist
+
+```bash
+# Required
+MC_ZOOM_WEB__ENABLED=true
+MC_ZOOM_WEB__PROFILE_DIR=~/.mc/zoom-web-profile
+
+# The default. Everything below is optional.
+MC_ZOOM_WEB__INGEST_MODE=browser
+
+MC_ZOOM_WEB__DISPLAY_NAME=AI Avatar
+MC_ZOOM_WEB__HEADLESS=true
+
+# Meeting awareness. Each is a consumer switch and keeps its meaning in both ingest
+# modes; what changes is whether the page or RTMS serves it.
+MC_ZOOM_WEB__ATTENDANCE_ENABLED=true
+MC_ZOOM_WEB__SPEAKER_TRACKING_ENABLED=true
+MC_ZOOM_WEB__TRANSCRIPT_ENABLED=true
+MC_ZOOM_WEB__CHAT_ENABLED=true
+
+# Visible actions, so each is its own switch.
+MC_ZOOM_WEB__CHAT_OPEN_PANEL=true          # local to the avatar's client
+MC_ZOOM_WEB__HAND_RAISE_OPEN_PANEL=true    # local to the avatar's client
+MC_ZOOM_WEB__CAPTIONS_AUTO_ENABLE=false    # EVERYBODY in the meeting sees this
+
+# Barge-in. Only reachable in browser mode — see 12.6.
+MC_ZOOM_WEB__VOICE_INTERRUPT_ENABLED=true
+MC_ZOOM_WEB__SPEECH_INTERRUPT_THRESHOLD=350
+
+# Observer tuning. Defaults are fine; these are the knobs if they are not.
+MC_ZOOM_WEB__OBSERVE_INTERVAL_MS=700
+MC_ZOOM_WEB__SPEAKER_MIN_MS=300
+MC_ZOOM_WEB__CAPTION_SETTLE_MS=1200
+```
+
+**If you are switching from `rtms`, unset `MC_ZOOM_WEB__ECHO_GATE_HANGOVER_MS`.** It was
+raised to 1500 ms for reasons entirely specific to RTMS's echo loop (doc 008 §4). Browser
+ingest does not have that loop, runs with the gate open, and detects barge-in from audio —
+which a long hangover would make deaf.
+
+## 12.4 Captions, and the one thing you have to decide
+
+Without captions the avatar can say **who** spoke and not **what they said**. That is not a
+tuning problem: the agent's own transcription receives one mixed stream and knows the words
+without knowing whose they are, while the speaker observer knows who is talking without
+knowing the words. Only Zoom's live transcript has both together.
+
+`MC_ZOOM_WEB__CAPTIONS_AUTO_ENABLE=true` makes the avatar click the captions control, which
+**everybody in the meeting sees**. Turn it on where the deployment owns the meetings or
+participants have been told; leave it off otherwise and accept a less capable avatar.
+Reading a transcript panel somebody else opened costs nothing and is on by default.
+
+## 12.5 Starting a session
+
+Identical to every other platform — no webhook, so nothing has to be triggered:
+
+```bash
+curl -sS -X POST localhost:8000/sessions \
+  -H 'content-type: application/json' \
+  -d '{"platform":"zoom_web","meeting_number":"94241716923","passcode":"139601",
+       "display_name":"AI Avatar"}'
+```
+
+## 12.6 Expected log lines, in order
+
+```
+zoom_web.page_server_listening      port=…            the loopback channel is bound
+zoom_web.page_connected             attached=…        the injected script dialled back
+zoom_web.session_joined             audio_joined=true in the meeting AND audible
+zoom_web.page_event  name=audioTapped  detail={how: webaudio, sources: 1}
+                                                      ← THE line to look for
+zoom_web.first_audio_tapped         samples=320       the meeting is being heard
+zoom_web.first_audio_published                        the avatar has been heard
+zoom_attendance.joined              participant=…     the roster observer armed
+zoom_speaker.started                participant=…     the speaking indicator was read
+```
+
+`audioTapped` is the one to check first. **Its absence is the difference between a silent
+meeting and a deaf avatar**, and nothing else in the log distinguishes them — the session
+reports healthy either way, because a meeting where nobody has spoken yet is fine.
+
+## 12.7 Failures and what they mean
+
+| Log / symptom | Meaning |
+|---|---|
+| No `audioTapped` line at all | The tap never attached to Zoom's playout graph. Everything else works; the avatar is deaf. Re-run with `MC_ZOOM_WEB__HEADLESS=false` and check `captureBuildFailed`. |
+| `zoom_web_ingest` health `degraded`, `tapped=0` | The same situation, or a genuinely silent meeting. The report refuses to guess which. |
+| `zoom_web.page_audio_unusable` | The injected script and this build have drifted apart. A stale profile with a cached script, or a partial deploy. |
+| Avatar joins, is visible, never speaks | Check `zoom_web_publish` in `GET /sessions/{id}`. `pages=0` means the page never dialled back — usually `LocalNetworkAccessChecks`. `audio=0` with pages attached means the profile has no microphone selected — §12.2. |
+| Avatar hears itself and answers its own sentences | The echo gate is on in browser mode, or `ECHO_GATE_HANGOVER_MS` is carried over. Both mean the mode branch is not doing what doc 009 §4 describes. |
+| Roster empty, `observerArmed` never logged for it | The participants panel is closed, or `roster_row` selectors miss. The panel is opened only when `HAND_RAISE_OPEN_PANEL` or the roster observer is on. |
+| Speaker never reported | `speaker_marker` selectors miss. Degrades to no attribution; audio is unaffected. Edit `ZoomObserverSelectors` — it is data, in one file. |
+| Chat never seen | Panel closed (`CHAT_OPEN_PANEL=false`) or `chat_item` selectors miss. |
+| Transcript empty but speakers are tracked | Captions are off in the meeting. §12.4. |
+| The avatar answers a question from twenty minutes ago | Should be impossible — the observers arm on first sight and record the backlog without reporting it. If it happens, `observerArmed` was never logged, meaning the panel opened empty and filled later. |

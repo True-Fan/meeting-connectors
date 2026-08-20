@@ -25,6 +25,17 @@ from src.domain.media import AudioFormat, VideoFormat
 class ZoomWebConnectorConfig:
     """Everything the Zoom-web connector needs, and nothing else."""
 
+    @property
+    def browser_ingest(self) -> bool:
+        """Whether the meeting is heard and observed through the page rather than RTMS.
+
+        A property rather than a second field, so there is one answer and it cannot drift
+        from ``ingest_mode``. Read in the three places the two legs actually diverge: which
+        ``AudioSource`` is built, how ``EchoGuard`` is armed, and what the page is told to
+        observe.
+        """
+        return self.ingest_mode == "browser"
+
     # Joining, in the browser
     display_name: str
     join_timeout_s: float
@@ -37,7 +48,21 @@ class ZoomWebConnectorConfig:
     publish_audio_format: AudioFormat
     audio_queue_size: int
 
-    # Ingest, over RTMS
+    # Ingest — which leg, and how the page-side one behaves
+    ingest_mode: str
+    capture_frame_ms: int
+    observe_interval_ms: int
+    speaker_min_ms: int
+    captions_enabled: bool
+    captions_auto_enable: bool
+    chat_open_panel: bool
+    caption_settle_ms: int
+    panel_ready_timeout_ms: int
+    speech_interrupt_threshold: int
+    roster_leave_grace_s: float
+
+    # Ingest, over RTMS. Read only when ``ingest_mode == "rtms"``; a browser-ingest
+    # deployment leaves every one of these at its default and never makes an outbound call.
     client_id: str
     client_secret: SecretStr
     rtms_auto_start: bool
@@ -91,7 +116,29 @@ class ZoomWebConnectorConfig:
     @classmethod
     def from_settings(cls, settings: Settings) -> ZoomWebConnectorConfig:
         zoom_web = settings.zoom_web
+        browser = zoom_web.ingest_mode == "browser"
         return cls(
+            ingest_mode=zoom_web.ingest_mode,
+            capture_frame_ms=zoom_web.capture_frame_ms,
+            observe_interval_ms=zoom_web.observe_interval_ms,
+            speaker_min_ms=zoom_web.speaker_min_ms,
+            # Folded against the transcript consumer for the reason the RTMS subscriptions
+            # are folded against theirs: opening a panel nobody reads is a visible action in
+            # somebody else's meeting taken for no purpose at all.
+            captions_enabled=(
+                browser and zoom_web.captions_enabled and zoom_web.transcript_enabled
+            ),
+            captions_auto_enable=(
+                browser
+                and zoom_web.captions_auto_enable
+                and zoom_web.captions_enabled
+                and zoom_web.transcript_enabled
+            ),
+            chat_open_panel=zoom_web.chat_open_panel,
+            caption_settle_ms=zoom_web.caption_settle_ms,
+            panel_ready_timeout_ms=zoom_web.panel_ready_timeout_ms,
+            speech_interrupt_threshold=zoom_web.speech_interrupt_threshold,
+            roster_leave_grace_s=zoom_web.roster_leave_grace_s,
             display_name=zoom_web.display_name,
             join_timeout_s=zoom_web.join_timeout_s,
             join_poll_interval_s=zoom_web.join_poll_interval_s,
@@ -134,16 +181,30 @@ class ZoomWebConnectorConfig:
                     or zoom_web.voice_interrupt_enabled
                 )
             ),
-            chat_enabled=zoom_web.chat_enabled and zoom_web.rtms_chat_enabled,
+            # **Each consumer is folded against the subscription that feeds it — but only
+            # when RTMS is what feeds it.** Under browser ingest these signals come off the
+            # page, so an ``MC_ZOOM_WEB__RTMS_EVENTS_ENABLED=false`` left over from an
+            # earlier configuration would silently switch off attendance, speaker tracking
+            # and barge-in in a mode where RTMS is not involved at all. That failure is
+            # invisible — the avatar simply never knows who is in the meeting — which is why
+            # the mode is folded in here rather than left for a reader to notice.
+            chat_enabled=zoom_web.chat_enabled and (browser or zoom_web.rtms_chat_enabled),
             chat_require_mention=zoom_web.chat_require_mention,
             chat_mention_names=tuple(zoom_web.chat_mention_names),
             transcript_enabled=(
                 zoom_web.transcript_enabled
-                and (zoom_web.rtms_transcript_enabled or zoom_web.rtms_chat_enabled)
+                and (
+                    browser
+                    or zoom_web.rtms_transcript_enabled
+                    or zoom_web.rtms_chat_enabled
+                )
             ),
-            attendance_enabled=zoom_web.attendance_enabled and zoom_web.rtms_events_enabled,
+            attendance_enabled=(
+                zoom_web.attendance_enabled and (browser or zoom_web.rtms_events_enabled)
+            ),
             speaker_tracking_enabled=(
-                zoom_web.speaker_tracking_enabled and zoom_web.rtms_events_enabled
+                zoom_web.speaker_tracking_enabled
+                and (browser or zoom_web.rtms_events_enabled)
             ),
             speaker_hold_ms=zoom_web.speaker_hold_ms,
             speaker_merge_gap_ms=zoom_web.speaker_merge_gap_ms,
@@ -151,7 +212,8 @@ class ZoomWebConnectorConfig:
             context_push_interval_s=zoom_web.context_push_interval_s,
             context_push_require_negotiation=zoom_web.context_push_require_negotiation,
             voice_interrupt_enabled=(
-                zoom_web.voice_interrupt_enabled and zoom_web.rtms_events_enabled
+                zoom_web.voice_interrupt_enabled
+                and (browser or zoom_web.rtms_events_enabled)
             ),
             hand_raise_enabled=zoom_web.hand_raise_enabled,
             hand_raise_open_panel=zoom_web.hand_raise_open_panel,

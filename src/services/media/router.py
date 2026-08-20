@@ -234,7 +234,31 @@ class MediaRouter:
 
         # Before the send, not after: stopping the avatar is the half of an interruption that
         # has to be immediate, and ``avatar.send`` awaits a transport that can be slow.
-        taking_floor = self._note_speech(frame)
+        #
+        # **Only while the avatar is actually talking**, and this guard is the difference
+        # between barge-in and a conversation the agent cannot hold. An interruption is a
+        # request to *stop*; when nothing is being said there is nothing to stop, and what
+        # the agent receives instead is "somebody wants to say something, reply briefly like
+        # ok, go ahead" — in front of the question they are about to be asked. Observed live
+        # on every single utterance in a Zoom-web meeting: the agent answered "Ok, go ahead."
+        # and then answered the question, on every turn, having been told to defer to a
+        # speaker who was already speaking to it.
+        #
+        # The rule is the one doc 008 §4 states for ``ZoomInterruptSource`` and this leg was
+        # simply missing: **a hand interrupts a silent avatar too, a voice does not.** Every
+        # test in ``test_speech_interrupt.py`` keeps the avatar mid-sentence for the body of
+        # the test, so the intent was always this — the check was never written.
+        #
+        # ``pacer.is_speaking`` rather than "did the agent send us something", because the
+        # question is whether the *room* can hear the avatar right now. A sentence sitting in
+        # a queue is not something anybody is talking over.
+        #
+        # **The gate is passed in rather than applied out here**, because the detector has to
+        # see every frame either way: it learns the room's noise floor from the frames it is
+        # given, and skipping the ones where the avatar is silent would starve it of exactly
+        # the quiet it needs to calibrate — leaving it to fire on the first frame after the
+        # avatar starts talking.
+        taking_floor = self._note_speech(frame, avatar_speaking=self._pacer.is_speaking)
         if taking_floor is not None:
             try:
                 await self._yield_floor(taking_floor, trigger="voice")
@@ -242,7 +266,19 @@ class MediaRouter:
                 # Contained exactly like the hand-raise leg's: an interruption that could not
                 # be delivered must not take the meeting's audio down with it.
                 logger.warning("router.speech_interrupt_failed", error=str(exc))
-        elif self._speech is not None and self._speech.is_speaking:
+        elif (
+            self._speech is not None
+            and self._speech.is_speaking
+            # **Renewing a hold, never starting one**, which ``extend_hold`` cannot tell
+            # apart on its own — it pushes ``muted_until`` forward from whatever it was, so
+            # calling it on an unmuted pacer *mutes* it. Without this the avatar is held down
+            # for as long as anybody talks to it, interruption or no; the agent's reply then
+            # arrives into a muted pacer and its opening is discarded, which reads as an
+            # avatar that answers late and clipped. Surfaced by the same live meeting as the
+            # guard above, and the same shape of mistake: acting on speech that is not an
+            # interruption.
+            and self._pacer.is_muted
+        ):
             # Still talking. Renew the hold so the sentence still arriving from the agent
             # keeps being discarded rather than resuming between their words — a fixed window
             # fits a click, not a question.
@@ -365,7 +401,7 @@ class MediaRouter:
 
     # -- inbound: a voice → stop talking -----------------------------------
 
-    def _note_speech(self, frame: AudioFrame) -> HandRaise | None:
+    def _note_speech(self, frame: AudioFrame, *, avatar_speaking: bool) -> HandRaise | None:
         """Report a participant starting to speak as the raised hand it amounts to.
 
         **A voice and a hand are the same request — "stop, I want to speak" — so they get the
@@ -379,10 +415,20 @@ class MediaRouter:
         that, and it is what makes the avatar say "ok, go ahead" rather than fall silent for a
         second and carry on. A raised hand has always done both. Now so does a voice.
 
-        Returns None when nobody has just started — which is almost every frame.
+        Returns None when nobody has just started — which is almost every frame — and also
+        when the avatar is not talking, because then there is nothing to interrupt. See
+        ``_forward`` for why that second condition is a correctness requirement rather than
+        an optimisation, and why the frame is still observed when it holds.
         """
         detector = self._speech
-        if detector is None or not detector.observe(frame):
+        if detector is None:
+            return None
+        # **Observed unconditionally, before the gate.** The detector's learned noise floor
+        # comes from the frames it is shown, and the quiet ones are the only frames it can
+        # learn from — feeding it only the frames where the avatar happens to be talking
+        # would leave it permanently uncalibrated and firing on room tone.
+        started = detector.observe(frame)
+        if not started or not avatar_speaking:
             return None
         # Asked at the moment of the interruption, which is the only moment the answer is about.
         # A miss costs the name and never the barge-in — the two are decided independently, so an
