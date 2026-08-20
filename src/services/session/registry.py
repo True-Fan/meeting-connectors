@@ -26,7 +26,27 @@ from src.infrastructure.logging import get_logger
 
 logger = get_logger(__name__)
 
-DEFAULT_PENDING_TTL_S = 300.0
+DEFAULT_PENDING_TTL_S = 45.0
+"""How long a parked ``rtms_started`` payload is still worth claiming.
+
+**Bounded by Zoom, not by us.** Zoom stops an RTMS stream that nothing attaches to
+within roughly a minute, so a parked binding stops being a way in and becomes a
+signaling URL for a stream that no longer exists. Attaching to one fails with
+``received 1000 (OK) Normal close`` — a clean close, because from Zoom's side
+nothing is wrong: we dialled a number that had been disconnected.
+
+This was 300 s, which held bindings five times longer than they stay valid. The
+observable failure was a session created a minute after a meeting started: the
+webhook had parked at once, the operator's ``POST /sessions`` arrived 57 s later,
+the binding was claimed as though fresh, and the attach failed on a dead stream.
+
+Expiring instead is what makes that recoverable: with no binding to claim the
+meeting UUID stays unset, so the RTMS auto-trigger fires and asks Zoom for a *new*
+stream — which is the only thing that can actually work at that point.
+
+Deliberately under Zoom's window rather than at it, since the claim is followed by a
+handshake that also has to complete inside it.
+"""
 
 
 @dataclass(frozen=True, slots=True)

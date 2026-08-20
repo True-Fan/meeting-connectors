@@ -61,8 +61,15 @@ DEFAULT_ATTACH_WAIT_POLL_S = 0.5
 DEFAULT_ATTACH_WAIT_TIMEOUT_S = 300.0
 """How long to wait for ``meeting.rtms_started`` before failing this component.
 
-Matches ``SessionRegistry.DEFAULT_PENDING_TTL_S`` — there is no point waiting past
-the point a parked binding on the other side of the race would itself expire.
+**No longer tied to ``SessionRegistry.DEFAULT_PENDING_TTL_S``, and the two now
+measure different things.** That TTL bounds how long an *already delivered* binding
+stays claimable, and it is short because Zoom stops an unattached stream within about
+a minute. This bounds how long a session waits for a webhook to *arrive at all*,
+where the constraint is an operator's patience rather than Zoom's teardown: a webhook
+delivered at 200 s is newly issued, so binding it is exactly right.
+
+Keeping them equal was the older assumption; shortening this alongside the TTL would
+make a slow-to-trigger meeting fail for no reason.
 """
 
 

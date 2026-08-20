@@ -18,6 +18,8 @@ webhook.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from src.domain.health import ComponentState, HealthReport
@@ -152,3 +154,71 @@ async def test_webhook_first_still_parks_and_is_claimed_on_create(
 
     assert created.meeting.meeting_uuid == "uuid-abc=="
     assert registry.pending_count() == 0
+
+
+# --------------------------------------------------------------------------- #
+# Staleness
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_stale_binding_is_not_claimed(
+    service: MeetingService, registry: SessionRegistry
+) -> None:
+    """The failure this bound the TTL for.
+
+    Zoom stops an RTMS stream nothing attaches to within about a minute, so an old
+    parked binding is a signaling URL for a stream that no longer exists. Claiming
+    one produced ``received 1000 (OK) Normal close`` — a *clean* close, because from
+    Zoom's side nothing was wrong: we dialled a disconnected number.
+
+    Observed live with a 300 s TTL: the webhook parked immediately, the operator's
+    ``POST /sessions`` arrived 57 s later, the binding was claimed as though fresh,
+    and the attach failed.
+    """
+    stale = PendingRtmsBinding(
+        meeting_uuid="uuid-stale==",
+        rtms_stream_id="stream-1",
+        signaling_url="wss://rtms.example/dead",
+        received_at=time.monotonic() - 120.0,
+    )
+    registry.park_pending_rtms(stale)
+
+    created = await service.create_session(
+        CreateSessionCommand(meeting_number="9414944", platform=MeetingPlatform.ZOOM_WEB)
+    )
+
+    # Unbound, which is what lets the auto-trigger ask Zoom for a *live* stream
+    # instead of attaching to a dead one.
+    assert created.meeting.meeting_uuid is None
+
+
+async def test_a_fresh_binding_is_still_claimed(
+    service: MeetingService, registry: SessionRegistry
+) -> None:
+    """The TTL must not break the case it exists to protect."""
+    registry.park_pending_rtms(
+        PendingRtmsBinding(
+            meeting_uuid="uuid-fresh==",
+            rtms_stream_id="stream-1",
+            signaling_url="wss://rtms.example/live",
+            received_at=time.monotonic() - 1.0,
+        )
+    )
+
+    created = await service.create_session(
+        CreateSessionCommand(meeting_number="9414944", platform=MeetingPlatform.ZOOM_WEB)
+    )
+
+    assert created.meeting.meeting_uuid == "uuid-fresh=="
+
+
+def test_the_ttl_stays_under_zooms_teardown_window() -> None:
+    """A guard on the number itself, since the constraint is external.
+
+    Zoom's window is about 60 s and the claim is followed by a handshake that also
+    has to finish inside it, so raising this back up reintroduces the dead-stream
+    attach rather than merely being generous.
+    """
+    from src.services.session.registry import DEFAULT_PENDING_TTL_S
+
+    assert DEFAULT_PENDING_TTL_S < 60.0
