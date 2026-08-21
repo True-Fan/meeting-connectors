@@ -1080,3 +1080,258 @@ reports healthy either way, because a meeting where nobody has spoken yet is fin
 | Chat never seen | Panel closed (`CHAT_OPEN_PANEL=false`) or `chat_item` selectors miss. |
 | Transcript empty but speakers are tracked | Captions are off in the meeting. §12.4. |
 | The avatar answers a question from twenty minutes ago | Should be impossible — the observers arm on first sight and record the backlog without reporting it. If it happens, `observerArmed` was never logged, meaning the panel opened empty and filled later. |
+
+---
+
+# 13. Microsoft Teams, joined with a browser (`teams_web`)
+
+**The connector to use when the tenant is not yours.** The Graph connector (§10) needs an
+Azure AD application with `Calls.JoinGroupCall.All` and `Calls.AccessMedia.All`
+admin-consented **in the tenant that owns the meeting**, plus a Windows host running the .NET
+media SDK. When the avatar joins meetings booked by customers, candidates or prospects, that
+consent belongs to an administrator who has never heard of us — so this connector joins the
+ordinary web client as a guest and takes everything from the page.
+
+Same trade as §12, one step further along: Zoom's blocked path was a licensed SDK download,
+Teams' is a signature. Full reasoning, and what it costs, in
+[doc 010](docs/design/010-teams-web-connector-architecture.md).
+
+> **Status: the selectors are unverified.** Every `data-tid` in
+> `connectors/teams_web/automation/selectors.py` and `meeting/join.py` is a candidate drawn
+> from hooks the Teams web client is known to use — none has been run against a live Teams
+> build. §13.7 is the loop that turns them into measurements, and it is the actual first test.
+
+## 13.1 What you need
+
+| | |
+|---|---|
+| A Microsoft account for the **avatar** | **No.** It joins as an anonymous guest. One is optional — §13.2. |
+| Chromium/Chrome on the host | Same binary the Google Meet connector uses — §11.1. |
+| A persistent Chromium profile | **Optional**, unlike `zoom_web`. §13.2. |
+| An Azure AD app registration | **No.** That is the entire point. |
+| A Windows media host | **No.** |
+| Somebody to admit the avatar from the lobby | **Yes**, for a guest join. Or use a signed-in profile. |
+
+## 13.2 The profile — optional, and why
+
+**Unlike `zoom_web`, this is not what makes the microphone work.** Zoom refuses to start its
+capture pipeline until a device is selected in its own menu, so a throwaway profile there
+publishes nothing. Teams uses the track `getUserMedia` returns, so the avatar is audible from
+an empty directory.
+
+What a profile buys:
+
+* **a named join instead of a guest one** — a signed-in profile joins as a tenant user, which
+  some organisers require and which usually skips the lobby entirely;
+* **fewer prompts** — the device permission and the "open the Teams app?" preference persist.
+
+```bash
+poetry run python scripts/teams_web_login.py --profile ~/.mc/teams-web-profile
+```
+
+Leave `MC_TEAMS_WEB__PROFILE_DIR` unset to join as a guest every time. **Setting it to a
+directory you never signed in to is the worst of both**: an empty profile is created, the join
+is still a guest join, and nothing tells you the sign-in never happened.
+
+## 13.3 `.env` checklist
+
+```bash
+# Required. The only one.
+MC_TEAMS_WEB__ENABLED=true
+
+# Optional
+MC_TEAMS_WEB__PROFILE_DIR=~/.mc/teams-web-profile   # only if you ran §13.2
+MC_TEAMS_WEB__DISPLAY_NAME=AI Avatar
+MC_TEAMS_WEB__HEADLESS=true                          # false for the first runs — §13.7
+
+# Meeting awareness. Each is a consumer switch; every one is served by the page,
+# because there is no API half on this connector.
+MC_TEAMS_WEB__ATTENDANCE_ENABLED=true
+MC_TEAMS_WEB__SPEAKER_TRACKING_ENABLED=true
+MC_TEAMS_WEB__TRANSCRIPT_ENABLED=true
+MC_TEAMS_WEB__CHAT_ENABLED=true
+MC_TEAMS_WEB__CHAT_REQUIRE_MENTION=true
+MC_TEAMS_WEB__CHAT_MENTION_NAMES=["bot","avatar"]
+
+# Visible actions, so each is its own switch.
+MC_TEAMS_WEB__CHAT_OPEN_PANEL=true          # local to the avatar's client
+MC_TEAMS_WEB__HAND_RAISE_OPEN_PANEL=true    # local to the avatar's client
+MC_TEAMS_WEB__CAPTIONS_AUTO_ENABLE=false    # EVERYBODY in the meeting sees this
+
+# Barge-in. Both triggers are live here — §13.6.
+MC_TEAMS_WEB__VOICE_INTERRUPT_ENABLED=true
+MC_TEAMS_WEB__SPEECH_INTERRUPT_THRESHOLD=350
+MC_TEAMS_WEB__HAND_RAISE_ENABLED=true
+
+# The lobby is the normal case for a guest, so the default is generous.
+MC_TEAMS_WEB__JOIN_TIMEOUT_S=120.0
+
+# Teams' own CSP blocks the loopback channel the injected script dials, silently — leave
+# this on. See doc 010 §8c.
+MC_TEAMS_WEB__BYPASS_CSP=true
+
+# Where a work/school meeting id is typed in. A setting because Microsoft moves it.
+MC_TEAMS_WEB__JOIN_URL_TEMPLATE=https://teams.microsoft.com/v2/?meetingjoin=true
+# Where a PERSONAL ("Teams for Life") meeting id lives — a URL, not a form. Tried as a
+# fallback when the form above responds to nothing. Empty switches the fallback off.
+MC_TEAMS_WEB__LIVE_URL_TEMPLATE=https://teams.live.com/meet/{meeting_id}
+
+# Observer tuning. Defaults are fine; these are the knobs if they are not.
+MC_TEAMS_WEB__OBSERVE_INTERVAL_MS=700
+MC_TEAMS_WEB__SPEAKER_MIN_MS=300
+MC_TEAMS_WEB__CAPTION_SETTLE_MS=1200
+MC_TEAMS_WEB__ROSTER_LEAVE_GRACE_S=8.0
+```
+
+**Do not set `MC_TEAMS_WEB__ECHO_GATE_HANGOVER_MS`.** The echo gate is switched *off* on this
+connector, so nothing reads it. The avatar's voice is structurally absent from the tapped
+audio (Teams does not play a participant their own microphone), and a shut gate cannot tell an
+echo from somebody talking over the avatar — it would withhold every inbound frame during
+precisely the window a barge-in exists in. Doc 010 §4.
+
+**Nothing here reads `MC_TEAMS__*`.** The two Teams connectors register independently, so a
+deployment can run either, both, or neither. `connectors.teams_not_registered` in the log
+beside a working `teams_web` is correct, not a warning.
+
+## 13.4 Captions, and the one thing you have to decide
+
+Identical trade to §12.4, and it bites harder here because there is no API fallback at all.
+Without captions the avatar can say **who** spoke and not **what they said**: the agent's own
+transcription receives one mixed stream and knows the words without knowing whose they are,
+while the speaker observer knows who is talking without knowing the words.
+
+`MC_TEAMS_WEB__CAPTIONS_AUTO_ENABLE=true` makes the avatar click the captions control, which
+**everybody in the meeting sees**. One extra caveat over Zoom: in several Teams builds that
+control lives behind the **More** menu rather than on the toolbar, in which case the click
+finds nothing and the transcript is limited to captions somebody else switched on. Opening a
+menu is a second visible action and the connector does not take one uninvited — doc 010 §11.
+
+## 13.5 Starting a session
+
+Two routes. **Paste the whole join link into `meeting_number`** — the joiner detects and
+unpacks it, and that is the shortest path from a calendar invite:
+
+```bash
+curl -sS -X POST localhost:8000/sessions \
+  -H 'content-type: application/json' \
+  -d '{"platform":"teams_web",
+       "meeting_number":"https://teams.microsoft.com/l/meetup-join/19%3ameeting_ABC%40thread.v2/0?context=%7b%22Tid%22%3a%22…%22%2c%22Oid%22%3a%22…%22%7d",
+       "display_name":"AI Avatar"}'
+```
+
+Or by the numeric Meeting ID printed in the invite, spacing and all:
+
+```bash
+curl -sS -X POST localhost:8000/sessions \
+  -H 'content-type: application/json' \
+  -d '{"platform":"teams_web","meeting_number":"281 442 953 617",
+       "passcode":"aBc123","display_name":"AI Avatar"}'
+```
+
+A link wins when both are supplied: it carries the tenant and the thread, so it identifies the
+meeting exactly. **Then admit the avatar from the lobby** unless the profile is signed in.
+
+### Work/school vs personal — the one thing to get right
+
+Microsoft runs two Teams, and a meeting id does not say which one it belongs to. Both are
+9-13 digits.
+
+| Your link looks like | That is | What to send |
+|---|---|---|
+| `teams.microsoft.com/l/meetup-join/19%3a…` | work/school, classic | the link, in `meeting_number` |
+| `teams.microsoft.com/meet/<id>?p=…` | work/school, short form | the link, in `meeting_number` |
+| `teams.live.com/meet/<id>?p=…` | **personal / free ("Teams for Life")** | the link, in `meeting_number` |
+| just an id + passcode from an invite | either — unknowable | id in `meeting_number`, passcode in `passcode` |
+
+**Send the link whenever you have one.** All three shapes are recognised and navigated
+directly, and the short forms carry the passcode in the URL, so nothing has to be typed.
+
+For a bare id the joiner cannot know which Teams to try, so it tries the work/school form and
+— if the page responds to *nothing* it does for `ROUTE_FALLBACK_POLLS` polls — navigates
+`LIVE_URL_TEMPLATE` for the same id instead, logging `teams_web.route_fallback`. That is a
+fact about the page rather than a guess about the string. It costs a few seconds out of the
+120 s budget and only happens when the first guess was wrong.
+
+**This was a live failure, not a hypothetical.** A `teams.live.com` meeting driven through the
+work/school form landed on the Teams *app home* for a signed-in personal account — every
+selector correctly matched nothing, and the join timed out with nothing at fault.
+
+## 13.6 Expected log lines, in order
+
+```
+teams_web.page_server_listening    port=…              the loopback channel is bound
+teams_web.continued_in_browser     selector=…          clicked past the desktop-app launcher
+teams_web.waiting_in_lobby                             an organiser has to admit it
+teams_web.in_meeting                                   admitted
+teams_web.unmuted                  attempts=…          audible (or: still_muted — see below)
+teams_web.session_joined           unmuted=true lobby=… the join is complete
+teams_web.page_connected           attached=…          the injected script dialled back
+teams_web.page_event  name=audioTapped  detail={how: rtc, sources: 1}
+                                                       ← THE line to look for
+teams_web.first_audio_tapped       samples=320         the meeting is being heard
+teams_web.first_audio_published                        the avatar has been heard
+teams_attendance.joined            participant=…       the roster observer armed
+teams_speaker.started              participant=…       the speaking ring was read
+teams_web.context_pushed           present=1           the agent holds the brief
+```
+
+`audioTapped` is the one to check first. **Its absence is the difference between a silent
+meeting and a deaf avatar**, and nothing else in the log distinguishes them — the session
+reports healthy either way, because a meeting where nobody has spoken yet is fine. `how` says
+which of the three tap paths fired; on Teams `rtc` is the expected one, where Zoom's is
+`webaudio`.
+
+## 13.7 Bring-up: correcting the selectors
+
+This is the first real test, not a troubleshooting step. Every observer fails by *finding
+nothing*, and finding nothing is what a quiet meeting looks like — so the page reports what it
+can see and the job is to read those reports.
+
+```bash
+MC_TEAMS_WEB__HEADLESS=false poetry run uvicorn src.main:app --port 8000 2>&1 \
+  | grep -E "teams_web|teams_attendance|teams_speaker|teams_chat|teams_transcript"
+```
+
+| `page_event name=` | What to read out of it |
+|---|---|
+| `audioTapped` / `audioTapFailed` / `captureBuildFailed` | The tap. Check before anything else. |
+| `handsArmed`, `participantsPanelOpened`, `panelOpened`, `observerArmed` | The observers starting. `observerArmed existing=N` is the backlog that was recorded and deliberately not answered. |
+| `handsIdle` | `rows` (did the row selectors match), `handLabels` (did Teams write a sentence anywhere), `sample` (the `tid:` hooks a participant row actually contains — never its text, which would be a copy of somebody's name in a log). |
+| `observerIdle` | `counts` per selector, and **`tokens`** — a sweep of what Teams is really calling things. The `tid:` entries are what to write a selector against; Fluent class names are build hashes and change by design. |
+| `observerIdle observer=speaker` | **Read `churn`.** A state marker is by definition a hook that *toggles*, so `churn` lists what appeared and disappeared between scans and layout containers drop out for free. Doc 009 lost two live runs to sampling snapshots at moments when nobody was talking. |
+| `panelSelectorHitAppRail` | A panel selector resolved to Teams' **app rail** — the left-hand navigation strip — and was skipped rather than clicked. Informational, but that selector is dead weight and should be scoped to the toolbar or removed. |
+| `teams_web.page_probe` | Asked once after the join, and it does **not** travel over the page socket — so it is the one diagnostic that survives the channel being broken. `connects`/`closes` tell a held channel from a flapping one; `captureFrames` is the tap; `micTrack` is the synthetic microphone. |
+| `teams_web.page_channel_down` | The script is running and still not attached after several seconds of retrying. Read the three counters together: `closes` climbing is a channel that keeps dropping; **`stale_sockets` climbing with `closes=0` is a socket that failed before its handlers ran** — Chromium refusing the connection outright, which means `LocalNetworkAccessChecks` is no longer disabled. Until it reattaches the avatar is mute, the tap is deaf, and **every other page diagnostic is being dropped**. |
+| `teams_web.page_script_not_running` | No injected script in the page at all. The init script is registered on the browser context before navigation, so this points at a frame it could not run in. |
+| `meetingLost` | The page navigated out of the meeting and is pressing Back to recover. Should be unreachable; if it fires, the `lastPanel` field names the click that did it. |
+
+Correct the wrong list in `automation/selectors.py` (observers) or `meeting/join.py` (launcher,
+pre-join, leave), restart, repeat. Both are **data injected into the page**, so nothing is
+rebuilt and a stale selector costs the signal it carried and nothing else.
+
+## 13.8 Failures and what they mean
+
+| Log / symptom | Meaning |
+|---|---|
+| `connectors.teams_web_not_registered  reason='not configured'` | `MC_TEAMS_WEB__ENABLED` is not `true`. Check with `python -c "from src.config.settings import Settings; print(Settings().teams_web.is_configured())"`. |
+| `TeamsWebJoinTargetError` | The request said which meeting to join in neither accepted way. Raised **before the browser goes anywhere**, so the message names the inputs it got. |
+| `TeamsWebJoinTimeoutError … the avatar was in the lobby` | Nobody admitted it. Not a bug — raise `JOIN_TIMEOUT_S`, or sign the profile in (§13.2). |
+| `TeamsWebJoinTimeoutError … in_meeting=False` with no lobby line | The pre-join screen was never got past. Re-run headed: usually `web_client_button` or `join_button` selectors, or a launcher variant not on the list. |
+| `TeamsWebJoinTimeoutError … nothing on the page responded to the join sequence` | The page is not a join page at all. Either the meeting id belongs to the other Teams (§13.5 — send the link instead), or every pre-join selector has been renamed. Re-run headed and look at what loaded. |
+| `teams_web.route_fallback` in the log | The work/school form responded to nothing, so the personal short link was tried for the same id. Informational — but if it fires on every session, send the link instead of the id and skip the wasted navigation. |
+| `cannot start session: chromium page has crashed` | The page went away mid-join. With `HEADLESS=false` the usual cause is the window being closed or navigated by hand while the joiner was still polling — leave it alone during a run. |
+| `teams_web.still_muted` | **In the meeting and inaudible.** Every other signal says the join worked. Usually the `unmute_button` selectors; a signed-in profile that was last used muted makes it reproducible. |
+| Teams shows **"Mic disconnected — try troubleshooting"** in the call | Teams enumerates audio inputs to fill its device menu, and finding nothing selectable it declares the mic gone — *even though* the patched `getUserMedia` is working. The page appends a fake `audioinput` (`Avatar Microphone`) to the real device list for exactly this. If it recurs, check that `enumerateDevices` is still patched and that the fake device appears first. |
+| The avatar joins, then the browser lands on the Teams **contacts / chat page** | A panel selector matched the app rail's navigation button instead of the calling toolbar's and clicked it, navigating the SPA out of the meeting. The call keeps running behind it, the session reports healthy, and every observer reads a page with no meeting in it. Two guards exist (toolbar-scoped selectors, plus an app-rail exclusion in the page) — look for `panelSelectorHitAppRail` and `meetingLost`. |
+| No `audioTapped` line at all | The tap never attached. Everything else works and the avatar is deaf. Re-run headed and check `captureBuildFailed`. |
+| `teams_web_ingest` health `degraded`, `tapped=0` | The same situation, or a genuinely silent meeting. The report refuses to guess which. |
+| `teams_web.page_audio_unusable` | The injected script and this build have drifted apart — a partial deploy. |
+| Avatar joins, is visible, never speaks — and `first_audio_published attached_pages=0` (a **warning**) | The page is not holding the channel, so nothing the avatar says is audible *and every page diagnostic is being dropped on the way out*. Read `teams_web.page_probe` / `page_channel_down` for the reason. The script now reconnects with a backoff, so a single early close is expected to heal; a `closes` count that keeps climbing is a page that cannot hold the socket at all — usually `LocalNetworkAccessChecks`, see §11's launcher notes. |
+| Roster empty, no `observerArmed` for it | The participants panel is closed, or `roster_row` selectors miss. The panel is opened only when `HAND_RAISE_OPEN_PANEL` or the roster observer is on. |
+| Speaker never reported | `speaker_marker` selectors miss — the least certain list in the file. Degrades to no attribution; audio and energy barge-in are unaffected. Use `churn` (§13.7). |
+| The avatar interrupts itself every sentence | A `speaker_marker` that matched *layout* rather than *state*, so it is permanently present. That is not a marker. `churn` is how to tell the difference. |
+| One person appears as several participants | A `roster_row` selector matching fragments of one tile rather than one element per person. Narrow it; the hand observer's wider list is deliberately separate. |
+| Chat never seen | Panel closed (`CHAT_OPEN_PANEL=false`) or `chat_item` selectors miss. |
+| Transcript empty but speakers are tracked | Captions are off in the meeting, or the control is behind the More menu. §13.4. |
+| Two people with the same display name counted as one | Expected and not fixable here: a DOM row carries no participant id. Doc 010 §5. |
+| The avatar stayed in the meeting after `DELETE /sessions/{id}` | Look for `teams_web.leave_unconfirmed`. The browser is closed regardless, so Teams times the participant out — but the `leave_button`/`leave_confirm_button` selectors need correcting. |

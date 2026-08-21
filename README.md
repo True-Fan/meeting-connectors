@@ -35,6 +35,7 @@ Everything between the two — avatar client, decoder, pacer, echo suppression, 
 | **Teams** connector — bridge side | ✅ built and tested against an in-process fake sidecar |
 | **Teams** publish (.NET sidecar, Graph + Media SDK) | ⚠️ written, not yet compiled on Windows — see [doc 005 §10](docs/design/005-teams-connector-architecture.md) |
 | Google Meet | ⬜ roadmap only |
+| **Teams-web** connector — Chromium, no tenant consent needed | ⚠️ built and unit-tested with no browser; **selectors not yet verified against a live meeting** — see [doc 010 §7](docs/design/010-teams-web-connector-architecture.md) |
 
 Neither connector's pipeline needs its native SDK to be tested: `FileSink` makes the avatar's output watchable as a file, and both sidecars have in-repo fakes that speak their real wire protocols.
 
@@ -53,6 +54,7 @@ Read in order — each supersedes the previous for its own scope.
 | [007](docs/design/007-google-meet-connector-architecture.md) | **Google Meet connector architecture** — a browser as the whole media path. |
 | [008](docs/design/008-zoom-web-meeting-awareness.md) | Zoom-web meeting awareness over RTMS. Authoritative for `INGEST_MODE=rtms`. |
 | [009](docs/design/009-zoom-web-browser-ingest.md) | **Zoom-web without RTMS** — audio tapped from the page, so any account works. Supersedes 008 §2/§4 for `INGEST_MODE=browser`. |
+| [010](docs/design/010-teams-web-connector-architecture.md) | **Teams-web connector architecture** — the same trade as 009, against Teams: a browser instead of a tenant-consented Graph app. Does not replace 005. |
 
 ## Quick start
 

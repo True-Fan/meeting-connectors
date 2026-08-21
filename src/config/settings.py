@@ -1152,6 +1152,433 @@ class ZoomWebSettings(BaseModel):
         return self.enabled
 
 
+class TeamsWebSettings(BaseModel):
+    """Microsoft Teams joined with a browser, publishing through a synthetic microphone.
+
+    **Why this exists alongside ``TeamsSettings``.** That connector is the better one where
+    it can run: Graph's app-hosted media gives per-participant audio with a source id, no
+    DOM anywhere, and a single session carrying both directions. It also needs an Azure AD
+    app registration with admin-consented ``Calls.AccessMedia.All`` **in the tenant that
+    owns the meeting**, plus a Windows host running the .NET media SDK. A deployment that
+    joins meetings other people booked can obtain neither.
+
+    This connector needs neither. The avatar joins the ordinary Teams web client as an
+    anonymous guest — the same thing a person clicking a meeting link without a Teams
+    account gets — publishes through a synthetic ``MediaStreamTrack``, and hears the meeting
+    by tapping the page's own playout graph. The whole cost is that everything it knows
+    about the meeting is read off a DOM Microsoft is free to change.
+
+    Structurally this is ``ZoomWebSettings`` with the RTMS half removed, because there is no
+    RTMS equivalent: Teams' event streams live behind the same Graph entitlement the other
+    connector needs. So there is one ingest mode here rather than two, and every awareness
+    switch below turns a **DOM observer** on or off.
+    """
+
+    enabled: bool = False
+    """Opt-in, like every connector after the first. It takes no credentials of its own —
+    the join URL or meeting id arrives in the request — so there is nothing to infer
+    "wanted" from, and it carries a Chromium dependency that should be a deliberate
+    choice."""
+
+    display_name: str = "AI Avatar"
+    """The name typed into Teams' pre-join form, and therefore the name every participant
+    sees. ``POST /sessions`` overrides it per session."""
+
+    join_url_template: str = "https://teams.microsoft.com/v2/?meetingjoin=true"
+    """Where to go when the request carries a **meeting id** rather than a join link.
+
+    Teams' web client renders a "Join a meeting" form at this address with an id field and a
+    passcode field, which ``TeamsWebJoiner`` fills — the same poll-every-action loop that
+    handles the link route, so neither needs its own code path. A join *link* is navigated
+    to directly and this is not read.
+
+    A setting rather than a constant because Microsoft moves these entry points (``/v2/`` is
+    the current web client; ``/_#/`` was the previous one), and moving with them should be
+    an environment edit rather than a release."""
+
+    live_url_template: str = "https://teams.live.com/meet/{meeting_id}"
+    """Where a **personal** ("Teams for Life") meeting id lives, as a URL rather than a form.
+
+    **This exists because a meeting id does not say which Teams it belongs to.** A work/school
+    id is typed into the form at ``join_url_template``; a personal one is a path segment here,
+    with the passcode appended as ``?p=…``. Both are 9-13 digits and there is no way to tell
+    them apart from the string.
+
+    So the joiner tries the form first and, if the page responds to *nothing* it does, navigates
+    here once instead — a fact about the page rather than a guess about the id. A live run is why
+    it exists: a ``teams.live.com`` meeting driven through the work/school form landed on the
+    Teams app home for a signed-in personal account, where every selector correctly matched
+    nothing and the join timed out with no selector at fault.
+
+    ``{meeting_id}`` is substituted; the passcode is appended from the request. Set it empty to
+    switch the fallback off — worth doing in a deployment that only ever joins work/school
+    meetings and would rather see a clean timeout than a second navigation."""
+
+    bypass_csp: bool = True
+    """Disable the Teams page's Content Security Policy.
+
+    **On by default because without it the connector cannot work at all.** A page's CSP
+    ``connect-src`` governs WebSockets, and Teams' blocks the loopback channel the injected
+    script dials — in the least helpful way available: Chromium hands back a socket already in
+    ``CLOSED``, throws nothing, and fires neither ``error`` nor ``close``. The page cannot tell
+    it was refused and neither can the bridge. A live run measured 58 silent retries against a
+    channel that never opened, while the avatar published into it and the tap's frames were
+    dropped before they were framed.
+
+    What it gives up is narrow, for the reasons ``LOCAL_NETWORK_ACCESS_NOTE`` sets out about
+    the sibling flag: the browser is ours, headless, and visits one site; the channel is
+    loopback-bound and carries a per-session token compared with ``compare_digest``; and
+    nothing on that wire is a credential.
+
+    Set false to launch with the page's CSP intact — worth trying if a future Teams build no
+    longer blocks the channel, since this is a hardening feature and leaving it on is the
+    better end state."""
+
+    force_web_client: bool = True
+    """Click past the "open the Teams app?" launcher instead of waiting it out.
+
+    A meetup-join link lands on a launcher page offering the desktop app, the store, and
+    "Continue on this browser". Only the third is reachable here — there is no desktop
+    Teams in the container and no way to click a native app's dialog — so the joiner clicks
+    it. Turn this off only if a deployment lands directly on the web client and the extra
+    click is finding a false positive."""
+
+    join_timeout_s: float = Field(default=120.0, gt=0)
+    """Longer than Zoom's default, because a Teams lobby is the normal case rather than the
+    exception: an anonymous guest waits for admission unless the organiser has switched the
+    lobby off. Failing early turns a slow host into an error."""
+    join_poll_interval_s: float = Field(default=2.0, gt=0)
+
+    headless: bool = True
+    no_sandbox: bool = False
+
+    profile_dir: Path | None = None
+    """A persistent Chromium profile.
+
+    **Optional here, unlike on the Zoom-web connector.** That one cannot publish without a
+    profile in which a microphone has been chosen once, because Zoom will not start its
+    capture pipeline until its device menu has a selection. Teams accepts the track
+    ``getUserMedia`` returns, so an anonymous guest join works from a throwaway directory.
+
+    Worth setting anyway for two reasons: a profile that is *signed in* joins as a named
+    tenant user rather than a guest — which some organisers require, and which skips the
+    lobby — and a persistent profile keeps Teams' own device and consent state, so the join
+    has fewer prompts to click past. Prepared interactively; see
+    ``scripts/teams_web_login.py``."""
+
+    @field_validator("profile_dir")
+    @classmethod
+    def _expand_teams_web(cls, value: Path | None) -> Path | None:
+        """Expand ``~`` and make the path absolute.
+
+        Pydantic parses ``~/.mc/teams-web-profile`` into a *relative* path whose first
+        component is literally ``~``, so Chromium silently launches an empty profile in the
+        working directory. The session then looks correct while none of the profile's state
+        is present — the same trap ``ZoomWebSettings.profile_dir`` documents.
+        """
+        if value is None:
+            return None
+        return value.expanduser().resolve()
+
+    echo_gate_hangover_ms: int | None = None
+    """How long after the avatar stops publishing the echo gate keeps withholding inbound
+    audio. ``None`` uses the shared ``MC_MEDIA__ECHO_GATE_HANGOVER_MS`` (200 ms).
+
+    **Leave it unset — and be aware that the gate is switched off on this connector, so
+    nothing reads it today.** It is kept because the value is part of the media pipeline's
+    contract and a future ingest leg would need it, not because it is live.
+
+    The gate exists to stop the avatar hearing itself, which is a real problem on a leg that
+    carries the meeting's mix *with the avatar in it* — ``ZoomWebSettings.echo_gate_hangover_ms``
+    documents the loop that follows without one. The page tap has no such loop: Teams does not
+    play a participant their own microphone, and the synthetic microphone is built in an
+    ``AudioContext`` that terminates at a ``MediaStreamDestination`` the tap never watches, so
+    the avatar's voice is structurally absent from the audio it receives.
+
+    A shut gate would then be actively harmful, because it cannot tell the avatar's echo from
+    somebody talking over it: it would suppress the interruption along with the echo, and
+    energy barge-in would be deaf during precisely the window a barge-in exists in. What
+    remains is the acoustic path — a participant listening on speakers — which is a real echo
+    no gate could have caught anyway."""
+
+    # -- the page-side observers -------------------------------------------
+    #
+    # These tune what the injected script reads off the Teams DOM. The *consumer* switches
+    # below (``attendance_enabled``, ``transcript_enabled``, …) still decide whether a signal
+    # is wanted at all, and an observer whose consumer is off is never started — so a
+    # deployment that has turned everything off scans nothing.
+
+    capture_frame_ms: int = Field(default=20, ge=10, le=60)
+    """Length of one tapped audio frame, in milliseconds. 20 ms is the Opus frame size, what
+    ``AVATAR_INPUT_FORMAT`` is paced at, and what every other leg in this repository uses;
+    differing here would only make the pacer's arithmetic approximate."""
+
+    observe_interval_ms: int = Field(default=700, ge=100, le=5_000)
+    """How often the page scans the DOM for the roster, the speaker, the chat and captions.
+
+    One timer for all four, because they run on the renderer thread that also encodes the
+    avatar's audio: four independent intervals means four chances per period to land on top
+    of an audio callback, for no benefit. The hand observer keeps its own faster timer,
+    because an interruption is the one signal where latency is the feature."""
+
+    speaker_min_ms: int = Field(default=300, ge=0, le=5_000)
+    """How long Teams must keep drawing somebody as the active speaker before it is believed.
+
+    Teams renders speech as an animated ring around a participant's tile, driven by an audio
+    level — so it flickers between syllables and between two people talking at once. Without
+    a floor the tracker is handed a new turn several times a second, and the agent a new
+    "current speaker" with it. ``speaker_hold_ms`` and ``speaker_merge_gap_ms`` do the rest
+    on the Python side."""
+
+    captions_enabled: bool = True
+    """Read Teams' live-captions panel, when something has switched it on.
+
+    This is *reading*, not enabling — see ``captions_auto_enable``. Costs nothing and finds
+    nothing in a meeting with captions off, which is why it can default to true.
+
+    It is the only source of **who said what** on this connector, and that question is
+    otherwise unanswerable in principle: the agent's own transcription receives one mixed
+    stream and knows the words without knowing whose they are, while the speaker observer
+    knows who is talking without knowing the words."""
+
+    captions_auto_enable: bool = False
+    """Turn Teams' live captions on if they are not already running.
+
+    **Off by default because it is visible to everybody in the meeting** — it is the avatar
+    reaching into somebody else's call and enabling a feature, which is a different kind of
+    act from reading a panel that is already there. Turn it on where the deployment owns the
+    meetings, or where participants have been told. The transcript is substantially less
+    useful without it: the avatar can say who spoke and cannot say what they said."""
+
+    chat_open_panel: bool = True
+    """Open the chat panel so its messages can be read.
+
+    Unlike captions this changes nothing for anybody else — the panel is local to the
+    avatar's own client and nobody is notified. It is still a switch because it is a visible
+    action on the avatar's screen, which matters when that screen is being shared."""
+
+    roster_leave_grace_s: float = Field(default=8.0, ge=0)
+    """How long somebody must be absent from the page before they count as having left.
+
+    **Departures are debounced and arrivals are not**, which is the asymmetry the Zoom-web
+    connector arrived at after a live run and which applies here for the same reason: the
+    roster is read off a re-rendered list, and Teams re-lays it out constantly — gallery to
+    speaker view, a panel opening, somebody sharing a screen. Every flap re-pushes the
+    meeting brief to the agent, so the avatar is told the room emptied and refilled. There
+    is no layout in which Teams invents a participant, so an arrival is believed at once."""
+
+    speech_interrupt_threshold: int = Field(default=350, ge=0)
+    """Floor under the energy a voice must reach to take the floor from the avatar, in
+    int16 RMS.
+
+    **A floor, not the trigger.** The trigger is ``max(this, room_noise * 3)``, learned from
+    the meeting — so this only decides how quiet a room has to be before the learned floor
+    stops mattering, and its job is to stop a near-silent meeting setting a bar low enough
+    that line noise interrupts the avatar. See ``services/media/speech_detector.py``.
+
+    Raise it if the avatar stops for a keyboard or a passing truck; lower it if a softly
+    spoken interruption is ignored. One caveat before tuning: a participant listening on
+    speakers has their own echo canceller, and while the avatar is talking that canceller
+    suppresses their voice too — no threshold here can recover audio that never arrived."""
+
+    panel_ready_timeout_ms: int = Field(default=10_000, ge=0)
+    """How long to wait for a panel's container before reading it anyway.
+
+    **A fallback, not the mechanism.** The chat and caption observers take their baseline —
+    what was already on screen and must not be answered — when the panel becomes *readable*,
+    detected by its container element existing whether or not it holds anything. That
+    distinction separates "open and empty" from "not rendered yet", and getting it wrong
+    swallows the first real message: a panel that opened empty would stay unarmed until
+    somebody typed, then record that person's question as backlog.
+
+    This governs only the case where every container selector has been renamed. The observer
+    then arms on a timer instead, which risks reading a backlog aloud — the lesser of the two
+    failures, and visible in the log rather than silent."""
+
+    caption_settle_ms: int = Field(default=1_200, ge=0, le=10_000)
+    """How long a caption's text must stop changing before it counts as final.
+
+    Teams rewrites a caption line in place while its recogniser revises the guess, so a
+    reader without this emits a dozen partial versions of one sentence. Too low and the agent
+    is handed half a question; too high and it answers late. Only settled lines reach the
+    transcript."""
+
+    # -- meeting awareness -------------------------------------------------
+    #
+    # The same switches ``ZoomWebSettings`` carries, and under browser ingest they mean the
+    # same thing there as they do here: each turns a DOM observer, a ledger, or a consumer of
+    # one on and off. Nothing in this block reaches a Microsoft API.
+
+    chat_enabled: bool = True
+    """Forward meeting chat to the avatar agent, so a typed question gets a spoken answer.
+
+    Whether messages are *remembered* is ``transcript_enabled``, and whether only tagged ones
+    are answered is ``chat_require_mention`` — three different questions."""
+
+    chat_require_mention: bool = True
+    """Answer only chat messages that ``@``-tag the avatar, ignoring the rest of the room.
+
+    Meeting chat is a conversation between people — links, greetings, participants answering
+    each other — and an avatar that replies to every line is interrupting a room that was not
+    talking to it. With this on, "@AI Avatar what is the notice period?" is answered while
+    "sounds good, thanks!" and "did the avatar join?" are not.
+
+    Teams' compose box offers an ``@`` autocomplete, and what the chat panel renders for a
+    resolved mention is still the display name preceded by ``@`` — so the tag survives into
+    the DOM this reads, and it is **required**. What follows it is matched loosely, ignoring
+    case and optional separators, so ``@AI Avatar``, ``@ai_avatar`` and ``@AIAvatar`` all
+    count; the name must still stand as whole words, so ``@Aisha`` does not trigger an avatar
+    named "AI". The mention is stripped before the text reaches the agent.
+
+    Set false to answer every message — reasonable for a one-to-one meeting, where everything
+    typed is addressed to the avatar anyway."""
+
+    chat_mention_names: list[str] = Field(default_factory=list)
+    """Extra names the avatar answers to after an ``@``, on top of its ``display_name``.
+
+    Worth setting when the joined name is long or awkward to type and people will shorten it
+    — an avatar joining as "TrueFan Interview Avatar" gets ``["Gunika", "bot"]`` so
+    ``@Gunika`` and ``@bot`` are recognised too."""
+
+    transcript_enabled: bool = True
+    """Keep a ledger of what each person said — spoken and typed — for the whole meeting.
+
+    Fed by the captions observer and the chat observer, and worth having with either: a
+    meeting held largely in chat still has a conversation to remember. Read it back with
+    ``GET /sessions/{id}/transcript``; the recent lines are also folded into the brief pushed
+    to the agent."""
+
+    attendance_enabled: bool = True
+    """Keep a record of who was in the meeting, so the agent can be asked about it later.
+
+    What it makes answerable: who is here now, who was here and left, who rejoined, and —
+    when the session has been seeded via ``POST /sessions/{id}/invitees`` — who was invited
+    and never turned up. Read it back with ``GET /sessions/{id}/participants``.
+
+    Cheaper than it looks: it folds the roster the page is already scanning for the speaker
+    observer, and keeps no task and no place on the media path."""
+
+    speaker_tracking_enabled: bool = True
+    """Identify who is speaking, and keep that attribution for the whole meeting.
+
+    What it makes answerable: who is talking right now, who has spoken, in what order and for
+    how long each. Read it with ``GET /sessions/{id}/speakers``. It also names a barge-in:
+    with this off, somebody talking over the avatar is reported to the agent as "Someone"."""
+
+    speaker_hold_ms: int = Field(default=1_500, ge=0)
+    """How long somebody stays "the current speaker" after the floor moves off them.
+
+    Speech has gaps at every clause boundary. Without a hold, asking who is speaking during
+    the pause between two sentences answers "nobody" — true of that instant, and the wrong
+    answer to the question. It is also what stops a barge-in landing in a gap from being
+    attributed to no one."""
+
+    speaker_merge_gap_ms: int = Field(default=1_200, ge=0)
+    """How long a gap may be before it ends a turn rather than punctuating one.
+
+    What makes the history read like a conversation instead of like a waveform: without it,
+    two people alternating quickly produce dozens of turns."""
+
+    context_push_enabled: bool = True
+    """Push the meeting brief to the avatar agent, so it can answer without a round trip.
+
+    Who is here, who is talking, and what has been said — as **one** frame, because an agent
+    has one slot for standing context and two pushers competing for it evict each other.
+
+    Delivered as ``kind="meeting_context"``, which is **not** the channel chat and
+    interruptions use. That distinction is the point: a chat frame is a turn the avatar
+    answers out loud, and an avatar announcing "Aarav Sharma is in the meeting" every time
+    somebody reconnects is worse than one that says nothing."""
+
+    context_push_interval_s: float = Field(default=3.0, ge=0.5, le=120.0)
+    """How often the ledgers are checked for changes worth pushing.
+
+    Not how often anything is sent: a meeting where nothing changed sends nothing, because
+    the brief is standing context and resending an identical one is noise in the agent's
+    context window."""
+
+    context_push_require_negotiation: bool = True
+    """Only send the brief to an agent that negotiated protocol ``1.2`` or above.
+
+    **Set this to False to skip the agent's handshake change.** Adding meeting context to an
+    existing agent otherwise takes two edits — reply ``"1.2"`` in the server hello, *and*
+    handle ``kind="meeting_context"`` — and forgetting the first silently disables the feature
+    while the second looks done. Safe for any agent that ignores control frames it does not
+    recognise."""
+
+    voice_interrupt_enabled: bool = True
+    """**Let somebody talking over the avatar stop it mid-sentence.**
+
+    Driven by audio energy, which this connector can do and the Graph-based Teams connector's
+    sibling on Zoom cannot: the avatar's own voice is structurally absent from the tapped
+    audio, so the echo gate stays open and the inbound mix can be measured while the avatar
+    talks. The DOM speaker observer feeds the same handover, so a barge-in fires on the first
+    syllable and is *named* a moment later.
+
+    Only fires while the avatar is actually speaking. Somebody starting to talk into a silence
+    is just the meeting happening, and interrupting nothing would send the agent a "stop
+    talking" message on every sentence anybody utters.
+
+    Turn it off for a meeting where the avatar should hold the floor through interruptions — a
+    presentation, or a scripted read-out. A raised hand still interrupts."""
+
+    hand_raise_enabled: bool = True
+    """Stop the avatar and hand over when a participant raises their hand.
+
+    Teams marks a raised hand in two places the page can see: an icon on the participant's
+    roster row and tile, and an announcement it renders for screen readers ("… raised their
+    hand"). The injected script watches for both and reports the moment a hand goes up; every
+    judgement about what that means is made in Python.
+
+    It depends on selectors matching a UI Microsoft is free to change, and degrades to silence
+    rather than to an error — which is why the observer reports diagnostics. See
+    ``hand_raise_open_panel`` for the most common reason it finds nothing."""
+
+    hand_raise_open_panel: bool = True
+    """Open the participants panel once, so raised hands are in the DOM to be seen.
+
+    **The roster indicator does not exist in a panel nobody opened.** Teams also shows a hand
+    on the participant's tile, but a tile is only rendered while that person is on screen — so
+    with the panel closed the observer is correct, running, and blind to anybody Teams has
+    paginated away. This is the one visible action the avatar takes inside the meeting, which
+    is why it is a switch; clicked once per session, never toggled."""
+
+    hand_raise_prompt: str = ""
+    """What the agent is told when somebody asks for the floor — by hand **or** by voice.
+
+    Empty uses the wording that ships with the connector, which asks it to stop and hand over
+    in a few words. ``{name}`` is substituted with the person's name, or "Someone" when
+    nothing attributed the request. Nothing else is substituted, and a template that fails to
+    render costs the wording rather than the feature.
+
+    **This steers the avatar's reply; it is not the reply.** The bridge contains no AI and
+    speaks none of its own words — the agent composes what is said, and this is the
+    instruction it receives."""
+
+    hand_raise_cooldown_s: float = Field(default=10.0, ge=0)
+    """How long the same participant is ignored after the avatar has yielded to them.
+
+    Both inputs repeat: the page re-reads a hand that has not moved, and the speaker observer
+    re-reports the same person through a conversation. Either can produce a burst, and an
+    avatar interrupted repeatedly never gets far enough to say "go ahead" — which looks far
+    more broken than a slightly late reaction. Zero disables it."""
+
+    hand_raise_mute_ms: int = Field(default=800, ge=0)
+    """How long avatar audio keeps being discarded after an interrupt.
+
+    **This is what makes barge-in audible rather than theoretical.** When the floor is claimed
+    the agent's speech is already in flight — sent over the socket, sitting in the decoder —
+    and dropping only what is queued for publication buys a couple of hundred milliseconds
+    before the same sentence resumes. Holding the line while the rest drains is what turns
+    that into stopping.
+
+    Too short and the interrupted sentence comes back; too long and the beginning of the
+    *reply* is clipped."""
+
+    def is_configured(self) -> bool:
+        return self.enabled
+
+
 class MediaSettings(BaseModel):
     """Media pipeline geometry and queue depths."""
 
@@ -1231,6 +1658,7 @@ class Settings(BaseSettings):
     teams: TeamsSettings = Field(default_factory=TeamsSettings)
     google_meet: GoogleMeetSettings = Field(default_factory=GoogleMeetSettings)
     zoom_web: ZoomWebSettings = Field(default_factory=ZoomWebSettings)
+    teams_web: TeamsWebSettings = Field(default_factory=TeamsWebSettings)
     avatar: AvatarSettings = Field(default_factory=AvatarSettings)
     media: MediaSettings = Field(default_factory=MediaSettings)
     sidecar: SidecarSettings = Field(default_factory=SidecarSettings)

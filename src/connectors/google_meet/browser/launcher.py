@@ -149,6 +149,25 @@ class LaunchPlan:
     locale: str
     timezone_id: str
     timeout_ms: int
+    bypass_csp: bool = False
+    """Disable the page's own Content Security Policy.
+
+    **Off by default, and the default is what Meet and Zoom-web keep**: neither needs it, and
+    the key is omitted from ``to_playwright_kwargs`` entirely when false so their launch is
+    byte-for-byte what it was.
+
+    It exists for the Teams-web connector. A page's CSP ``connect-src`` governs *WebSockets*
+    too, and a blocked one fails in the least helpful way available: Chromium returns a socket
+    object already in ``CLOSED``, throws nothing, and fires neither ``error`` nor ``close`` — so
+    the page cannot tell that it was refused, and neither can the bridge. The observed symptom
+    was 58 silent retries against a channel that never opened, on an origin whose *earlier*
+    pages had connected to the same loopback port perfectly.
+
+    Disabling CSP for a page we already fully control is a narrow cost: the browser is ours,
+    headless, visits one site, and the channel it protects is loopback-bound and
+    token-authenticated (``page/server.py``). It is nonetheless a page-hardening feature being
+    switched off, which is why it is a field with a default rather than something applied to
+    every connector."""
 
     def to_playwright_kwargs(self) -> dict[str, Any]:
         """Keyword arguments for ``chromium.launch_persistent_context``."""
@@ -169,6 +188,10 @@ class LaunchPlan:
         }
         if self.executable_path is not None:
             kwargs["executable_path"] = str(self.executable_path)
+        # Added only when asked for, so a connector that does not want it launches with exactly
+        # the kwargs it launched with before this field existed.
+        if self.bypass_csp:
+            kwargs["bypass_csp"] = True
         return kwargs
 
 
@@ -183,6 +206,7 @@ def build_launch_plan(
     timeout_s: float = 60.0,
     locale: str = DEFAULT_LOCALE,
     timezone_id: str = DEFAULT_TIMEZONE,
+    bypass_csp: bool = False,
 ) -> LaunchPlan:
     """Resolve every launch parameter for one session.
 
@@ -223,4 +247,5 @@ def build_launch_plan(
         locale=locale,
         timezone_id=timezone_id,
         timeout_ms=int(timeout_s * 1000),
+        bypass_csp=bypass_csp,
     )

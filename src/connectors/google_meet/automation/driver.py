@@ -23,6 +23,8 @@ which is what keeps the browser layer free of business logic.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -126,7 +128,7 @@ class BrowserDriver(Protocol):
 class PlaywrightDriver:
     """``BrowserDriver`` over a real Chromium, launched with a persistent profile."""
 
-    __slots__ = ("_context", "_crashed", "_page", "_playwright", "_stopped")
+    __slots__ = ("_console", "_context", "_crashed", "_page", "_playwright", "_stopped")
 
     def __init__(self) -> None:
         self._playwright: Playwright | None = None
@@ -134,6 +136,40 @@ class PlaywrightDriver:
         self._page: Page | None = None
         self._crashed = False
         self._stopped = False
+        self._console: Callable[[str, str], None] | None = None
+
+    def set_console_handler(self, handler: Callable[[str, str], None] | None) -> None:
+        """Forward the page's console and uncaught errors to ``handler(kind, text)``.
+
+        **Not on the ``BrowserDriver`` protocol, and called through ``getattr`` by the one
+        connector that wants it.** Widening the port would oblige every driver double in the
+        suite to implement a method only Playwright can honour, and the protocol earns its
+        narrowness by being the thing an in-memory fake can satisfy.
+
+        **Off by default, so no existing connector's behaviour changes.** With no handler the
+        listeners still attach but forward nothing — which costs a bound method call per console
+        line and keeps ``start`` a single code path.
+
+        It exists because some browser-side failures are visible *only* here. A WebSocket that
+        Chromium refuses can end up CLOSED without firing an ``error`` or ``close`` event and
+        without the constructor throwing, so the page cannot report the reason and neither can
+        the bridge — Chromium writes it to the console and nowhere else. Without this, that
+        class of failure is diagnosable only by a human watching a headed browser.
+        """
+        self._console = handler
+
+    def _on_console(self, kind: str, text: str) -> None:
+        """Hand one console line to the registered handler. Never raises.
+
+        Total by construction: this runs on Playwright's event loop callback, and a listener
+        that throws there would surface as an unretrieved future rather than as anything
+        useful.
+        """
+        handler = self._console
+        if handler is None:
+            return
+        with suppress(Exception):  # pragma: no cover - defensive
+            handler(kind, text)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -185,6 +221,14 @@ class PlaywrightDriver:
         self._page.on("crash", lambda _page: self._on_crash())
         self._page.on("close", lambda _page: self._on_close())
         self._context.on("close", lambda _context: self._on_close())
+
+        # Attached unconditionally and forwarded only when a handler is registered — see
+        # ``set_console_handler``. Lambdas rather than bound methods for the ``__slots__``
+        # reason the handlers above document.
+        self._page.on(
+            "console", lambda message: self._on_console(message.type, message.text)
+        )
+        self._page.on("pageerror", lambda error: self._on_console("pageerror", str(error)))
 
         logger.info("meet_browser.launched", headless=plan.headless, args=len(plan.args))
 

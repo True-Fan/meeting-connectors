@@ -281,6 +281,7 @@ def test_shared_code_routes_on_the_domain_enum_not_on_a_connector() -> None:
         "teams",
         "google_meet",
         "zoom_web",
+        "teams_web",
     }
 
     # The enum carries identity only: no urls, no ports, no SDK hints. Anything more and

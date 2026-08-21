@@ -242,3 +242,32 @@ class TestProfile:
         blocker.write_text("oops")
         with pytest.raises(MeetConfigurationError, match="not a directory"):
             ProfileManager(template=blocker).ensure_template()
+
+
+class TestCspBypassIsOptOut:
+    """``bypass_csp`` exists for the Teams-web connector and must not reach the others.
+
+    A page's CSP ``connect-src`` governs WebSockets, and Teams' blocks the loopback channel in
+    the least helpful way available — a socket returned already CLOSED, no throw, no events. Meet
+    and Zoom-web need none of that, so the key is omitted from their kwargs entirely rather than
+    passed as ``False``: their launch stays byte-for-byte what it was before the field existed.
+    """
+
+    def test_it_is_off_by_default(self) -> None:
+        assert _plan().bypass_csp is False
+
+    def test_the_key_is_absent_rather_than_false_when_not_asked_for(self) -> None:
+        assert "bypass_csp" not in _plan().to_playwright_kwargs()
+
+    def test_asking_for_it_sets_it(self) -> None:
+        plan = _plan(bypass_csp=True)
+        assert plan.bypass_csp is True
+        assert plan.to_playwright_kwargs()["bypass_csp"] is True
+
+    def test_nothing_else_about_the_launch_changes(self) -> None:
+        """The guard that keeps this additive: same args, same flags, one extra key."""
+        base = _plan().to_playwright_kwargs()
+        with_csp = _plan(bypass_csp=True).to_playwright_kwargs()
+        assert with_csp.pop("bypass_csp") is True
+        assert with_csp == base
+        assert _plan(bypass_csp=True).args == _plan().args

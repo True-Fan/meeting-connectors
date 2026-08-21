@@ -21,6 +21,8 @@ from src.connectors.google_meet.config import GoogleMeetConnectorConfig
 from src.connectors.google_meet.session.google_meet_session import GoogleMeetSessionFactory
 from src.connectors.teams.config import TeamsConnectorConfig
 from src.connectors.teams.session.teams_session import TeamsSessionFactory
+from src.connectors.teams_web.config import TeamsWebConnectorConfig
+from src.connectors.teams_web.session.teams_web_session import TeamsWebSessionFactory
 from src.connectors.zoom.auth.webhook_verifier import WebhookVerifier
 from src.connectors.zoom.config import ZoomConnectorConfig
 from src.connectors.zoom.oauth.router import build_router as build_zoom_oauth_router
@@ -47,6 +49,7 @@ def build_connector_registry(
     teams_factory: Callable[[], TeamsSessionFactory],
     google_meet_factory: Callable[[], GoogleMeetSessionFactory] | None = None,
     zoom_web_factory: Callable[[], ZoomWebSessionFactory] | None = None,
+    teams_web_factory: Callable[[], TeamsWebSessionFactory] | None = None,
 ) -> ConnectorRegistry:
     """Register every connector this deployment can serve.
 
@@ -98,6 +101,20 @@ def build_connector_registry(
         platform=MeetingPlatform.ZOOM_WEB,
         configured=settings.zoom_web.is_configured(),
         factory=zoom_web_factory,
+    )
+    # Opt-in via MC_TEAMS_WEB__ENABLED, for the reason the Zoom-web connector is: it has no
+    # credentials of its own to infer "wanted" from, and it carries a Chromium dependency that
+    # should never appear in a deployment that did not ask for it.
+    #
+    # **Independent of ``settings.teams``, deliberately.** The two Teams connectors have
+    # opposite requirements — one needs a consented Azure AD app and a Windows media host, the
+    # other needs neither — so a deployment can have either, both, or neither, and gating this
+    # on the Graph credentials would make the credential-free connector require credentials.
+    _register_optional(
+        registry,
+        platform=MeetingPlatform.TEAMS_WEB,
+        configured=settings.teams_web.is_configured(),
+        factory=teams_web_factory,
     )
 
     logger.info("connectors.registered", platforms=sorted(registry.supported()))
@@ -210,6 +227,22 @@ class Container(containers.DeclarativeContainer):
         metrics=metrics,
     )
 
+    # -- Teams-web connector -----------------------------------------------
+    #
+    # Structurally parallel to the Zoom-web block above and sharing nothing with the Graph-based
+    # Teams connector. No credential provider, because there is no credential: the avatar joins
+    # the ordinary web client as an anonymous guest, so the only optional input is a browser
+    # profile on disk. See connectors/teams_web/__init__.py for why that connector exists
+    # alongside the other one.
+
+    teams_web_config = providers.Singleton(TeamsWebConnectorConfig.from_settings, settings)
+
+    teams_web_session_factory = providers.Singleton(
+        TeamsWebSessionFactory,
+        config=teams_web_config,
+        metrics=metrics,
+    )
+
     # -- orchestration -----------------------------------------------------
 
     # ``Delegate`` passes the provider itself rather than its resolved value, which is
@@ -222,6 +255,7 @@ class Container(containers.DeclarativeContainer):
         teams_factory=providers.Delegate(teams_session_factory),
         google_meet_factory=providers.Delegate(google_meet_session_factory),
         zoom_web_factory=providers.Delegate(zoom_web_session_factory),
+        teams_web_factory=providers.Delegate(teams_web_session_factory),
     )
 
     meeting_service = providers.Singleton(

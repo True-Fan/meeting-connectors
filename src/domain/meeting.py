@@ -43,6 +43,20 @@ class MeetingPlatform(StrEnum):
     is choosing which machinery runs, which belongs in the request rather than being
     inferred from configuration."""
 
+    TEAMS_WEB = "teams_web"
+    """The same Teams meetings as ``TEAMS``, but joined with a browser.
+
+    A separate member for the reason ``ZOOM_WEB`` is one, and here the gap between the
+    two is even wider. ``TEAMS`` needs an Azure AD app with admin-consented
+    ``Calls.AccessMedia.All``, a tenant that will grant it, and a **Windows** host running
+    the .NET media SDK — three requirements a deployment often cannot satisfy for meetings
+    other people booked. This one drives Chromium, joins as an anonymous guest through the
+    ordinary web client, publishes through a synthetic microphone and hears the meeting by
+    tapping the page. It needs nothing from the tenant.
+
+    Choosing between them is choosing which machinery runs, which belongs in the request
+    rather than being inferred from configuration (doc 010 §1)."""
+
 
 @dataclass(frozen=True, slots=True)
 class ParticipantRef:
