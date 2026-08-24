@@ -190,6 +190,54 @@ async def test_join_is_skipped_when_the_bridge_already_has_the_meeting(
     assert joins == []
 
 
+async def test_a_duplicate_invite_is_finished_with_on_the_first_poll(
+    tmp_path, monkeypatch, joins
+):
+    """**A skipped-as-duplicate invite is handled, not failed**, and conflating the two left
+    already-answered mail sitting unread in the inbox.
+
+    ``_join`` used to return a bare ``False`` here, which is the same value a bridge outage
+    returns — and the caller retries a failure. So the message went unrecorded, was re-fetched
+    on every poll at 5 quota units a time, and stayed **unread** until ``max_attempts`` ran
+    out, all while the bot was already in the meeting. No retry could ever have changed the
+    answer: the meeting is being attended, which is exactly why the join was skipped.
+    """
+
+    async def already_joined(meeting_code, bridge_settings):
+        return True
+
+    monkeypatch.setattr(module, "has_active_session", already_joined)
+    gmail = FakeGmail({"m1": _invite("m1")})
+    poller, store = _poller(
+        gmail, tmp_path, _settings(mark_as_read=True, max_attempts=3)
+    )
+
+    for _ in range(3):
+        await poller.poll_once()
+
+    assert gmail.marked_read == ["m1"], "handled mail left unread in the inbox"
+    assert gmail.fetched == ["m1"], "re-fetched a message there was nothing more to do about"
+    assert await store.count() == 1
+
+
+async def test_a_second_invite_to_a_meeting_this_process_just_joined_is_finished_with(
+    tmp_path, monkeypatch, joins
+):
+    """The same fix on the other duplicate path — the in-process TTL rather than the bridge.
+
+    Two people clicking "Add people" is two emails and one meeting, and the second email is
+    fully dealt with the moment the first one joined.
+    """
+    gmail = FakeGmail({"m1": _invite("m1"), "m2": _invite("m2")})
+    poller, store = _poller(gmail, tmp_path, _settings(mark_as_read=True))
+
+    assert await poller.poll_once() == 1
+    assert joins == ["abc-defg-hij"]
+    # Both: the one that joined, and the duplicate that had nothing left to do.
+    assert sorted(gmail.marked_read) == ["m1", "m2"]
+    assert await store.count() == 2
+
+
 async def test_failed_join_is_retried_then_given_up_on(tmp_path, monkeypatch):
     """A bridge outage should not lose the invite on the first try, nor retry forever."""
     attempts: list[str] = []
@@ -211,6 +259,7 @@ async def test_failed_join_is_retried_then_given_up_on(tmp_path, monkeypatch):
         await poller.poll_once()
 
     assert len(attempts) == 3  # capped, not once and not forever
+    assert gmail.fetched == ["m1", "m1", "m1"], "a real failure must still be retried"
 
 
 async def test_recovers_when_the_bridge_comes_back(tmp_path, monkeypatch):
@@ -293,3 +342,190 @@ async def test_concurrent_polls_do_not_double_join(tmp_path, joins):
     await asyncio.gather(poller.poll_once(), poller.poll_once(), poller.poll_once())
 
     assert joins == ["abc-defg-hij"]
+
+
+# --------------------------------------------------------------------------- #
+# Every message the poller finishes with is marked read — on every platform
+# --------------------------------------------------------------------------- #
+
+# A realistic invite per platform: the envelope each one actually arrives with, not one
+# envelope reused three times.
+#
+# **The senders differ because the platforms differ in what can be trusted, and getting this
+# wrong is how a fixture passes for the wrong reason.** Google Meet has *no body route* — a
+# Meet link from an arbitrary mailbox is refused, and rightly, because a real "Add people"
+# mail comes from `meetings-noreply@google.com` and there is nothing invariant about the body
+# to key on. Zoom and Teams do have one, and for Teams it is the only route there is, so for
+# those two an arbitrary sender under an arbitrary subject is the realistic case rather than
+# the awkward one.
+_PLATFORM_INVITES = {
+    "google_meet": (
+        '"Google Meet" <meetings-noreply@google.com>',
+        "Happening now: Sync",
+        "Join https://meet.google.com/veg-fkxv-rhg",
+    ),
+    "zoom_web": (
+        '"Someone" <someone@example.net>',
+        "Weekly sync",
+        "Join Zoom Meeting\nhttps://us05web.zoom.us/j/83843212151\n"
+        "Meeting ID: 838 4321 2151\nPasscode: 139601",
+    ),
+    "teams_web": (
+        '"Someone" <someone@example.net>',
+        "Weekly sync",
+        "Join the meeting now\nhttps://teams.live.com/meet/9339756425487"
+        "?p=71cQWhQJ5X8fxHSmVy\nMeeting ID: 933 975 642 5487\nPasscode: 71cQWhQJ5X8fxHSmVy",
+    ),
+}
+PLATFORMS = sorted(_PLATFORM_INVITES)
+
+
+def _platform_invite(message_id: str, platform: str, age_s: float = 0) -> dict:
+    """A live invite for ``platform``, in the envelope that platform really uses."""
+    sender, subject, body = _PLATFORM_INVITES[platform]
+    return {
+        "id": message_id,
+        "threadId": f"thread-{message_id}",
+        "snippet": "",
+        "internalDate": str(_now_ms() - int(age_s * 1000)),
+        "payload": {
+            "mimeType": "text/plain",
+            "headers": [
+                {"name": "From", "value": sender},
+                {"name": "Subject", "value": subject},
+            ],
+            "body": {"data": _b64(body)},
+        },
+    }
+
+
+@pytest.mark.parametrize("platform", PLATFORMS)
+async def test_the_fixtures_are_accepted_as_invites(platform, tmp_path, joins):
+    """**A guard on the fixtures, not on the poller.**
+
+    Every test below asserts that a *handled* message was marked read — and a message rejected
+    as "not an invite" is also handled, and also marked read. So a fixture that silently stopped
+    parsing would leave the whole class passing while testing nothing about joining.
+
+    This is not hypothetical: the first version of these fixtures used one arbitrary sender for
+    all three platforms, which Google Meet correctly refuses, and the mark-read assertions
+    passed anyway.
+
+    Parametrised rather than looped, so each platform gets its own ``tmp_path`` and therefore
+    its own dedup store — sharing one made the second platform's message look already-processed,
+    which is the same failure wearing a different hat.
+    """
+    gmail = FakeGmail({"m1": _platform_invite("m1", platform)})
+    poller, _ = _poller(gmail, tmp_path)
+
+    assert await poller.poll_once() == 1, f"{platform} fixture no longer parses"
+
+
+class TestEveryHandledMessageIsMarkedRead:
+    """**The guarantee, asserted per platform rather than argued from the code.**
+
+    ``mark_as_read`` lives in one place (``_finish``) and nothing about it is platform-aware,
+    so it is tempting to test it once and reason that the rest follows. That reasoning is
+    exactly what let the duplicate-invite bug through: the *decision to call* ``_finish`` is
+    made on an outcome, and one outcome was being misread — so "marking works" was true and
+    "handled mail gets marked" was not.
+
+    So this walks every way handling can end, on every platform. The one exception is stated
+    at the bottom, and it is an exception because the mail was never read in the first place.
+    """
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    async def test_a_joined_invite_is_marked_read(self, platform, tmp_path, joins):
+        gmail = FakeGmail({"m1": _platform_invite("m1", platform)})
+        poller, _ = _poller(gmail, tmp_path, _settings(mark_as_read=True))
+
+        assert await poller.poll_once() == 1
+        assert gmail.marked_read == ["m1"]
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    async def test_a_duplicate_invite_is_marked_read_on_the_first_poll(
+        self, platform, tmp_path, monkeypatch, joins
+    ):
+        """The regression. Retrying could never have turned this into a join."""
+
+        async def already_joined(meeting_code, bridge_settings):
+            return True
+
+        monkeypatch.setattr(module, "has_active_session", already_joined)
+        gmail = FakeGmail({"m1": _platform_invite("m1", platform)})
+        poller, _ = _poller(gmail, tmp_path, _settings(mark_as_read=True))
+
+        assert await poller.poll_once() == 0
+        assert gmail.marked_read == ["m1"]
+        assert gmail.fetched == ["m1"]
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    async def test_an_invite_given_up_on_is_marked_read(
+        self, platform, tmp_path, monkeypatch
+    ):
+        """A bridge outage retries ``max_attempts`` times and then stops — and when it stops,
+        the mail is finished with. Otherwise it sits unread and is re-fetched until it ages
+        out of the query a day later."""
+
+        async def always_fails(meeting_code, bridge_settings, **kwargs):
+            raise module.BotTriggerError("bridge down")
+
+        async def not_active(meeting_code, bridge_settings):
+            return False
+
+        monkeypatch.setattr(module, "trigger_bot_join", always_fails)
+        monkeypatch.setattr(module, "has_active_session", not_active)
+        gmail = FakeGmail({"m1": _platform_invite("m1", platform)})
+        poller, _ = _poller(
+            gmail, tmp_path, _settings(mark_as_read=True, max_attempts=3)
+        )
+
+        for _ in range(5):
+            await poller.poll_once()
+
+        assert gmail.marked_read == ["m1"]
+        assert gmail.fetched == ["m1"] * 3, "retried the capped number of times"
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    async def test_an_invite_too_old_to_join_is_marked_read(
+        self, platform, tmp_path, joins
+    ):
+        gmail = FakeGmail({"m1": _platform_invite("m1", platform, age_s=99_999)})
+        poller, _ = _poller(gmail, tmp_path, _settings(mark_as_read=True))
+
+        assert await poller.poll_once() == 0
+        assert gmail.marked_read == ["m1"]
+
+    async def test_mail_that_is_not_an_invite_is_marked_read(self, tmp_path, joins):
+        """Otherwise a newsletter is re-fetched every poll for as long as it sits unread."""
+        newsletter = _invite("m1")
+        newsletter["payload"]["headers"][1]["value"] = "Your recording is ready"
+        newsletter["payload"]["body"]["data"] = _b64("Nothing joinable in here.")
+        gmail = FakeGmail({"m1": newsletter})
+        poller, _ = _poller(gmail, tmp_path, _settings(mark_as_read=True))
+
+        await poller.poll_once()
+
+        assert gmail.marked_read == ["m1"]
+
+    async def test_a_message_that_could_not_be_fetched_is_not_marked_read(
+        self, tmp_path, joins
+    ):
+        """**The one deliberate exception, and the reason it is one.**
+
+        Here the Gmail API call to *retrieve* the message failed, so nothing was ever read and
+        there is nothing to have handled. Marking it read would hide a live invite behind a
+        transient 5xx; leaving it unread keeps it retryable and visible to a human. It stops
+        being retried on its own when it falls out of the ``newer_than:1d`` query.
+        """
+        gmail = FakeGmail({"m1": _invite("m1")})
+        gmail.fetch_error = GmailError("boom", status=500)
+        poller, _ = _poller(gmail, tmp_path, _settings(mark_as_read=True))
+
+        await poller.poll_once()
+
+        assert gmail.marked_read == []
+
+        gmail.fetch_error = None
+        assert await poller.poll_once() == 1
+        assert gmail.marked_read == ["m1"], "marked once the fetch finally succeeded"

@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from enum import StrEnum
 
 from app.bot_client import BotTriggerError, has_active_session, trigger_bot_join
 from app.config import Settings
@@ -37,6 +38,34 @@ from app.invite_parser import InstantInvite, parse_invite
 from app.meeting_link import join_url_for
 
 logger = logging.getLogger(__name__)
+
+
+class JoinOutcome(StrEnum):
+    """What became of one invite, and therefore whether the message is finished with.
+
+    **A bool could not answer that question, and the bug it hid is why this type exists.**
+    ``_join`` used to return "did I trigger a join", so every non-join looked identical to the
+    caller — and the caller treats a non-join as *retry me*. But two of the three non-joins are
+    terminal: if the bridge is already in the meeting, or this process just sent it there, then
+    no number of retries will ever turn that into a join.
+
+    So a duplicate invite was retried ``max_attempts`` times before being recorded, which is
+    the observable symptom: the mail sits **unread** in the inbox and is re-fetched on every
+    poll for a minute and a half, at 5 quota units a time, after the bot is already in the
+    meeting. Only ``FAILED`` is worth another attempt.
+    """
+
+    JOINED = "joined"
+    """The bridge accepted the join. Finish the message."""
+
+    ALREADY_HANDLED = "already_handled"
+    """The meeting is already being attended — a second invite for it, or a second person
+    clicking *Add people*. Nothing left to do, so finish the message: this is a success from
+    the mailbox's point of view, not a failure to retry."""
+
+    FAILED = "failed"
+    """The bridge could not be reached or rejected the join, after ``bot_client``'s own
+    retries. The only outcome worth another poll, bounded by ``max_attempts``."""
 
 
 class GmailPoller:
@@ -111,10 +140,18 @@ class GmailPoller:
             await self._finish(message_id)
             return False
 
-        joined = await self._join(invite)
-        if joined or self._count_attempt(message_id) >= self._settings.gmail.max_attempts:
+        outcome = await self._join(invite)
+        # **Anything but a failure is finished with**, which is the distinction a bool could
+        # not carry. A duplicate invite is terminal — the meeting is already being attended, so
+        # retrying can only re-fetch the same message and reach the same answer — and leaving it
+        # unrecorded is what left handled mail sitting unread in the inbox for max_attempts
+        # polls. See ``JoinOutcome``.
+        if (
+            outcome is not JoinOutcome.FAILED
+            or self._count_attempt(message_id) >= self._settings.gmail.max_attempts
+        ):
             await self._finish(message_id)
-        return joined
+        return outcome is JoinOutcome.JOINED
 
     def _age_s(self, invite: InstantInvite) -> float:
         return time.time() - invite.internal_date_ms / 1000
@@ -144,20 +181,25 @@ class GmailPoller:
         self._attempts[message_id] = count
         return count
 
-    async def _join(self, invite: InstantInvite) -> bool:
-        """Put the bot in the invited meeting, unless it is already there."""
+    async def _join(self, invite: InstantInvite) -> JoinOutcome:
+        """Put the bot in the invited meeting, unless it is already there.
+
+        Returns *why* nothing happened when nothing happened, because the caller has to tell a
+        duplicate apart from a failure to decide whether the message is finished with — see
+        ``JoinOutcome``.
+        """
         code = invite.meeting_code
 
         if self._recently_joined(code):
             logger.info("ignoring invite %s: just joined %s", invite.message_id, code)
-            return False
+            return JoinOutcome.ALREADY_HANDLED
 
         if await has_active_session(code, self._settings.bridge):
             logger.info(
                 "ignoring invite %s: bridge already has a session in %s", invite.message_id, code
             )
             self._mark_joined(code)
-            return False
+            return JoinOutcome.ALREADY_HANDLED
 
         logger.info(
             "instant invite from %s (%r) -> joining %s meeting %s",
@@ -179,10 +221,10 @@ class GmailPoller:
             # cycle tries again, bounded by max_attempts and by the invite ageing out.
             logger.warning("failed to trigger bot join for invite %s: %s", invite.message_id, exc)
             self.last_error = str(exc)
-            return False
+            return JoinOutcome.FAILED
 
         self._mark_joined(code)
-        return True
+        return JoinOutcome.JOINED
 
     def _recently_joined(self, meeting_code: str) -> bool:
         """Short in-process guard covering the gap between a join being accepted and the
