@@ -1,8 +1,8 @@
 # calendar-orchestrator
 
 Watches the bot's Google Calendar and triggers `meeting-connectors`' `POST /sessions`
-1 minute before any meeting that has a **Google Meet or Zoom** link on it — no manual cURL
-needed.
+1 minute before any meeting that has a **Google Meet, Zoom or Microsoft Teams** link on it —
+no manual cURL needed.
 
 ```
 Google Calendar  --poll-->  calendar-orchestrator  --schedule-->  APScheduler job
@@ -12,20 +12,22 @@ Google Calendar  --poll-->  calendar-orchestrator  --schedule-->  APScheduler jo
                                                      POST http://localhost:8000/sessions
                                                      {"platform":"google_meet","meeting_number":"abc-defg-hij"}
                                                      {"platform":"zoom_web","meeting_number":"838...","passcode":"..."}
+                                                     {"platform":"teams_web","meeting_number":"9339756425487",
+                                                      "passcode":"...","meeting_url":"https://teams.live.com/meet/..."}
                                                                         v
                                                           meeting-connectors bridge (bot joins)
 ```
 
 It also joins **on demand**: when someone clicks "Add people" in a running Google Meet, or
-**Invite → Email** in a running Zoom meeting, that mail lands in the bot's inbox and a second
-poller puts it in the call within seconds — the Zoom form is recognised by its subject, since
-Zoom sends it from the host's own mailbox. See
-[Direct invites](#direct-invites-three-shapes-three-ways-in). The whole inbox
+**Invite → Email** in a running Zoom meeting, or pastes a Teams link into a mail, that message
+lands in the bot's inbox and a second poller puts it in the call within seconds. See
+[Direct invites](#direct-invites-four-shapes-four-ways-in). The whole inbox
 path is opt-in — see [Instant invites](#instant-invites-gmail-polling).
 
 **Which platform a meeting is on is decided per meeting, not per deployment.** A Meet code
-resolves to the bridge's `google_meet` connector and a Zoom link to `zoom_web`; the same
-calendar and the same inbox can carry both. See [Platforms](#platforms).
+resolves to the bridge's `google_meet` connector, a Zoom link to `zoom_web` and a Teams link
+to `teams_web`; the same calendar and the same inbox can carry all three. See
+[Platforms](#platforms).
 
 It is a standalone service on purpose: it never touches a meeting itself, only decides
 *when* to ask the existing bridge to join one. The bridge stays exactly as it is today.
@@ -37,7 +39,7 @@ calendar-orchestrator/
 ├── app/
 │   ├── main.py              FastAPI app: lifespan wiring + /health, /jobs, /sync
 │   ├── config.py            Settings (pydantic-settings, ORCH_ env prefix)
-│   ├── meeting_link.py      Recognises a Meet code or Zoom link in free text
+│   ├── meeting_link.py      Recognises a Meet code, Zoom link or Teams link in free text
 │   ├── models.py            CalendarEvent
 │   ├── calendar_service.py  Polls Calendar API, extracts joinable links
 │   ├── scheduler.py         Reconciles events -> APScheduler jobs (add/reschedule/remove)
@@ -72,7 +74,8 @@ event returned is, by definition, one the bot was invited to. For each one:
    last two are free text that can contain last week's link in a copied agenda.
 2. Extract the meeting from whichever link was found — `https://meet.google.com/veg-fkxv-rhg`
    -> `veg-fkxv-rhg` on `google_meet`, `https://us05web.zoom.us/j/83843212151` ->
-   `83843212151` on `zoom_web`, with the passcode if the event carries one.
+   `83843212151` on `zoom_web`, `https://teams.live.com/meet/9339756425487?p=71cQWhQJ5X8fxHSmVy`
+   -> `9339756425487` on `teams_web`, with the passcode if the event carries one.
 3. Schedule (or reschedule) an APScheduler job keyed on the event id, to fire
    `ORCH_SCHEDULING__JOIN_LEAD_TIME_S` seconds (default 60) before the event's start time.
 4. Any previously-scheduled job whose event no longer appears in the fresh list (cancelled,
@@ -94,23 +97,67 @@ rather than joining minutes into an already-underway call.
 
 ## Platforms
 
-Both platforms travel the same two routes — calendar and inbox — and the same three filter
-steps. Nothing branches on platform except the link pattern itself (`app/meeting_link.py`),
-which is why Zoom needed no second poller, no second state file and no second code path.
+All three platforms travel the same two routes — calendar and inbox — and the same three
+filter steps. Nothing branches on platform except the link pattern itself
+(`app/meeting_link.py`), which is why neither Zoom nor Teams needed a second poller, a second
+state file or a second code path.
 
-| | Google Meet | Zoom |
-|---|---|---|
-| bridge connector | `google_meet` | `zoom_web` |
-| meeting id | `abc-defg-hij` | `83843212151` |
-| passcode | n/a | sent when the invite spells it out |
-| calendar source | `hangoutLink`, `conferenceData` | `conferenceData`, `location`, `description` |
-| invite sender | `meetings-noreply@google.com` | `no-reply@zoom.us`, `no-reply@zoom.com` |
+| | Google Meet | Zoom | Microsoft Teams |
+|---|---|---|---|
+| bridge connector | `google_meet` | `zoom_web` | `teams_web` |
+| meeting id | `abc-defg-hij` | `83843212151` | `9339756425487` |
+| passcode | n/a | sent when the invite spells it out | from the link's `?p=`, else the printed line |
+| join URL sent | no | no | **yes** — see below |
+| calendar source | `hangoutLink`, `conferenceData` | `conferenceData`, `location`, `description` | `conferenceData`, `location`, `description` |
+| invite sender | `meetings-noreply@google.com` | `no-reply@zoom.us`, `no-reply@zoom.com` | **none** — always a human's mailbox |
 
 **`zoom_web`, not `zoom`.** The bridge has two Zoom connectors: `zoom` uses the Meeting SDK
 and needs the meeting to be hosted on an account with RTMS enabled *for this app*, and
 `zoom_web` joins as an ordinary browser participant and needs nothing from the host. A
 meeting the bot was invited to is by definition somebody else's, so that entitlement is
 exactly what is not available — every invite therefore resolves to `zoom_web`.
+
+**`teams_web`, not `teams`, for a stronger version of the same argument.** The bridge's
+`teams` connector needs an Azure AD app with admin-consented `Calls.AccessMedia.All`, a tenant
+willing to grant it, *and* a Windows host running the .NET media SDK. An invited meeting
+belongs to somebody else's tenant — often a personal ("Teams for Life") account with no tenant
+at all — so none of the three is available. `teams_web` drives Chromium and joins as an
+anonymous guest.
+
+### Teams links, and why this one also sends `meeting_url`
+
+Two shapes, both recognised:
+
+```
+https://teams.live.com/meet/9339756425487?p=71cQWhQJ5X8fxHSmVy      personal / free
+https://teams.microsoft.com/meet/281442953617?p=aB3dE9             work/school, short form
+https://teams.microsoft.com/l/meetup-join/19%3ameeting_…%40thread.v2/0?context=…   work/school
+```
+
+For the short forms, `9339756425487` is the meeting id and `71cQWhQJ5X8fxHSmVy` is the
+passcode. **Unlike Zoom's `pwd=`, Teams' `?p=` really is the typed passcode** — the same string
+the invitation prints on its `Passcode:` line — so it is read straight out of the link. The
+URL handed to the bridge is *rebuilt* from the scheme, host, id and passcode rather than copied
+out of the mail, so entities and tracking parameters picked up from an HTML body can't reach
+the browser that has to navigate it.
+
+A `meetup-join` link carries a thread id rather than a number, so the meeting id comes from the
+invitation's printed `Meeting ID:` line; with no printed id, the URL itself is sent as
+`meeting_number`, which the bridge accepts for Teams.
+
+**Teams is the one platform that gets `meeting_url` in the payload**, and the asymmetry is
+deliberate: Meet and Zoom join by number and the bridge documents the field as ignored for
+them. A bare Teams meeting id does not say whether it belongs to a personal or a work/school
+account, and the bridge resolves that by trying one join form, waiting four polls for it to
+make no progress, then re-navigating to the other. Sending the link turns that guess into a
+fact. A Meet or Zoom join posts byte-for-byte the body it always did.
+
+> **One collision worth knowing about.** Teams and Zoom print their meeting ids in the
+> identical `Meeting ID: 281 442 953 617` form, and Zoom's last-resort pattern reads a bare id
+> out of prose. So Teams is matched *before* Zoom, and Zoom's prose fallback is skipped
+> entirely on text that says "Microsoft Teams". Without that, a Teams invitation whose link a
+> mail client stripped would be dialled on `zoom_web` as a meeting Zoom has never heard of.
+> A Teams meeting always requires a **link**; there is no prose-only route in.
 
 ### Two things to know about Zoom passcodes
 
@@ -125,17 +172,23 @@ If that becomes a problem, the fix is on the bridge side: `ZoomWebJoiner` builds
 `https://app.zoom.us/wc/{id}/join` and could carry the token as `?pwd=`. That is a change to
 the Zoom connector, deliberately not made here.
 
-### Direct invites: three shapes, three ways in
+### Direct invites: four shapes, four ways in
 
-A meeting can reach the bot's inbox in three shapes, and they differ in what can be trusted
-about them. All three still require the body to name a real meeting.
+A meeting can reach the bot's inbox in four shapes, and they differ in what can be trusted
+about them. All four still require the body to name a real meeting.
 
 | shape | identified by | sender | acted on when |
 |---|---|---|---|
 | Zoom **in-meeting** invite | subject `Please join Zoom meeting in progress` | the host's own mailbox | always |
 | **Calendar invitation** | the `invite.ics` part | the organiser's own address | only if the meeting is **live now** |
-| Zoom invite **pasted** anywhere | the body's invite block | anyone | always |
+| Zoom or Teams invite **pasted** anywhere | the body's invite block | anyone | always |
 | Zoom/Meet **system** invite | subject marker | `no-reply@zoom.us` etc. | sender must be allow-listed |
+
+**For Teams the body route is not a third option — it is the only one.** Microsoft sends no
+meeting invitation from a system address and has no in-meeting "invite by email" with a fixed
+subject, so a Teams meeting arrives either as an Outlook calendar invitation (whose subject is
+the event's own title) or as a link somebody pasted. Neither the sender nor the subject carries
+any signal in either case.
 
 #### Zoom in-meeting invite
 
@@ -151,7 +204,7 @@ Zoom composes this from **your own mailbox**, so the sender is unknowable in adv
 subject is the only handle. `ORCH_GMAIL__ANY_SENDER_SUBJECT_MARKERS` lists subjects acted on
 whoever sent them; it ships containing exactly that string, so it works with no setup.
 
-#### Calendar invitation / a Zoom invite pasted anywhere
+#### Calendar invitation / a Zoom or Teams invite pasted anywhere
 
 ```
 From:    Any Organiser <organiser@example.com>   <-- the ORGANISER, or anyone
@@ -171,6 +224,25 @@ and it survives being pasted into a calendar event, forwarded, or reformatted.
 Deliberately stricter than "there is a Zoom link somewhere". A colleague writing *"we used to
 meet at zoom.us/j/123456789"* has a link and no invitation, and must not move the bot.
 
+A Teams invitation reads the same way:
+
+```
+From:    Priya Sharma <priya@example.org>        <-- the ORGANISER, or anyone
+Subject: Weekly sync                             <-- the EVENT's title. Arbitrary.
+
+         Microsoft Teams
+         Join the meeting now
+         https://teams.live.com/meet/9339756425487?p=71cQWhQJ5X8fxHSmVy
+         Meeting ID: 933 975 642 5487            <-- this is the handle
+         Passcode: 71cQWhQJ5X8fxHSmVy
+```
+
+with one addition the Zoom form has no equivalent for: a short link carrying `?p=` counts as an
+invitation **on its own**, without a labelled block underneath it. That string only comes from
+the *Copy link* button and it is the whole of what a join needs. A passcodeless link
+(`teams.live.com/meet/9339756425487` with nothing else) is a mention, not an invitation, and
+does not move the bot.
+
 When the message **does** carry an `invite.ics`, that decides instead — including deciding to
 refuse:
 
@@ -189,14 +261,19 @@ URL is longer than that — read raw, the URL is truncated mid-token while the m
 broken link and nothing reports a problem.
 
 Switches: `ORCH_GMAIL__ACCEPT_ZOOM_INVITE_BODIES=false`,
+`ORCH_GMAIL__ACCEPT_TEAMS_INVITE_BODIES=false`,
 `ORCH_GMAIL__ACCEPT_CALENDAR_INVITATIONS=false`, `ORCH_GMAIL__CALENDAR_INVITE_LEAD_S=300`.
+The two body switches are independent: turning Teams off leaves Zoom working, and vice versa.
 
-> **What these open routes accept.** Anyone who can email the bot a Zoom invitation block —
-> or a valid `.ics` for a live meeting, or that exact Zoom subject — can make it join, with a
-> link of their choosing. There is no cryptographic difference between the host's invite and
-> a stranger's; both are ordinary mail. The mitigations are that the block signature is
-> specific rather than any mention of Zoom, that the bot's address is not usually published,
-> and that stale invites age out via `MAX_INVITE_AGE_S`.
+> **What these open routes accept.** Anyone who can email the bot a Zoom or Teams invitation
+> block — or a valid `.ics` for a live meeting, or that exact Zoom subject — can make it join,
+> with a link of their choosing. There is no cryptographic difference between the host's invite
+> and a stranger's; both are ordinary mail. The mitigations are that the block signature is
+> specific rather than any mention of the platform, that the bot's address is not usually
+> published, and that stale invites age out via `MAX_INVITE_AGE_S`.
+>
+> For Teams this is the *only* route, since there is no system sender to allow-list — so
+> switching it off does not fall back to a narrower Teams path, it turns Teams-by-mail off.
 
 ### Everything else is still sender-gated
 
@@ -414,7 +491,20 @@ a broad result set and filtering in Python.
   `meetings-noreply@google.com` — which anyone can set — gains nothing.
 - **The Meet code regex is deliberately stricter than `meet\.google\.com/([a-z-]+)`.** The
   loose version matches the support and landing links in Google's own email footer, and each
-  one would be handed to the bridge as a meeting number.
+  one would be handed to the bridge as a meeting number. The Zoom (`/j/`, `/wc/`, `/s/`) and
+  Teams (`/meet/<digits>`, `/l/meetup-join/`) patterns require a path segment for the same
+  reason — otherwise `zoom.us/download` and `teams.microsoft.com/downloads` become meetings.
+- **The query has to admit what the parser would accept, or the feature is silently dead.**
+  A pasted invitation matches no `from:` (arbitrary sender), no `subject:` (the event's title)
+  and no `filename:ics`, so the query carries body terms — `"zoom.us"`, `"teams.live.com"`,
+  `"teams.microsoft.com"`. Both Teams hosts, because which one an invite uses is decided by the
+  organiser's account type. Losing precision here is safe; losing recall means the message is
+  never *fetched*, and the parser that would have accepted it never sees it.
+- **Flattened HTML bodies are repaired before anything is read out of them.** Gmail's HTML view
+  drops the newlines between an invitation's blocks, and every pattern here ends at whitespace
+  — so `Passcode: aB3dE9` followed by `Dial in by phone` reads as `aB3dE9Dial`. Plausible,
+  passcode-shaped, and rejected by the meeting. `restore_line_breaks` puts the boundaries back
+  at known block labels, URL starts, and the `---`/`____` section rules both platforms use.
 - **Duplicate joins are guarded three ways**, because a meeting can be both on the calendar
   and instant-invited: the processed-id file (survives restarts), a short in-process
   meeting-code TTL (covers the gap before a session is listed), and a live check against the

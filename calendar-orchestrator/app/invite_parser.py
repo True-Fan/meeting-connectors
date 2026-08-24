@@ -4,10 +4,10 @@ Pure functions over the Gmail message dict — no network, no state. That is wha
 risky part of this feature (does this email really mean "join a meeting"?) directly testable
 against captured message payloads.
 
-**Every message must name a meeting** — a Meet code or a Zoom join link, found by
-``meeting_link``. That is the one universal step, and it is also where the *platform* is
-decided, which is why Zoom needed no second poller, no second state file and no second code
-path: an invite is an invite, and only the link's shape varies.
+**Every message must name a meeting** — a Meet code, a Zoom join link or a Teams join link,
+found by ``meeting_link``. That is the one universal step, and it is also where the *platform*
+is decided, which is why neither Zoom nor Teams needed a second poller, a second state file or
+a second code path: an invite is an invite, and only the link's shape varies.
 
 What differs is how a message earns the right to be read at all, and there are three routes
 because the invite shapes differ in what can be trusted about them:
@@ -20,14 +20,19 @@ because the invite shapes differ in what can be trusted about them:
    poller (``ics.is_happening_now``).
 2. **An in-meeting Zoom invite**, identified by its fixed subject. Composed from the host's
    own mailbox, so again there is no address to allow-list.
-3. **Everything else**, which is sender-gated as it always was: ``From:`` must match
+3. **An invitation body**, identified by the block the platform generates — a join link plus
+   its labelled ``Meeting ID:`` / ``Passcode:`` lines. This is the route for a meeting pasted
+   into a message or added to a calendar event, where the subject is the *event's* title and
+   the sender is the organiser's own mailbox, so neither says anything. It is the only route
+   Teams has that does not depend on knowing the organiser in advance.
+4. **Everything else**, which is sender-gated as it always was: ``From:`` must match
    ``allowed_senders`` *and* the subject must contain a marker. The Gmail query already
    restricts the sender, but it is re-checked here because the query is a performance filter
    and this is a *security* one.
 
-Routes 1 and 2 accept arbitrary senders by design, and both are switchable — see
-``GmailSettings.accept_calendar_invitations`` and ``any_sender_subject_markers`` for what
-that costs.
+Routes 1-3 accept arbitrary senders by design, and each is switchable — see
+``GmailSettings.accept_calendar_invitations``, ``any_sender_subject_markers``,
+``accept_zoom_invite_bodies`` and ``accept_teams_invite_bodies`` for what that costs.
 """
 
 from __future__ import annotations
@@ -46,7 +51,8 @@ from app.meeting_link import (
     PLATFORM_GOOGLE_MEET,
     MeetingLink,
     find_meeting_link,
-    find_zoom_passcode,
+    find_passcode,
+    has_teams_invite_block,
     has_zoom_invite_block,
 )
 
@@ -108,7 +114,8 @@ def parse_invite(message: dict, settings: GmailSettings) -> InstantInvite | None
     #      own title, in whatever language the organiser wrote it;
     #   2. an in-meeting Zoom invite, recognised by its fixed subject — composed from the
     #      host's mailbox, so again no address to allow-list;
-    #   3. everything else, which is still sender-gated exactly as it always was.
+    #   3. an invitation body, recognised by the block Zoom or Teams generates;
+    #   4. everything else, which is still sender-gated exactly as it always was.
     reason = _open_route(message, subject, settings)
     if reason is None:
         if not _subject_matches(subject, settings.subject_markers):
@@ -230,10 +237,15 @@ def _open_route(message: dict, subject: str, settings: GmailSettings) -> str | N
     # The invite block does: a join link plus a labelled ``Meeting ID:`` or ``Passcode:``
     # line, which is what Zoom generates and what survives being pasted, forwarded or
     # reformatted.
-    if settings.accept_zoom_invite_bodies and has_zoom_invite_block(
-        *_message_text(message)
-    ):
+    #
+    # Teams is read from the body for the same reason and with one addition of its own: its
+    # short link carries the passcode in the URL, so a bare link with ``?p=`` is already the
+    # whole of an invitation. See ``has_teams_invite_block``.
+    texts = _message_text(message)
+    if settings.accept_zoom_invite_bodies and has_zoom_invite_block(*texts):
         return "body contains a Zoom invitation block"
+    if settings.accept_teams_invite_bodies and has_teams_invite_block(*texts):
+        return "body contains a Teams invitation block"
     return None
 
 
@@ -302,14 +314,15 @@ def _extract_meeting_link(message: dict) -> MeetingLink | None:
     body = "\n".join(_message_text(message))
 
     link = find_meeting_link(body)
-    if link is None or not link.is_zoom or link.passcode is not None:
+    if link is None or link.passcode is not None:
         return link
 
     # A second sweep for the passcode alone. Zoom's mail puts the join link in a block of its
-    # own and the passcode several lines below it, and some senders strip one part or the
-    # other — so the link matching in one rendering and the passcode in another is ordinary
-    # rather than exceptional.
-    passcode = find_zoom_passcode(body)
+    # own and the passcode several lines below it, Teams does the same, and some senders strip
+    # one part or the other — so the link matching in one rendering and the passcode in another
+    # is ordinary rather than exceptional. ``find_passcode`` answers ``None`` for Meet, which
+    # has no passcode to look for, so the original path reaches the same result it always did.
+    passcode = find_passcode(link.platform, body)
     return link if passcode is None else replace(link, passcode=passcode)
 
 

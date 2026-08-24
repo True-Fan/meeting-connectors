@@ -15,9 +15,12 @@ from __future__ import annotations
 import pytest
 from app.meeting_link import (
     PLATFORM_GOOGLE_MEET,
+    PLATFORM_TEAMS,
     PLATFORM_ZOOM,
     find_meeting_link,
+    find_teams_passcode,
     find_zoom_passcode,
+    has_teams_invite_block,
     restore_line_breaks,
 )
 
@@ -44,6 +47,36 @@ MEET_INVITE = """Priya is inviting you to a video call.
 Join: https://meet.google.com/veg-fkxv-rhg
 Learn more at meet.google.com/support, or start one at meet.google.com/new
 """
+
+TEAMS_PERSONAL_INVITE = """Priya Sharma is inviting you to a Microsoft Teams meeting.
+
+Join the meeting now
+https://teams.live.com/meet/9339756425487?p=71cQWhQJ5X8fxHSmVy
+Meeting ID: 933 975 642 5487
+Passcode: 71cQWhQJ5X8fxHSmVy
+________________________________________
+Need help? Visit https://teams.live.com/support or get the app at
+https://teams.microsoft.com/downloads
+"""
+"""A personal ("Teams for Life") invitation — the shape this feature was asked for."""
+
+TEAMS_TENANT_INVITE = """________________________________________
+Microsoft Teams
+Need help?
+Join the meeting now
+https://teams.microsoft.com/l/meetup-join/19%3ameeting_YmM2MTk%40thread.v2/0?context=%7b%22Tid%22%3a%22aaa%22%2c%22Oid%22%3a%22bbb%22%7d
+Meeting ID: 281 442 953 617
+Passcode: aB3dE9
+________________________________________
+Dial in by phone
++1 323-555-0199,,123456789# United States, Los Angeles
+Find a local number
+Phone conference ID: 123 456 789#
+For organizers: Meeting options | Reset dial-in PIN
+________________________________________
+"""
+"""A work/school invitation, as Outlook writes it. The link carries a thread id rather than a
+number, so the numeric id has to come out of the printed block."""
 
 
 class TestZoom:
@@ -223,6 +256,231 @@ class TestGoogleMeet:
         assert link.meeting_number == "veg-fkxv-rhg"
 
 
+class TestTeams:
+    def test_the_short_link_yields_the_id_and_the_passcode_from_the_url(self) -> None:
+        """``teams.live.com/meet/<id>?p=<passcode>`` carries everything a join needs."""
+        link = find_meeting_link(
+            "Join here: https://teams.live.com/meet/9339756425487?p=71cQWhQJ5X8fxHSmVy"
+        )
+
+        assert link is not None
+        assert link.platform == PLATFORM_TEAMS
+        assert link.meeting_number == "9339756425487"
+        assert link.passcode == "71cQWhQJ5X8fxHSmVy"
+        assert link.url == (
+            "https://teams.live.com/meet/9339756425487?p=71cQWhQJ5X8fxHSmVy"
+        )
+
+    def test_teams_web_is_the_platform_not_the_graph_connector(self) -> None:
+        """``teams`` needs an admin-consented Azure app and a Windows host, in the *organiser's*
+        tenant. An invited meeting is by definition somebody else's — often a personal account
+        with no tenant at all — so ``teams_web`` is the only route that exists."""
+        link = find_meeting_link(TEAMS_PERSONAL_INVITE)
+
+        assert link is not None
+        assert link.platform == "teams_web"
+
+    def test_a_full_personal_invitation_parses(self) -> None:
+        link = find_meeting_link(TEAMS_PERSONAL_INVITE)
+
+        assert link is not None
+        assert link.meeting_number == "9339756425487"
+        assert link.passcode == "71cQWhQJ5X8fxHSmVy"
+
+    def test_the_p_parameter_is_the_typed_passcode_unlike_zooms_pwd(self) -> None:
+        """**The asymmetry worth stating, because the two look alike.**
+
+        Zoom's ``pwd=`` is an encrypted token its own client exchanges for entry and is rejected
+        by the passcode box. Teams' ``p=`` *is* the passcode — the same string the invitation
+        prints on its ``Passcode:`` line — so reading it out of the URL is correct here and
+        would be a bug there.
+        """
+        link = find_meeting_link(TEAMS_PERSONAL_INVITE)
+
+        assert link is not None
+        assert link.passcode == "71cQWhQJ5X8fxHSmVy"
+        assert "Passcode: 71cQWhQJ5X8fxHSmVy" in TEAMS_PERSONAL_INVITE
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://teams.live.com/meet/9339756425487",
+            "https://teams.microsoft.com/meet/9339756425487",
+            "http://teams.live.com/meet/9339756425487",
+        ],
+    )
+    def test_both_hosts_and_a_passcodeless_link_resolve(self, url: str) -> None:
+        """Which host an invite carries is decided by the organiser's account type, not by
+        anything this service can see, so both have to work."""
+        link = find_meeting_link(url)
+
+        assert link is not None
+        assert link.platform == PLATFORM_TEAMS
+        assert link.meeting_number == "9339756425487"
+        assert link.passcode is None
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Get the app at https://teams.microsoft.com/downloads",
+            "Need help? https://teams.live.com/support",
+            "Options: https://teams.microsoft.com/meetingOptions/?organizerId=abc",
+            "https://teams.live.com/",
+            "Read https://www.microsoft.com/en/microsoft-teams/whats-new",
+        ],
+    )
+    def test_a_footer_link_is_not_a_meeting(self, text: str) -> None:
+        """The same failure the Zoom pattern guards against: dialling a download page."""
+        assert find_meeting_link(text) is None
+
+    def test_the_url_is_rebuilt_rather_than_carried_out_of_html(self) -> None:
+        """**The bridge navigates this string, so junk in it is a failed join.**
+
+        A link lifted out of an HTML part arrives wrapped in an attribute and carrying entities
+        and tracking parameters. The scheme, host, id and passcode are the whole of what a join
+        needs, so the URL is reassembled from them and everything else is dropped — which is
+        also what makes ``&amp;p=`` readable at all.
+        """
+        html = (
+            '<a href="https://teams.live.com/meet/9339756425487'
+            '?anon=true&amp;p=71cQWhQJ5X8fxHSmVy">Join the meeting now</a>'
+        )
+
+        link = find_meeting_link(html)
+
+        assert link is not None
+        assert link.url == (
+            "https://teams.live.com/meet/9339756425487?p=71cQWhQJ5X8fxHSmVy"
+        )
+        assert '"' not in link.url and "&amp;" not in link.url
+
+    def test_a_tenant_invite_takes_its_number_from_the_printed_block(self) -> None:
+        """A ``meetup-join`` link carries a thread id and a tenant, never a meeting number —
+        the number is printed in the body, and it is what the join is de-duplicated on."""
+        link = find_meeting_link(TEAMS_TENANT_INVITE)
+
+        assert link is not None
+        assert link.platform == PLATFORM_TEAMS
+        assert link.meeting_number == "281442953617"
+        assert link.passcode == "aB3dE9"
+        assert link.url.startswith("https://teams.microsoft.com/l/meetup-join/")
+
+    def test_a_tenant_link_alone_falls_back_to_the_url_as_the_identifier(self) -> None:
+        """The bridge requires a non-empty ``meeting_number`` and accepts a Teams URL there, so
+        a link with no printed id is still joinable rather than dropped."""
+        link = find_meeting_link(
+            "https://teams.microsoft.com/l/meetup-join/19%3ameeting_x%40thread.v2/0?context=%7b%22Tid%22%3a%22a%22%7d"
+        )
+
+        assert link is not None
+        assert link.meeting_number == link.url
+        assert link.meeting_number != ""
+
+    def test_a_trailing_full_stop_is_not_part_of_the_url(self) -> None:
+        """A link at the end of a sentence, which is how a human pastes one."""
+        link = find_meeting_link(
+            "We're on https://teams.microsoft.com/l/meetup-join/19%3ameeting_x"
+            "%40thread.v2/0?context=%7b%22Tid%22%3a%22a%22%7d. See you there."
+        )
+
+        assert link is not None
+        assert not link.url.endswith(".")
+
+    def test_the_dial_in_block_never_supplies_a_passcode(self) -> None:
+        """**A confident wrong answer is worse than none here.**
+
+        Teams' phone block carries a *conference id* and a dial-in PIN, neither of which is the
+        meeting passcode. Reading a number out of it — which the Zoom one-tap fallback would —
+        yields a passcode Teams rejects, turning "no passcode, ask the host" into "wrong
+        passcode, refused".
+        """
+        assert find_teams_passcode("+1 323-555-0199,,123456789# US") is None
+        assert find_teams_passcode("Phone conference ID: 123 456 789#") is None
+
+    def test_a_flattened_invitation_does_not_run_the_passcode_into_the_next_block(
+        self,
+    ) -> None:
+        """Gmail's HTML view drops the newlines between blocks, and the block after
+        ``Passcode:`` is "Dial in by phone" — so without the break the passcode reads
+        ``aB3dE9Dial``, which is passcode-shaped, plausible, and rejected."""
+        flattened = (
+            "Microsoft TeamsNeed help?Join the meeting now"
+            "https://teams.microsoft.com/l/meetup-join/19%3ameeting_x%40thread.v2/0?context=%7bx%7d"
+            "Meeting ID: 281 442 953 617Passcode: aB3dE9Dial in by phone"
+            "+1 323-555-0199,,123456789# United StatesFind a local number"
+        )
+
+        link = find_meeting_link(flattened)
+
+        assert link is not None
+        assert link.passcode == "aB3dE9", "ran into the next block"
+        assert link.meeting_number == "281442953617"
+        assert not link.url.endswith("Meeting"), "swallowed the following label"
+
+    def test_the_underscore_rule_restores_one_break_not_one_per_character(self) -> None:
+        """Teams separates its sections with a run of underscores where Zoom uses ``---``.
+
+        **One break, at the start of the run.** A lookbehind of ``\\S`` also matches every
+        position *inside* it, which turned Teams' forty-underscore rule into forty lines —
+        harmless for the patterns that follow, but it made the repaired text unreadable in a
+        log and it is the kind of thing that stops being harmless later. Zoom's ``---`` hid the
+        flaw by being exactly three long.
+        """
+        repaired = restore_line_breaks("Passcode: aB3dE9" + "_" * 12)
+
+        assert repaired == "Passcode: aB3dE9\n" + "_" * 12
+        assert restore_line_breaks(repaired) == repaired, "not idempotent"
+
+    def test_a_long_zoom_rule_gets_one_break_too(self) -> None:
+        """The same fix, on the pattern that was already there — Zoom's rule is only ever
+        three dashes in practice, so this was latent rather than observed."""
+        assert restore_line_breaks("Passcode: 278999-----One") == (
+            "Passcode: 278999\n-----One"
+        )
+
+
+class TestTeamsInviteBlock:
+    """What counts as a Teams *invitation* rather than a message mentioning Teams.
+
+    The gate for the body route, which accepts arbitrary senders — so the negative cases are
+    the ones that matter.
+    """
+
+    def test_a_real_invitation_qualifies(self) -> None:
+        assert has_teams_invite_block(TEAMS_PERSONAL_INVITE)
+        assert has_teams_invite_block(TEAMS_TENANT_INVITE)
+
+    def test_a_passcode_bearing_short_link_is_an_invitation_on_its_own(self) -> None:
+        """No Zoom equivalent: ``?p=`` is what the *Copy link* button produces and it is the
+        whole of what a join needs, so it does not also need a labelled block underneath it."""
+        assert has_teams_invite_block(
+            "https://teams.live.com/meet/9339756425487?p=71cQWhQJ5X8fxHSmVy"
+        )
+
+    def test_a_bare_link_with_no_passcode_and_no_block_is_not_an_invitation(self) -> None:
+        """A colleague reminiscing about a meeting must not move the bot."""
+        assert not has_teams_invite_block(
+            "we used to meet at https://teams.live.com/meet/9339756425487"
+        )
+
+    def test_a_tenant_link_needs_a_labelled_line(self) -> None:
+        bare = (
+            "old thread: https://teams.microsoft.com/l/meetup-join/"
+            "19%3ameeting_x%40thread.v2/0?context=%7bx%7d"
+        )
+
+        assert not has_teams_invite_block(bare)
+        assert has_teams_invite_block(bare + "\nMeeting ID: 281 442 953 617")
+
+    def test_talking_about_teams_without_a_link_is_not_an_invitation(self) -> None:
+        assert not has_teams_invite_block(
+            "Microsoft Teams is down again. Meeting ID: 281 442 953 617"
+        )
+
+    def test_a_zoom_invitation_is_not_a_teams_one(self) -> None:
+        assert not has_teams_invite_block(ZOOM_INVITE)
+
+
 class TestPrecedence:
     def test_meet_wins_over_zoom_inside_one_text(self) -> None:
         """Meet's pattern is the stricter of the two, so an unambiguous Meet code should not
@@ -262,3 +520,63 @@ class TestPrecedence:
         assert find_meeting_link("Lunch with Priya, 1pm, the usual place") is None
         assert find_meeting_link() is None
         assert find_meeting_link("") is None
+
+    def test_a_teams_invitation_is_not_read_as_a_zoom_meeting_number(self) -> None:
+        """**The reason Teams is tried before Zoom, and the bug it prevents.**
+
+        Both platforms print ``Meeting ID: 281 442 953 617`` in the same words and the same
+        digit grouping, and Zoom's last-resort pattern reads a bare id out of prose. Offered to
+        Zoom first, a Teams invitation resolves to a ``zoom_web`` join of a number Zoom has
+        never heard of — which fails while pointing at the wrong platform entirely.
+        """
+        link = find_meeting_link(TEAMS_TENANT_INVITE)
+
+        assert link is not None
+        assert link.platform == PLATFORM_TEAMS
+
+    def test_a_teams_invitation_whose_link_was_stripped_is_not_claimed_by_zoom(self) -> None:
+        """The same collision with nothing left to disambiguate but the word "Teams".
+
+        Refusing is the answer rather than guessing: ``None`` logs a warning that the invite
+        carried no joinable link, where a wrong-platform join dials a meeting that does not
+        exist.
+        """
+        assert (
+            find_meeting_link(
+                "Microsoft Teams\nMeeting ID: 281 442 953 617\nPasscode: aB3dE9"
+            )
+            is None
+        )
+
+    def test_zooms_prose_fallback_still_works_where_it_always_did(self) -> None:
+        """The guard above must cost a genuine Zoom invite nothing — those say "Zoom"."""
+        link = find_meeting_link(
+            "Join Zoom Meeting\nMeeting ID: 838 4321 2151\nPasscode: abc123"
+        )
+
+        assert link is not None
+        assert link.platform == PLATFORM_ZOOM
+        assert link.meeting_number == "83843212151"
+
+    def test_meet_wins_over_teams_inside_one_text(self) -> None:
+        """Meet's pattern is the strictest of the three, so an unambiguous Meet code should not
+        lose to a Teams link mentioned in the same prose."""
+        link = find_meeting_link(
+            "Join https://meet.google.com/veg-fkxv-rhg "
+            "(we used to use https://teams.live.com/meet/9339756425487?p=abc)"
+        )
+
+        assert link is not None
+        assert link.platform == PLATFORM_GOOGLE_MEET
+
+    def test_an_earlier_source_wins_for_teams_too(self) -> None:
+        """A Teams event whose description still carries last week's Meet link resolves to
+        Teams, because the structured field is passed first."""
+        link = find_meeting_link(
+            "https://teams.live.com/meet/9339756425487?p=abc",  # location
+            "Agenda copied from last week: https://meet.google.com/veg-fkxv-rhg",
+        )
+
+        assert link is not None
+        assert link.platform == PLATFORM_TEAMS
+        assert link.meeting_number == "9339756425487"

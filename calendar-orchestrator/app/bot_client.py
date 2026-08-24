@@ -30,6 +30,7 @@ async def trigger_bot_join(
     attendees: tuple[str, ...] = (),
     platform: str | None = None,
     passcode: str | None = None,
+    meeting_url: str | None = None,
 ) -> None:
     """POST to the bridge to make the bot join ``meeting_code``.
 
@@ -47,6 +48,10 @@ async def trigger_bot_join(
     The bridge defaults it to ``None`` itself, and a meeting with no passcode and a meeting
     whose passcode we could not read are the same request as far as it is concerned.
 
+    ``meeting_url`` is the same shape of optional addition, and in practice only Teams supplies
+    one — see ``meeting_link.join_url_for`` for why that platform needs it and the others do
+    not. Omitted when absent, so a Meet or Zoom join posts the identical body it always has.
+
     ``attendees`` is the calendar event's invite list. It is sent as a **second, separate call**
     after the join succeeds, for two reasons: the join contract stays the small
     ``{platform, meeting_number}`` the bridge README documents, and the invite list is optional
@@ -59,6 +64,8 @@ async def trigger_bot_join(
     }
     if passcode:
         payload["passcode"] = passcode
+    if meeting_url:
+        payload["meeting_url"] = meeting_url
     last_exc: Exception | None = None
 
     async with httpx.AsyncClient(timeout=settings.timeout_s) as client:

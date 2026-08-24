@@ -28,6 +28,7 @@ from apscheduler.triggers.date import DateTrigger
 
 from app.bot_client import BotTriggerError, trigger_bot_join
 from app.config import Settings
+from app.meeting_link import join_url_for
 from app.models import CalendarEvent
 from app.state import TriggeredEventStore
 
@@ -128,6 +129,7 @@ async def _run_join(event: CalendarEvent, state: TriggeredEventStore, settings: 
             attendees=event.attendees,
             platform=event.platform,
             passcode=event.passcode,
+            meeting_url=join_url_for(event.platform, event.meeting_url),
         )
     except BotTriggerError:
         logger.exception("failed to trigger bot join for %s", event.event_id)

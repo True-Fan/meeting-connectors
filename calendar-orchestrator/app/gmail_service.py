@@ -114,19 +114,31 @@ class GmailService:
         return ["filename:ics"] if self._settings.accept_calendar_invitations else []
 
     def _body_terms(self) -> list[str]:
-        """How a Zoom invitation *pasted into a message* becomes retrievable.
+        """How an invitation *pasted into a message* becomes retrievable.
 
-        The body route accepts an invitation on its own text, from any sender and under any
+        The body routes accept an invitation on its own text, from any sender and under any
         subject — so, exactly like a calendar invitation, nothing about the envelope can
         select it and the message would otherwise never be fetched. Gmail cannot express the
-        block signature the parser applies, so the query casts one step wider: mail
-        mentioning ``zoom.us`` at all.
+        block signatures the parser applies, so the query casts one step wider: mail
+        mentioning the platform's join host at all.
 
         That is deliberately imprecise and safely so. Recall is what the query must not lose;
-        precision is ``has_zoom_invite_block``'s job, and it runs on every candidate anyway.
-        The result set stays small because ``newer_than:1d`` and ``is:unread`` still apply.
+        precision is ``has_zoom_invite_block`` / ``has_teams_invite_block``'s job, and they run
+        on every candidate anyway. The result set stays small because ``newer_than:1d`` and
+        ``is:unread`` still apply.
+
+        **Both Teams hosts are named, not just the one in the invite you tested with.**
+        ``teams.live.com`` is a personal ("Teams for Life") link and ``teams.microsoft.com`` a
+        work/school one; which of them an invite carries is decided by the organiser's account,
+        not by anything this service can see. Omitting either is the failure where the parser
+        is correct, the feature is implemented, and the mail is never fetched to be parsed.
         """
-        return ['"zoom.us"'] if self._settings.accept_zoom_invite_bodies else []
+        terms: list[str] = []
+        if self._settings.accept_zoom_invite_bodies:
+            terms.append('"zoom.us"')
+        if self._settings.accept_teams_invite_bodies:
+            terms.extend(['"teams.live.com"', '"teams.microsoft.com"'])
+        return terms
 
     @staticmethod
     def _quoted_subjects(markers: tuple[str, ...]) -> list[str]:

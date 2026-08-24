@@ -280,6 +280,30 @@ class GmailSettings(BaseModel):
     other two open routes — anyone who can email the bot a Zoom invitation can make it join
     that meeting. Set false to require an allow-listed sender for these."""
 
+    accept_teams_invite_bodies: bool = True
+    """Act on a message whose **body** is a Microsoft Teams invitation, whoever sent it.
+
+    The Teams counterpart of ``accept_zoom_invite_bodies``, and it is the route Teams needs
+    most rather than least. Teams has no system sender to allow-list and no in-meeting "invite
+    by email" with a fixed subject: a Teams meeting reaches a mailbox either as an Outlook
+    calendar invitation (whose subject is the event's own title) or as a link somebody pasted.
+    So for Teams the body is not a third route — it is the only one that does not depend on the
+    organiser being known in advance.
+
+    The signature is a join link plus a labelled line from the block Teams generates, with one
+    Teams-specific addition: its short link carries the passcode in the URL
+    (``teams.live.com/meet/<id>?p=<passcode>``), and that string only comes from *Copy link*,
+    so it counts as an invitation on its own. ``has_teams_invite_block`` is where that is
+    decided and where the trade-off is written out.
+
+    **An ics, where the message has one, overrules this entirely** — including when it says the
+    meeting is next week — exactly as it does for Zoom. Otherwise a body match would walk past
+    the timing gate and join days early.
+
+    Exposure is the same shape as the other open routes: anyone who can email the bot a Teams
+    invitation can make it join that meeting, bounded by ``max_invite_age_s`` and the join
+    de-duplication. Set false to require an allow-listed sender for these."""
+
     calendar_invite_lead_s: int = Field(default=300, ge=0)
     """How far before an invited meeting's start time it still counts as "happening now".
 

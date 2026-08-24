@@ -34,6 +34,7 @@ from app.config import Settings
 from app.gmail_service import GmailError, GmailService
 from app.gmail_state import ProcessedMessageStore
 from app.invite_parser import InstantInvite, parse_invite
+from app.meeting_link import join_url_for
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +172,7 @@ class GmailPoller:
                 self._settings.bridge,
                 platform=invite.platform,
                 passcode=invite.passcode,
+                meeting_url=join_url_for(invite.platform, invite.meeting_url),
             )
         except BotTriggerError as exc:
             # bot_client has already exhausted its own retries. Left unrecorded so the next

@@ -25,7 +25,7 @@ from googleapiclient.discovery import Resource, build
 from googleapiclient.errors import HttpError
 
 from app.config import Settings
-from app.meeting_link import MeetingLink, find_meeting_link, find_zoom_passcode
+from app.meeting_link import MeetingLink, find_meeting_link, find_passcode
 from app.models import CalendarEvent, MissingConferenceDataError
 
 logger = logging.getLogger(__name__)
@@ -191,9 +191,13 @@ def _extract_meeting_link(raw: dict) -> MeetingLink:
         raise MissingConferenceDataError(f"event {raw.get('id')} names no joinable meeting")
 
     # The passcode may be in the description while the link is in ``conferenceData`` — the
-    # Zoom add-on splits them exactly that way. Only ever filled in, never overridden.
-    if link.is_zoom and link.passcode is None:
-        passcode = find_zoom_passcode(
+    # Zoom add-on splits them exactly that way, and a Teams meeting pasted into an event puts
+    # the link in ``location`` and the printed ``Passcode:`` line in the body. Only ever filled
+    # in, never overridden. ``find_passcode`` answers ``None`` for Meet, so this costs the
+    # original path nothing.
+    if link.passcode is None:
+        passcode = find_passcode(
+            link.platform,
             "\n".join(structured),
             str(raw.get("location", "")),
             str(raw.get("description", "")),
