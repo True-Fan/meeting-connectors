@@ -836,12 +836,19 @@
 
   function handRowName(row) {
     if (!row) return null;
+    // The row's own `data-tid` first: it carries the display name and does not change when the
+    // person mutes, which is what keeps this hand's key — and therefore the "already up" latch
+    // on both sides — stable for as long as the hand is up. See `nameFromTid`.
+    const fromTid = cleanName(nameFromTid(row));
+    if (fromTid && !handMatch(fromTid)) return fromTid.slice(0, 120);
     const selectors = CONFIG.handNameSelectors || [];
     for (const selector of selectors) {
       try {
         const el = row.querySelector(selector);
         const text = el ? el.getAttribute('title') || el.textContent || '' : '';
-        const name = text.split('\n')[0].trim();
+        // Through `cleanName`, which every path out of here now is: a name element's text
+        // carries the status decorations too, and an uncleaned one is the key that flapped.
+        const name = cleanName(text);
         if (name && !handMatch(name)) return name.slice(0, 120);
       } catch (err) {
         /* as above */
@@ -851,7 +858,7 @@
       .split('\n')[0]
       .trim();
     const match = handMatch(label);
-    const name = match ? handName(label, match) : label;
+    const name = cleanName(match ? handName(label, match) : label);
     return name ? name.slice(0, 120) : null;
   }
 
@@ -1328,15 +1335,170 @@
   const NAME_SUFFIX =
     /\s*\((?:[^)]*\b(?:you|me|guest|external|organizer|organiser|presenter|attendee|co-organizer|co-organiser|unverified|out of office)\b[^)]*)\)\s*$/i;
 
-  function cleanName(raw) {
-    let name = String(raw || '').split('\n')[0].trim();
-    // Repeatedly, because Teams stacks them: "Dev (Guest) (Unverified)".
-    for (let i = 0; i < 3; i += 1) {
-      const next = name.replace(NAME_SUFFIX, '').trim();
-      if (next === name) break;
-      name = next;
+  /*
+   * The unbracketed decorations, which are the ones that actually broke things.
+   *
+   * **Teams writes a participant's *state* into the same accessible name as their name**, and
+   * a live meeting produced all three of these for one person inside five seconds:
+   *
+   *     "Dev Choudhary muted Context menu is available"
+   *     "Dev Choudhary Context menu is available"
+   *     "Dev Choudhary"
+   *
+   * `NAME_SUFFIX` above cannot touch any of it — none of it is in brackets. That matters far
+   * more than the cosmetics, because `handResolve` keys a raised hand on this string: the
+   * moment somebody muted, their hand's key changed, the old key was retired by the grace
+   * pass below, and the very next scan reported the same unmoved hand as a *fresh* raise. The
+   * avatar stopped itself to say "ok, go ahead" again, for as long as they left it up.
+   *
+   * Supplied as configuration (`nameNoisePhrases`, `nameStatusWords`) for the reason every
+   * selector here is: a Teams rename should cost a settings edit. The fallbacks are the two
+   * observed live, so a page running against an older config is still corrected for the case
+   * that was actually reported.
+   */
+  const FALLBACK_NOISE = ['context menu is available', 'context menu'];
+  const FALLBACK_STATUS = ['muted', 'unmuted'];
+
+  /* Multi-word wording removed anywhere: no display name contains "context menu". */
+  function stripNoise(value) {
+    let name = value;
+    for (const phrase of CONFIG.nameNoisePhrases || FALLBACK_NOISE) {
+      if (!phrase) continue;
+      for (let guard = 0; guard < 4; guard += 1) {
+        const at = name.toLowerCase().indexOf(phrase);
+        if (at === -1) break;
+        name = (name.slice(0, at) + ' ' + name.slice(at + phrase.length)).replace(/\s+/g, ' ');
+      }
     }
-    return name.slice(0, 120);
+    return name.trim();
+  }
+
+  /*
+   * Bare status words, removed only where they *trail* the label.
+   *
+   * Any one of these could be somebody's real name or part of one, so removing them anywhere
+   * would eventually rename a participant. Teams appends them, so the end is the only place
+   * they legitimately occur — and a single remaining word is kept whatever it says, because a
+   * name scrubbed to nothing is worse than one that kept a stray word.
+   */
+  function statusWords() {
+    return (CONFIG.nameStatusWords || FALLBACK_STATUS).map((w) => String(w || '').toLowerCase());
+  }
+
+  function stripStatus(value) {
+    const words = statusWords();
+    let name = value;
+    // Brackets and bare words alternately, because Teams stacks them in either order: "Dev
+    // (Guest) muted" needs the word off before the bracket is at the end to be seen.
+    for (let guard = 0; guard < 4; guard += 1) {
+      const before = name;
+      name = name.replace(NAME_SUFFIX, '').trim();
+      const parts = name.split(/\s+/);
+      if (parts.length > 1) {
+        const last = parts[parts.length - 1].replace(/[,.;:]+$/, '').toLowerCase();
+        if (words.indexOf(last) !== -1) name = parts.slice(0, -1).join(' ');
+      }
+      if (name === before) break;
+    }
+    return name.trim();
+  }
+
+  /*
+   * A label made only of status words is not a person.
+   *
+   * A name element that failed to resolve leaves the row's status pill as the whole label, and
+   * admitting "muted" to the roster puts a participant in the meeting who does not exist —
+   * which breaks the "exactly one other person here" inference exactly as the duplicate
+   * spellings do. Python applies the same rule; see `meeting/names.py` for the trade.
+   */
+  function allStatus(value) {
+    const words = statusWords();
+    const parts = value.split(/\s+/);
+    if (!parts.length || !value) return false;
+    for (const part of parts) {
+      if (words.indexOf(part.toLowerCase()) === -1) return false;
+    }
+    return true;
+  }
+
+  /*
+   * Halve a name that is its own first half repeated.
+   *
+   * Teams renders the name twice inside one row — as the row's accessible name and again in
+   * the name element — so a label read off the container arrives as "Dev Choudhary Dev
+   * Choudhary". Word-wise, so a genuine repeated word ("Ann Ann Smith") is left alone.
+   */
+  function collapseRepeat(value) {
+    const words = value.split(/\s+/);
+    if (words.length >= 2 && words.length % 2 === 0) {
+      const half = words.length / 2;
+      let same = true;
+      for (let i = 0; i < half; i += 1) {
+        if (words[i].toLowerCase() !== words[half + i].toLowerCase()) {
+          same = false;
+          break;
+        }
+      }
+      if (same) return words.slice(0, half).join(' ');
+    }
+    return value;
+  }
+
+  function cleanName(raw) {
+    let name = String(raw || '').split('\n')[0].replace(/\s+/g, ' ').trim();
+    name = stripStatus(stripNoise(name)).replace(/^[\s,.;:-]+|[\s,.;:-]+$/g, '');
+    if (allStatus(name)) return '';
+    return collapseRepeat(name).slice(0, 120);
+  }
+
+  /*
+   * The name Teams wrote into the row's own `data-tid`.
+   *
+   * **The most stable name source this page has, and it was being ignored.** A live meeting's
+   * roster rows carry `data-tid="participantsInCall-Dev Choudhary"` — the display name, in an
+   * attribute that does not change when the person mutes, unmutes, or has a context menu
+   * attached. Everything else available here is rendered text, which does.
+   *
+   * Returns `''` for a row whose tid carries no name, and the caller falls back to reading
+   * the markup as before.
+   */
+  function nameFromTid(node) {
+    if (!node || !node.getAttribute) return '';
+    const tid = String(node.getAttribute('data-tid') || '');
+    for (const prefix of CONFIG.rosterTidPrefixes || []) {
+      if (prefix && tid.length > prefix.length && tid.indexOf(prefix) === 0) {
+        return tid.slice(prefix.length).replace(/[_-]+/g, ' ').trim();
+      }
+    }
+    return '';
+  }
+
+  /*
+   * Drop any node that contains another node from the same list.
+   *
+   * A prefix selector can match a group container as well as the rows inside it, and a
+   * container resolves to *one* name for everybody in it — so the roster would report one
+   * participant where there were three. Keeping only the innermost matches removes that
+   * whole failure mode without needing to know which shape Teams is currently rendering.
+   *
+   * Bounded: this is quadratic, and it runs on the thread that encodes the avatar's audio.
+   * Past a townhall-sized roster the list is returned untouched, which is the pre-existing
+   * behaviour rather than a new risk.
+   */
+  function innermost(nodes) {
+    if (nodes.length < 2 || nodes.length > 60) return nodes;
+    const out = [];
+    for (const node of nodes) {
+      let container = false;
+      for (const other of nodes) {
+        if (other !== node && node.contains && node.contains(other)) {
+          container = true;
+          break;
+        }
+      }
+      if (!container) out.push(node);
+    }
+    return out.length ? out : nodes;
   }
 
   /*
@@ -1483,8 +1645,16 @@
    */
   function scanRoster() {
     const names = [];
-    for (const row of queryAll(CONFIG.rosterRowSelectors)) {
-      const name = cleanName(firstText(row, CONFIG.rosterNameSelectors) || textOf(row));
+    for (const row of innermost(queryAll(CONFIG.rosterRowSelectors))) {
+      // **The `data-tid` first, then the markup.** A live meeting's roster rows carry the
+      // display name in the attribute (`participantsInCall-Dev Choudhary`) and the *label*
+      // Teams renders beside it reads "Dev Choudhary muted Context menu is available" — so
+      // reading the markup first meant the ledger identified one person by up to three
+      // different names, and could therefore never say "there is exactly one other person
+      // here", which is what answers "what is my name".
+      const name = cleanName(
+        nameFromTid(row) || firstText(row, CONFIG.rosterNameSelectors) || textOf(row)
+      );
       if (!name || handMatch(name) || isPronounSelf(name)) continue;
       if (names.indexOf(name) === -1) names.push(name);
     }
@@ -1534,7 +1704,11 @@
         }
       }
       if (!marked) continue;
-      const name = cleanName(firstText(row, CONFIG.rosterNameSelectors) || textOf(row));
+      // Same order as `scanRoster`, and it has to be: the tracker matches a speaker against the
+      // roster's names, so a speaker read one way and a roster read the other never meet.
+      const name = cleanName(
+        nameFromTid(row) || firstText(row, CONFIG.rosterNameSelectors) || textOf(row)
+      );
       // A pronoun row is the avatar itself, and reporting it would be worse here than in the
       // roster: the tracker would name "You" as the current speaker for as long as the avatar
       // talked, and the interrupt source — which cannot recognise it as self either — would

@@ -157,6 +157,81 @@ class TestRoster:
         assert speakers.snapshot().candidates == ("Dev Choudhary",)
 
 
+class TestRosterNames:
+    """One person spelled several ways is several people, and that broke every answer.
+
+    The ledger identifies participants by name, so a roster carrying "Dev Choudhary" and "Dev
+    Choudhary muted Context menu is available" holds two attendees. Elimination — which is what
+    names an unattributed voice, chat message or caption on this connector — needs *exactly*
+    one other person present and fails closed at two, so the avatar could answer neither "what
+    is my name" nor "who is in the meeting" in a two-person call.
+    """
+
+    def test_status_decorations_do_not_split_one_person_into_several(self) -> None:
+        observer, parts = _observer()
+        observer.on_page_event(
+            {
+                "type": "roster",
+                "names": [
+                    "Dev Choudhary muted Context menu is available",
+                    "Dev Choudhary Context menu is available",
+                    "Dev Choudhary",
+                ],
+            }
+        )
+        ledger: TeamsAttendanceLedger = parts["attendance"]  # type: ignore[assignment]
+        assert ledger.present_names == ("Dev Choudhary",)
+
+    def test_the_agent_brief_names_the_only_other_person(self) -> None:
+        """The line that answers "what is my name": with one other participant there is nobody
+        else the voice could belong to, so the brief makes the inference rather than leaving it
+        to the agent."""
+        observer, parts = _observer()
+        observer.on_page_event(
+            {"type": "roster", "names": ["Dev Choudhary muted Context menu is available"]}
+        )
+        ledger: TeamsAttendanceLedger = parts["attendance"]  # type: ignore[assignment]
+        brief = ledger.snapshot().agent_context()
+        assert "Dev Choudhary" in brief
+        assert "Context menu" not in brief
+        assert "is the only other person here" in brief
+
+    def test_a_label_that_is_only_a_status_word_is_not_a_participant(self) -> None:
+        """A name element that failed to resolve leaves the row's status pill as the whole
+        label. Admitting it puts somebody in the meeting who does not exist."""
+        observer, parts = _observer()
+        observer.on_page_event({"type": "roster", "names": ["Dev Choudhary", "muted"]})
+        ledger: TeamsAttendanceLedger = parts["attendance"]  # type: ignore[assignment]
+        assert ledger.present_names == ("Dev Choudhary",)
+
+    def test_a_chat_message_the_panel_could_not_attribute_is_named_by_elimination(
+        self,
+    ) -> None:
+        """Asked who typed that, the avatar can answer — but only because the roster resolved
+        to exactly one person."""
+        observer, parts = _observer()
+        observer.on_page_event(
+            {"type": "roster", "names": ["Dev Choudhary muted Context menu is available"]}
+        )
+        observer.on_page_event(
+            {"type": "chat", "name": None, "text": "@AI Avatar what is my name?"}
+        )
+        transcript: TeamsTranscript = parts["transcript"]  # type: ignore[assignment]
+        assert "Dev Choudhary" in transcript.snapshot().agent_context()
+
+    def test_a_speaker_is_named_as_the_roster_spells_them(self) -> None:
+        """Asked who was talking to it, the avatar needs the speaker and the roster to be the
+        same string — a speaker called "Dev Choudhary muted" is nobody the ledger has heard
+        of."""
+        observer, parts = _observer()
+        observer.on_page_event({"type": "roster", "names": ["Dev Choudhary"]})
+        observer.on_page_event(
+            {"type": "speaker", "name": "Dev Choudhary muted Context menu is available"}
+        )
+        speakers: TeamsSpeakerTracker = parts["speakers"]  # type: ignore[assignment]
+        assert speakers.current_speaker() == "Dev Choudhary"
+
+
 class TestHands:
     def test_a_raised_hand_becomes_an_interruption(self) -> None:
         observer, parts = _observer()
@@ -204,6 +279,80 @@ class TestHands:
         observer.on_page_event({"type": "handLower", "id": "name:priya menon"})
         observer.on_page_event(
             {"type": "handRaise", "id": "name:priya menon", "name": "Priya Menon"}
+        )
+        assert interrupts.received == 2
+
+    def test_an_unmoved_hand_whose_label_changed_is_still_one_interruption(self) -> None:
+        """**The live failure, reproduced exactly.** Teams writes a participant's *state* into
+        the same accessible name as their name, so the page's key changes the moment they mute:
+
+            name:dev choudhary muted context menu is available
+            name:dev choudhary context menu is available
+
+        The page then retires the first — its row stopped being seen — and reports the second as
+        a fresh raise. Nobody moved, and the avatar stopped itself to say "ok, go ahead" a second
+        time five seconds after the first.
+
+        Two defences, and this asserts the outcome of both: ``meeting/names.py`` scrubs the
+        decorations so the two keys describe one person, and the observer latches on that person
+        rather than only on the page's key.
+        """
+        observer, parts = _observer()
+        observer.on_page_event(
+            {
+                "type": "handRaise",
+                "id": "name:dev choudhary muted context menu is available",
+                "name": "Dev Choudhary muted Context menu is available",
+            }
+        )
+        # The label lost "muted" — they unmuted to ask their question — so the page retires the
+        # old key and offers the new one.
+        observer.on_page_event(
+            {"type": "handLower", "id": "name:dev choudhary muted context menu is available"}
+        )
+        observer.on_page_event(
+            {
+                "type": "handRaise",
+                "id": "name:dev choudhary context menu is available",
+                "name": "Dev Choudhary Context menu is available",
+            }
+        )
+        interrupts: TeamsInterruptSource = parts["interrupts"]  # type: ignore[assignment]
+        assert interrupts.received == 1
+
+    def test_the_agent_is_told_the_person_s_name_and_not_the_row_s_label(self) -> None:
+        """The name is *spoken*: it reaches the agent as "{name} wants to say something", and a
+        live meeting had the avatar told that "Dev Choudhary muted Context menu is available"
+        wanted the floor."""
+        observer, parts = _observer()
+        observer.on_page_event(
+            {
+                "type": "handRaise",
+                "id": "name:dev choudhary muted context menu is available",
+                "name": "Dev Choudhary muted Context menu is available",
+            }
+        )
+        interrupts: TeamsInterruptSource = parts["interrupts"]  # type: ignore[assignment]
+        event = interrupts._queue.get_nowait()
+        assert event.participant == "Dev Choudhary"
+        assert "Dev Choudhary wants to say something" in event.prompt
+
+    def test_a_hand_lowered_under_every_label_re_arms_the_edge(self) -> None:
+        """The person's latch is released once nothing still reports them, and not before: a
+        hand genuinely lowered and raised again is two requests for the floor."""
+        observer, parts = _observer()
+        interrupts: TeamsInterruptSource = parts["interrupts"]  # type: ignore[assignment]
+        observer.on_page_event(
+            {
+                "type": "handRaise",
+                "id": "name:dev choudhary muted",
+                "name": "Dev Choudhary muted",
+            }
+        )
+        interrupts._queue.get_nowait()  # drained the way the router drains it
+        observer.on_page_event({"type": "handLower", "id": "name:dev choudhary muted"})
+        observer.on_page_event(
+            {"type": "handRaise", "id": "name:dev choudhary", "name": "Dev Choudhary"}
         )
         assert interrupts.received == 2
 

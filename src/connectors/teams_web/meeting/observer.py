@@ -28,6 +28,7 @@ from src.connectors.teams_web.meeting.active_speaker import TeamsSpeakerTracker
 from src.connectors.teams_web.meeting.attendance import TeamsAttendanceLedger
 from src.connectors.teams_web.meeting.chat import TeamsChatSource
 from src.connectors.teams_web.meeting.hand_raise import TeamsInterruptSource
+from src.connectors.teams_web.meeting.names import clean_display_name
 from src.connectors.teams_web.meeting.transcript import TeamsTranscript
 from src.connectors.teams_web.observations import (
     ParticipantEvent,
@@ -73,10 +74,12 @@ class TeamsMeetingObserver:
         "_attendance",
         "_chat",
         "_clock",
+        "_hand_names",
         "_hands_up",
         "_interrupts",
         "_leave_grace_us",
         "_missing_since",
+        "_names_up",
         "_roster",
         "_speakers",
         "_transcript",
@@ -108,6 +111,14 @@ class TeamsMeetingObserver:
         # Whose hand is up, keyed exactly as the page keys it. Held here because this outlives
         # every page re-render, reload and frame — see ``_on_hand``.
         self._hands_up: set[str] = set()
+        # The same question keyed on the *person* instead: page key -> folded name, and the set
+        # of names currently up. **A second latch rather than a replacement**, because the two
+        # fail differently. The page's key is what a ``handLower`` names, so it has to be
+        # tracked; but two of them can mean one person — a label that gained or lost a status
+        # word mid-hold spells the same participant two ways — and it is the person, not the
+        # key, that must only be handed the floor once. See ``_on_hand``.
+        self._hand_names: dict[str, str] = {}
+        self._names_up: set[str] = set()
         # Casefolded name -> when the page stopped seeing them. A departure is not believed
         # until it has persisted; see ``_on_roster``.
         self._missing_since: dict[str, int] = {}
@@ -203,7 +214,7 @@ class TeamsMeetingObserver:
                 self._on_hand(dict(event))
                 return
             if kind == "handLower":
-                self._hands_up.discard(str(event.get("id") or ""))
+                self._on_hand_lower(str(event.get("id") or ""))
                 return
             if kind == "roster":
                 self._on_roster(event)
@@ -243,6 +254,16 @@ class TeamsMeetingObserver:
         Deliberately **not** the per-participant cooldown in ``TeamsInterruptSource``. That is a
         rate limit — it would still fire again every cooldown for an unmoved hand, which is the
         exact behaviour being prevented, only slower.
+
+        **Latched on the person as well as on the page's key**, which is the half that was
+        missing. The page derives its key from the row's label, and Teams writes the
+        participant's *state* into that label — so the moment somebody muted, one unmoved hand
+        became two keys ("dev choudhary muted context menu is available" and "dev choudhary
+        context menu is available"), the first was retired by the page's grace pass, the second
+        arrived here as news, and the avatar interrupted itself to say "ok, go ahead" again. It
+        did that repeatedly, for as long as the hand stayed up, which is exactly what a latch
+        exists to prevent. ``meeting/names.py`` removes the decorations so the two keys collapse
+        into one at source; this makes the outcome independent of whether it managed to.
         """
         key = str(event.get("id") or "")
         if key and key in self._hands_up:
@@ -252,10 +273,48 @@ class TeamsMeetingObserver:
                 note="the page re-detected a hand that has not been lowered",
             )
             return
+
+        named = self._named(dict(event))
+        # Cleaned before it goes any further, because this name is *spoken*: it reaches the
+        # agent as "{name} wants to say something", and a live meeting had the avatar told that
+        # "Dev Choudhary muted Context menu is available" wanted the floor.
+        cleaned = clean_display_name(str(named.get("name") or ""))
+        if cleaned:
+            named["name"] = cleaned
+        folded = cleaned.casefold()
+
         if key:
             self._hands_up.add(key)
+            if folded:
+                self._hand_names[key] = folded
+
+        if folded and folded in self._names_up:
+            # A different key for a hand that is already up. Recorded above so the page can
+            # still lower it, and not acted on: this person already has the floor.
+            logger.info(
+                "teams_web.hand_already_up",
+                participant=named.get("name"),
+                note="the page re-detected an unmoved hand under a changed label; the floor "
+                "was already yielded to this person",
+            )
+            return
+        if folded:
+            self._names_up.add(folded)
+
         if self._interrupts is not None:
-            self._interrupts.offer_hand(self._named(dict(event)))
+            self._interrupts.offer_hand(named)
+
+    def _on_hand_lower(self, key: str) -> None:
+        """The page stopped seeing one hand.
+
+        The person's latch is released only when *no* key still maps to them, so a label that
+        changed mid-hold — leaving the page to retire the old key while the new one is still
+        reporting — does not re-arm the interruption for a hand nobody moved.
+        """
+        self._hands_up.discard(key)
+        folded = self._hand_names.pop(key, None)
+        if folded and folded not in self._hand_names.values():
+            self._names_up.discard(folded)
 
     def _on_roster(self, event: dict[str, object]) -> None:
         """A list of who the page can see, turned into joins and leaves.
@@ -279,7 +338,12 @@ class TeamsMeetingObserver:
             return
         seen: list[str] = []
         for item in raw:
-            name = " ".join(str(item or "").split())
+            # Scrubbed here as well as in the page, and the de-duplication below is why it
+            # matters: a roster carrying both "Dev Choudhary" and "Dev Choudhary muted" is two
+            # attendees, and a two-person meeting that the ledger believes has three can never
+            # answer "what is my name" — the elimination that names an unattributed voice needs
+            # *exactly* one other person and fails closed at two. See ``meeting/names.py``.
+            name = clean_display_name(item if isinstance(item, str) else str(item or ""))
             if name and not any(name.casefold() == known.casefold() for known in seen):
                 seen.append(name)
         if not seen:
@@ -352,7 +416,10 @@ class TeamsMeetingObserver:
         letting the page's narrower answer short-circuit that is how the avatar ends up
         interrupting itself.
         """
-        name = " ".join(str(event.get("name") or "").split())
+        # Cleaned to the same name the roster holds, because the tracker matches one against
+        # the other: a speaker named "Dev Choudhary muted" is nobody the ledger has heard of,
+        # so the brief would say the floor belongs to somebody who is not in the meeting.
+        name = clean_display_name(str(event.get("name") or ""))
         if not name:
             return
         speaker = SpeakerEvent(user_id=None, display_name=name, at_us=self._now_us())
@@ -373,7 +440,7 @@ class TeamsMeetingObserver:
         text = str(event.get("text") or "").strip()
         if not text or self._transcript is None:
             return
-        name = " ".join(str(event.get("name") or "").split()) or None
+        name = clean_display_name(str(event.get("name") or "")) or None
         line = TranscriptLine(
             user_id=None, display_name=name, text=text, at_us=self._now_us()
         )
@@ -389,7 +456,10 @@ class TeamsMeetingObserver:
         text = str(event.get("text") or "").strip()
         if not text:
             return
-        sender = " ".join(str(event.get("name") or "").split()) or None
+        # The same scrub as everywhere else, so a sender the chat panel labelled with a status
+        # decoration still matches the roster — which is what lets "who asked that?" be
+        # answered, and what keeps the avatar's own messages recognisable as its own.
+        sender = clean_display_name(str(event.get("name") or "")) or None
         self.on_chat(
             ChatMessage(text=text, sender=sender, received_at_us=self._now_us())
         )

@@ -67,6 +67,7 @@ from src.connectors.teams_web.meeting.hand_raise import (
 from src.connectors.teams_web.meeting.hand_raise import TeamsInterruptSource, render_prompt
 from src.connectors.teams_web.meeting.join import DEFAULT_SELECTORS as JOIN_SELECTORS
 from src.connectors.teams_web.meeting.join import TeamsWebJoiner
+from src.connectors.teams_web.meeting.names import NOISE_PHRASES, STATUS_WORDS
 from src.connectors.teams_web.meeting.observer import TeamsMeetingObserver
 from src.connectors.teams_web.meeting.transcript import TeamsTranscript
 from src.connectors.teams_web.page.server import PageAudioServer
@@ -594,6 +595,19 @@ class TeamsWebSession:
             "captionSettleMs": config.caption_settle_ms,
             "rosterRowSelectors": list(observe.roster_row),
             "rosterNameSelectors": list(observe.roster_name),
+            # Not a selector: the ``data-tid`` prefixes whose remainder is the display name.
+            # Read before any rendered text, because a Teams row's *label* changes when its
+            # owner mutes and its ``data-tid`` does not — and every name-keyed thing in this
+            # connector (the ledger, the hand latch, chat elimination) breaks when one person
+            # arrives spelled three ways. See ``TeamsObserverSelectors.roster_tid_prefixes``.
+            "rosterTidPrefixes": list(observe.roster_tid_prefixes),
+            # The decorations Teams renders inside the same label as the name, as data for the
+            # same reason the selectors are: a rename should cost a settings edit. Shared with
+            # ``meeting/names.py``, which scrubs again on the way in — the page's copy is what
+            # keeps the hand-raise key stable at source, and Python's is what stops a stale
+            # page script putting a status label into an answer about who attended.
+            "nameNoisePhrases": list(NOISE_PHRASES),
+            "nameStatusWords": list(STATUS_WORDS),
             "speakerRowSelectors": list(observe.speaker_row),
             "speakerMarkerSelectors": list(observe.speaker_marker),
             # The containers, which are what let an *empty* panel be recognised as open — see

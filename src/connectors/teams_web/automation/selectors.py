@@ -48,15 +48,27 @@ class TeamsHandSelectors:
     )
 
     participant_row: tuple[str, ...] = (
+        # **Observed live, and the one that matches.** Teams tags each roster row with the
+        # participant's own name — ``data-tid="participantsInCall-Dev Choudhary"`` — so the
+        # hook is a prefix rather than a fixed value, which is why the exact-match entry below
+        # it counted zero rows through an entire meeting while the roster was open on screen.
+        # It is also the most stable *name* source on the page: the attribute does not change
+        # when somebody mutes, and the rendered label does. See ``nameFromTid`` in the page.
+        "[data-tid^='participantsInCall-']",
         # Teams renders its roster as a tree, one ``treeitem`` per person, grouped into
         # "In this meeting" and "Presenters"/"Attendees" sections.
         "[data-tid='roster-participant']",
         "[data-tid='participantsInCall'] [role='treeitem']",
         "[role='treeitem'][data-tid]",
         "li[data-tid^='participant']",
+        # The roster item wrapper, from the same live run: the panel rendered
+        # ``calling-roster-item-avatar`` inside every row, so the row itself is a
+        # ``calling-roster-item``.
+        "[data-tid^='calling-roster-item']",
         # The tile grid, which exists in every layout and needs no panel open. Wider than the
         # roster and correspondingly less precise, which is why it is last.
         "[data-tid='participant-stream']",
+        "[data-tid='participant-info']",
         "[role='listitem']",
     )
     """One element per person the observer might find an indicator inside.
@@ -70,6 +82,9 @@ class TeamsHandSelectors:
         "[data-tid='roster-participant-name']",
         "[data-tid='displayName']",
         "[data-tid='display-name']",
+        # The stage tile's name plate, observed live. Consulted for a hand drawn on a tile
+        # rather than in the roster, where none of the hooks above exists.
+        "[data-tid='participant-info-nametag']",
         "[class*='displayName' i]",
         "[class*='participantName' i]",
     )
@@ -119,9 +134,21 @@ class TeamsObserverSelectors:
     """
 
     roster_row: tuple[str, ...] = (
+        # **First, because it is the one a live meeting actually matched.** See
+        # ``TeamsHandSelectors.participant_row`` for the evidence: the row's ``data-tid`` is
+        # ``participantsInCall-<display name>``, so every exact-match guess below counted zero
+        # while the participants panel was open and the names were on screen — which is why
+        # attendance was never populated and the agent could answer neither "what is my name"
+        # nor "who is in the meeting".
+        #
+        # A prefix selector can also match a *group* container, which would resolve one name
+        # for everybody inside it; ``innermost`` in the page drops any match that contains
+        # another, so that shape costs nothing here.
+        "[data-tid^='participantsInCall-']",
         "[data-tid='roster-participant']",
         "[data-tid='participantsInCall'] [role='treeitem']",
         "[role='treeitem'][data-tid]",
+        "[data-tid^='calling-roster-item']",
         # The tile grid, behind the roster rather than in front of it: it needs no panel open,
         # and it is the people *on screen* rather than the people in the meeting. Teams
         # paginates and virtualises the grid, so past roughly one screenful the roster becomes
@@ -129,6 +156,12 @@ class TeamsObserverSelectors:
         # avatar's view scrolls. Correct for the small meetings this connector is aimed at,
         # wrong for a town hall.
         "[data-tid='participant-stream']",
+        # **The tile's info overlay, and the reason it is worth having at all.** Teams shows
+        # one side pane, so opening the chat panel *closes* the participants panel — a session
+        # that reads both has the roster on screen only for the seconds between the two clicks.
+        # This is the one name-bearing hook that survives it; ``participant-info-nametag`` sits
+        # inside it and was observed live throughout a meeting whose roster hooks had all gone.
+        "[data-tid='participant-info']",
     )
     """One element per person in the meeting.
 
@@ -139,12 +172,34 @@ class TeamsObserverSelectors:
         "[data-tid='roster-participant-name']",
         "[data-tid='displayName']",
         "[data-tid='display-name']",
+        # The stage tile's name plate, observed live — and the only name-bearing hook present
+        # once the chat panel has replaced the roster, which Teams' single side pane makes
+        # inevitable in a session that reads both.
+        "[data-tid='participant-info-nametag']",
         "[class*='displayName' i]",
         "[class*='participantName' i]",
         # The tile's accessible name, which is where the name lives when the tile is showing
         # video and no text element is rendered at all.
         "[aria-label]",
     )
+
+    roster_tid_prefixes: tuple[str, ...] = (
+        "participantsInCall-",
+        "roster-participant-",
+        "calling-roster-item-",
+    )
+    """``data-tid`` prefixes whose remainder *is* the participant's display name.
+
+    **Not a selector — a name source, and the best one this connector has.** Teams writes the
+    display name into the row's own ``data-tid``, where it is unaffected by whether the person
+    is muted, whether a context menu is attached, or which of the row's several text nodes was
+    read. Every other name on the page is rendered text, and a live meeting produced "Dev
+    Choudhary", "Dev Choudhary muted Context menu is available" and "Dev Choudhary Context
+    menu is available" for one person inside five seconds — three participants as far as a
+    ledger keyed on the name is concerned, and three separate hand-raise latches.
+
+    Consulted before the markup and ignored when the remainder is empty, so a build that tags
+    rows without naming them falls back to exactly the previous behaviour."""
 
     speaker_row: tuple[str, ...] = (
         # The tile is the element that carries the state: Teams draws the speaking indicator
