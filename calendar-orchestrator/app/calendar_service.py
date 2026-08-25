@@ -1,0 +1,207 @@
+"""Polls the bot's Google Calendar and extracts joinable meetings.
+
+Google Meet and Zoom both, since a Zoom meeting scheduled through the Google Calendar add-on
+is an ordinary calendar event with a Zoom link on it — the calendar does not care who hosts
+the conference, and neither does this poller. Which connector serves it is decided by
+``meeting_link`` and carried on the event as ``platform``.
+
+Polling rather than push notifications (Google Calendar supports webhook "watch" channels)
+on purpose: watch channels need a publicly reachable HTTPS callback URL and expire on their
+own schedule, which is extra infrastructure this service doesn't need to take on for a
+single-calendar, minute-granularity use case. ``poll_interval_s`` trades a little latency
+for a lot less moving parts; see README.md if push notifications are ever worth revisiting.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import replace
+from datetime import UTC, datetime
+from typing import Any
+
+from google.auth.exceptions import RefreshError
+from googleapiclient.discovery import Resource, build
+from googleapiclient.errors import HttpError
+
+from app.config import Settings
+from app.meeting_link import MeetingLink, find_meeting_link, find_passcode
+from app.models import CalendarEvent, MissingConferenceDataError
+
+logger = logging.getLogger(__name__)
+
+# The Meet pattern used to live here and a copy of it lived in ``invite_parser``, with a
+# comment on each saying the two had to agree. Both now call ``meeting_link``, which is also
+# what taught this path to recognise Zoom without a second copy of a second pattern.
+
+
+class CalendarSyncError(RuntimeError):
+    """A poll failed. Callers should log and try again next interval rather than crash the
+    scheduler loop over a transient Calendar API error."""
+
+
+class CalendarService:
+    """Thin async wrapper around the (synchronous) Google Calendar API client."""
+
+    def __init__(self, credentials: Any, settings: Settings) -> None:
+        self._settings = settings
+        # discovery.build() and the resulting resource's .execute() are both blocking
+        # network calls — every use below is dispatched through asyncio.to_thread so it
+        # never stalls the scheduler's event loop.
+        self._service: Resource = build(
+            "calendar", "v3", credentials=credentials, cache_discovery=False
+        )
+
+    async def list_upcoming_meetings(self) -> list[CalendarEvent]:
+        """Fetch events starting within the lookahead window that carry a joinable link.
+
+        Events without conferencing, and cancelled events, are silently excluded — this is
+        a list of things to *join*, not a mirror of the calendar.
+        """
+        try:
+            response = await asyncio.to_thread(self._fetch_page)
+        except RefreshError as exc:
+            raise CalendarSyncError(f"credential refresh failed: {exc}") from exc
+        except HttpError as exc:
+            raise CalendarSyncError(f"Calendar API error: {exc}") from exc
+
+        events: list[CalendarEvent] = []
+        for raw in response.get("items", []):
+            if raw.get("status") == "cancelled":
+                continue
+            try:
+                events.append(_parse_event(raw))
+            except MissingConferenceDataError:
+                continue  # no conferencing on it — e.g. a plain calendar block
+            except (KeyError, ValueError) as exc:
+                logger.warning("skipping malformed event %s: %s", raw.get("id"), exc)
+        return events
+
+    def _fetch_page(self) -> dict:
+        now = datetime.now(UTC)
+        time_max = now.timestamp() + self._settings.scheduling.lookahead_hours * 3600
+        return (
+            self._service.events()
+            .list(
+                calendarId=self._settings.calendar_id,
+                timeMin=now.isoformat(),
+                timeMax=datetime.fromtimestamp(time_max, tz=UTC).isoformat(),
+                singleEvents=True,  # expand recurring events into concrete instances
+                orderBy="startTime",
+                maxResults=250,
+            )
+            .execute()
+        )
+
+
+def _parse_event(raw: dict) -> CalendarEvent:
+    start_raw = raw.get("start", {})
+    start_str = start_raw.get("dateTime")
+    if start_str is None:
+        # All-day events only have "date", never a Meet link worth joining at a precise time.
+        raise MissingConferenceDataError("all-day event has no start time")
+    start = datetime.fromisoformat(start_str)
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=UTC)
+
+    link = _extract_meeting_link(raw)
+
+    return CalendarEvent(
+        event_id=raw["id"],
+        summary=raw.get("summary", "(no title)"),
+        start=start,
+        updated=raw.get("updated", ""),
+        meeting_code=link.meeting_number,
+        meeting_url=link.url,
+        platform=link.platform,
+        passcode=link.passcode,
+        attendees=_extract_attendees(raw),
+    )
+
+
+def _extract_attendees(raw: dict) -> tuple[str, ...]:
+    """Pull the invite list off a calendar event.
+
+    ``displayName`` when Google has one, the email address otherwise — the bridge prefers
+    whatever name Meet itself reports once somebody joins, so an address here is a serviceable
+    placeholder rather than the final label.
+
+    Three kinds of entry are dropped. ``resource`` entries are rooms and equipment, not people.
+    ``self`` is the bot's own calendar account, which would otherwise be reported as an invitee
+    who never joined while it is sitting in the meeting. Declined invitations are kept
+    deliberately — "Priya was invited and did not come" is true and worth being able to say.
+    """
+    names: list[str] = []
+    seen: set[str] = set()
+    for attendee in raw.get("attendees", []) or ():
+        if not isinstance(attendee, dict):
+            continue
+        if attendee.get("resource") or attendee.get("self"):
+            continue
+        label = str(attendee.get("displayName") or attendee.get("email") or "").strip()
+        if not label or label.casefold() in seen:
+            continue
+        seen.add(label.casefold())
+        names.append(label)
+    return tuple(names)
+
+
+def _extract_meeting_link(raw: dict) -> MeetingLink:
+    """Find the meeting this event is for, on whichever platform hosts it.
+
+    **Searched in descending order of authority**, which matters more now than it did when
+    only Meet was handled. Google fills ``conferenceData`` and ``hangoutLink`` itself, so
+    those are facts; ``location`` and ``description`` are free text a human or a Zoom add-on
+    wrote, and can contain last week's link in a copied agenda. Taking the structured fields
+    first means the loose ones are only consulted when nothing structured exists.
+
+    That ordering is also what keeps a **Zoom meeting scheduled from Google Calendar**
+    working: the Zoom add-on writes a proper ``conferenceData`` entry point, while a meeting
+    somebody pasted into the description reaches the last resort — and both are joinable.
+
+    Raises:
+        MissingConferenceDataError: nothing joinable is named anywhere on the event.
+    """
+    structured: list[str] = []
+    for entry_point in raw.get("conferenceData", {}).get("entryPoints", []) or ():
+        if not isinstance(entry_point, dict):
+            continue
+        if entry_point.get("entryPointType") != "video":
+            continue
+        structured.append(str(entry_point.get("uri", "")))
+        # Google's own field for a conferencing passcode, which the Zoom add-on populates.
+        # Appended as ``Passcode: x`` rather than parsed separately so it goes through the
+        # single matcher in ``meeting_link`` — one definition of what a passcode looks like.
+        for key in ("password", "passcode", "accessCode"):
+            value = str(entry_point.get(key) or "").strip()
+            if value:
+                structured.append(f"Passcode: {value}")
+
+    hangout_link = str(raw.get("hangoutLink", ""))
+    notes = str(raw.get("conferenceData", {}).get("notes", ""))
+
+    link = find_meeting_link(
+        "\n".join(structured),
+        hangout_link,
+        notes,
+        str(raw.get("location", "")),
+        str(raw.get("description", "")),
+    )
+    if link is None:
+        raise MissingConferenceDataError(f"event {raw.get('id')} names no joinable meeting")
+
+    # The passcode may be in the description while the link is in ``conferenceData`` — the
+    # Zoom add-on splits them exactly that way, and a Teams meeting pasted into an event puts
+    # the link in ``location`` and the printed ``Passcode:`` line in the body. Only ever filled
+    # in, never overridden. ``find_passcode`` answers ``None`` for Meet, so this costs the
+    # original path nothing.
+    if link.passcode is None:
+        passcode = find_passcode(
+            link.platform,
+            "\n".join(structured),
+            str(raw.get("location", "")),
+            str(raw.get("description", "")),
+        )
+        if passcode is not None:
+            link = replace(link, passcode=passcode)
+    return link

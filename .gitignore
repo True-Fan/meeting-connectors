@@ -1,0 +1,37 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+
+.env.local
+*.log
+
+# sidecar build artifacts (M5)
+src/connectors/zoom/publisher/sidecar/build/
+*.so
+*.o
+
+# runtime
+run/
+*.sock
+out/
+
+.DS_Store
+.idea/
+.vscode/
+
+# Google Meet connector: the persistent Chromium profile holds a live Google
+# session cookie, and per-session working copies are cloned beside it. Never commit.
+.meet/
+
+~/.mc/zoom-web-profile/
