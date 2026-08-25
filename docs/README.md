@@ -10,12 +10,14 @@ exists, why it is shaped the way it is, and how to bring it up on a laptop.
 | Doc | Read this for |
 |---|---|
 | [HLD.md](HLD.md) | The system in one picture: what each service is, how they talk to each other, what problem the architecture solves. Start here. |
+| [USAGE.md](USAGE.md) | Plain-English, no-code guide to *using* the three browser-based connectors (Google Meet, Zoom, Teams) day to day: the ways to get the avatar into a meeting, and what it can do once it's there (raise hand, chat mention, voice, room awareness). Start here if you're not writing code. |
+| [input-output-format.md](input-output-format.md) | What audio/video each of those three connectors sends to and receives from the avatar agent, what format it's in, and whether any of it touches a LiveKit room (short answer: no — LiveKit lives inside the separate avatar agent, not here). |
 | [LLD.md](LLD.md) | The bridge's internals: every module, the session state machine, the shared media pipeline, the wire protocols, the API contract. Read this to change code. |
 | [RUNBOOK.md](RUNBOOK.md) | Copy-pasteable commands to bring every service up locally, per platform, plus what to check when something doesn't work. |
 | [calendar-orchestrator.md](calendar-orchestrator.md) | The scheduler that watches a calendar/inbox and calls `POST /sessions` automatically, so nobody has to run a `curl` by hand. |
 | [connectors/google-meet.md](connectors/google-meet.md) | Google Meet connector: architecture, setup, run. |
-| [connectors/zoom.md](connectors/zoom.md) | Both Zoom connectors (`zoom` — Meeting SDK, `zoom_web` — browser): architecture, setup, run. |
-| [connectors/teams.md](connectors/teams.md) | Both Microsoft Teams connectors (`teams` — Graph/.NET sidecar, `teams_web` — browser): architecture, setup, run. |
+| [connectors/zoom.md](connectors/zoom.md) | The Zoom connector (`zoom_web` — browser): architecture, setup, run. |
+| [connectors/teams.md](connectors/teams.md) | The Microsoft Teams connector (`teams_web` — browser): architecture, setup, run. |
 
 ## The three services, in one sentence each
 
@@ -40,10 +42,10 @@ exists, why it is shaped the way it is, and how to bring it up on a laptop.
 - **LLD** answers "how does the code work" — classes, state machines, queues, wire formats,
   file:line references into `src/`.
 - **connectors/*.md** answer "how do I run *this specific platform*" — each platform's
-  two-app-registration dance (Zoom), Azure AD + Windows host (Teams), or browser-profile
-  sign-in (Google Meet, Zoom-web, Teams-web), plus the exact `curl` to join a meeting on it.
+  browser-profile sign-in (Google Meet, Zoom, Teams), plus the exact `curl` to join a meeting
+  on it.
 - **RUNBOOK.md** is the one page to keep open in a terminal — every process to start, in
-  order, for every platform, gathered from the connector docs and the top-level README.
+  order, for every platform, gathered from the connector docs and HLD.md.
 
 None of this replaces reading the code — the source in `src/` is unusually heavily commented
 (most non-trivial settings and design decisions are documented as docstrings next to the

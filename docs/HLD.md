@@ -39,7 +39,7 @@ which is a separate deployable this repo talks to over one WebSocket and never i
 │                                                                           │
 │   POST /sessions ──▶ MeetingService ──▶ ConnectorRegistry ──▶ connector   │
 │                                                                           │
-│   one of: zoom · zoom_web · teams · teams_web · google_meet               │
+│   one of: zoom_web · teams_web · google_meet                             │
 │   (a session joins exactly one platform, chosen per request)             │
 │                                                                           │
 │   every connector feeds the SAME shared pipeline:                        │
@@ -69,7 +69,7 @@ goes (see [RUNBOOK.md](RUNBOOK.md#the-avatar-agent-external)).
 independently:
 - The bridge needs no AI credentials and no calendar access — it can be stood up and tested
   with zero knowledge of the agent behind it (`FileSink`/`NullSink` and fakes for every
-  external SDK make this literal — see [LLD § testing seams](LLD.md#12-testing-seams)).
+  external dependency make this literal — see [LLD § testing seams](LLD.md#12-testing-seams)).
 - The orchestrator needs no meeting-platform credentials at all — it only reads a calendar
   and an inbox, and could be pointed at a different bridge entirely.
 - The avatar agent needs no meeting-platform or calendar knowledge — swapping Zoom for Teams
@@ -77,29 +77,28 @@ independently:
 
 ## 3. meeting-connectors: platforms it can join
 
-| | Zoom (`zoom`) | Zoom-web (`zoom_web`) | Teams (`teams`) | Teams-web (`teams_web`) | Google Meet (`google_meet`) |
-|---|---|---|---|---|---|
-| How the avatar gets in | Meeting SDK for Linux, via a C++ sidecar | Ordinary browser participant (Playwright) | Graph app-hosted media, via a .NET sidecar | Ordinary browser participant (Playwright) | Ordinary browser participant (Playwright) |
-| Ingest | RTMS (WebSocket) | RTMS **or** tapped from the page | Same Graph session that publishes | Tapped from the page | Tapped from the WebRTC peer connection |
-| Needs from the meeting owner | RTMS enabled on the hosting account | Nothing — joins like a guest | Tenant-consented Azure AD app + a Windows host | Nothing — joins like a guest | A Google account signed in once, in advance |
-| Where the "credential" lives | Zoom app registration (two apps) | A Chromium profile with a mic selected | Azure AD app + Windows sidecar | A Chromium profile (optional) | A Chromium profile (**required**) |
-| Runs on | Same container as the bridge | Same container (needs a browser) | **A separate Windows machine** | Same container | Same container |
-| Status | Ingest ✅ verified live; publish ✅ IPC verified against a stub, real SDK link pending | ✅ built and unit-tested; selectors unverified against a live meeting in `browser` mode | Bridge side ✅ tested against a fake sidecar; .NET side ⚠️ written, not yet compiled on Windows | ⚠️ built and unit-tested; selectors not yet verified against a live meeting | Roadmap only in the original design, **now the connector most exercised in practice** (see `docs/README-gateway.md` in the avatar-agent repo) |
+| | Zoom (`zoom_web`) | Teams (`teams_web`) | Google Meet (`google_meet`) |
+|---|---|---|---|
+| How the avatar gets in | Ordinary browser participant (Playwright) | Ordinary browser participant (Playwright) | Ordinary browser participant (Playwright) |
+| Ingest | Tapped from the page (or RTMS, for a meeting the bot's own account hosts) | Tapped from the page | Tapped from the WebRTC peer connection |
+| Needs from the meeting owner | Nothing — joins like a guest | Nothing — joins like a guest | A Google account signed in once, in advance |
+| Where the "credential" lives | A Chromium profile with a mic selected | A Chromium profile (optional) | A Chromium profile (**required**) |
+| Runs on | Same container as the bridge | Same container | Same container |
+| Status | ✅ built and unit-tested; selectors unverified against a live meeting in `browser` mode | ⚠️ built and unit-tested; selectors not yet verified against a live meeting | Roadmap only in the original design, **now the connector most exercised in practice** (see `docs/README-gateway.md` in the avatar-agent repo) |
 
-**Why there are two connectors for both Zoom and Teams.** `zoom`/`teams` are the "native"
-integrations — better signal (structured events instead of scraped DOM, no dependency on a UI
-that can change), but they need something from whoever owns the meeting: RTMS enabled on the
-Zoom account, or a tenant-consented Azure app plus a Windows host for Teams. **A meeting the
-bot was only invited to is, by definition, someone else's** — so it can carry neither
-entitlement. `zoom_web`/`teams_web` need nothing but a public join link, at the cost of
-reading the meeting through a browser instead of an API. `calendar-orchestrator` always
-chooses the `_web` variant for exactly this reason (see
+**All three join the same way: as an ordinary participant in a real, headless browser tab.**
+None needs anything granted by whoever owns the meeting — no special account entitlement, no
+app registration, no consent flow — which is exactly why this is what
+`calendar-orchestrator` always uses (see
 [calendar-orchestrator.md § Platforms](calendar-orchestrator.md#platforms)).
 
-**Why Google Meet is browser-only, full stop.** Google's real-time media API is
-receive-only — it states so explicitly — and there is no Meet equivalent of a Meeting SDK.
-There is no "native" Meet connector to fall back to; the avatar has to be a real, signed-in
-browser, always.
+**Why Google Meet's browser profile must be signed in, and the other two don't strictly need
+one.** Google's real-time media API is receive-only — it states so explicitly — so there is
+no way for anything to publish into a Meet call except a real, signed-in browser; the account
+identity has to come from somewhere, and a persistent, pre-authenticated profile is it. Zoom
+and Teams accept an anonymous guest, so their profiles exist for smaller reasons (a
+pre-selected microphone for Zoom, avoiding repeated consent prompts for Teams) rather than out
+of necessity.
 
 A session picks its platform per request (`POST /sessions {"platform": "..."}`), not per
 deployment — a single running bridge can hold a Zoom session and a Teams-web session at the
@@ -114,16 +113,16 @@ join.
 `ConnectorSessionFactory`. Everything on the other side of those ports — the media router, the
 jitter-buffering pacer, the echo suppressor, the fMP4 decoder, the shared clock, the avatar
 WebSocket client, the session state machine, the HTTP API — is **one implementation shared by
-all five connectors**, written once against Zoom and never touched when Teams, Google Meet,
-Zoom-web, or Teams-web were added. Adding a connector was, and remains, "a new folder, one
-enum member, and one line in the DI container" — see
-[LLD § adding a connector](LLD.md#13-adding-a-sixth-connector).
+all three connectors**, written once and never touched as Zoom-web, Teams-web, and Google Meet
+were added one at a time. Adding a connector was, and remains, "a new folder, one enum
+member, and one line in the DI container" — see
+[LLD § adding a connector](LLD.md#13-adding-a-fourth-connector).
 
-This is also why the three browser-based connectors (Google Meet, Zoom-web, Teams-web) look
-almost identical to each other despite being separate packages: they share the same recipe
-(inject JS, patch `getUserMedia`, tap `RTCPeerConnection`, talk to Python over a loopback
-WebSocket) without sharing a base class, arrived at independently and only converged on later
-— see [LLD § the page-bridge pattern](LLD.md#8-the-page-bridge-pattern-google-meet-zoom-web-teams-web).
+This is also why the three connectors (Google Meet, Zoom-web, Teams-web) look almost
+identical to each other despite being separate packages: they share the same recipe (inject
+JS, patch `getUserMedia`, tap `RTCPeerConnection`, talk to Python over a loopback WebSocket)
+without sharing a base class, arrived at independently and only converged on later — see
+[LLD § the page-bridge pattern](LLD.md#8-the-page-bridge-pattern-google-meet-zoom-web-teams-web).
 
 ## 5. Request lifecycle, end to end
 
@@ -163,9 +162,8 @@ WebSocket) without sharing a base class, arrived at independently and only conve
   formats never leave their own connector package; connectors never import each other. These
   are asserted by an architecture test, not just convention.
 - **Nothing here is untestable without the real platforms.** Every external dependency — the
-  Zoom Meeting SDK, the Teams Graph/.NET sidecar, the avatar agent itself, even a browser —
-  has an in-repo fake or stub that speaks the real wire protocol, so the bridge's own logic is
-  verified before (or entirely without) a licensed SDK, a tenant-consented Azure app, or a
-  Windows machine.
+  avatar agent itself, Zoom's RTMS handshake, even a browser — has an in-repo fake or stub
+  that speaks the real wire protocol, so the bridge's own logic is verified before (or
+  entirely without) any of the real platforms being reachable.
 
 Continue to [LLD.md](LLD.md) for how each of these pieces actually works.

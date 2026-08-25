@@ -96,12 +96,11 @@ Zoom and Teams needed no second poller or state file.
 | calendar source | `hangoutLink`, `conferenceData` | `conferenceData`, `location`, `description` | `conferenceData`, `location`, `description` |
 | invite sender | `meetings-noreply@google.com` | `no-reply@zoom.us`/`.com` | none — always a human's mailbox |
 
-**Always `zoom_web`, never `zoom`; always `teams_web`, never `teams`.** An invited meeting is
-by definition somebody else's — it cannot carry the RTMS entitlement `zoom` needs or the
-tenant-consented Azure app + Windows host `teams` needs. `zoom_web`/`teams_web` join as
-ordinary/anonymous participants and need neither. See
-[connectors/zoom.md](connectors/zoom.md) and [connectors/teams.md](connectors/teams.md) for
-what each pair actually requires.
+**Always the browser connector — `zoom_web` for Zoom, `teams_web` for Teams.** An invited
+meeting is by definition somebody else's, so the bot joins it the same way any guest would:
+as an ordinary/anonymous participant in a real browser tab, needing nothing granted by the
+meeting's owner. See [connectors/zoom.md](connectors/zoom.md) and
+[connectors/teams.md](connectors/teams.md) for what each connector actually requires.
 
 ### Teams links, and why this is the one platform that also gets `meeting_url`
 
@@ -272,6 +271,7 @@ triggered), `POST /gmail/poll` (check now).
   for any reasonable lead time; swap in `SQLAlchemyJobStore` if a much shorter lead time is
   ever needed.
 
-For the complete, line-by-line rationale behind every setting and filter above — including the
-exact regexes, the HTML-flattening repair pass, and the Gmail quota math — read
-`calendar-orchestrator/README.md` directly; this page is a map onto it, not a replacement.
+For the exact regexes, the HTML-flattening repair pass, and the Gmail quota math behind any
+setting or filter above, read the corresponding module directly in
+`calendar-orchestrator/app/` — `invite_parser.py` and `gmail_poller.py` are the two densest
+ones. This page is the complete map; there is no separate README in that folder.

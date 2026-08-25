@@ -25,9 +25,7 @@ is up will need to be re-created, not healed.
 |---|---|
 | Google Meet | `.venv/bin/python tools/meet_signin.py --profile ~/.mc/meet-profile` (headed, interactive) |
 | Zoom (`zoom_web`) | `.venv/bin/python scripts/zoom_web_login.py --profile ~/.mc/zoom-web-profile` (headed; **select a microphone**) |
-| Zoom (`zoom`) | Register two Zoom apps — see [connectors/zoom.md](connectors/zoom.md#setup-two-zoom-apps) |
 | Teams (`teams_web`) | `.venv/bin/python scripts/teams_web_login.py --profile ~/.mc/teams-web-profile` (optional) |
-| Teams (`teams`) | Azure AD app + a Windows host running the .NET sidecar — see [connectors/teams.md](connectors/teams.md#setup) |
 | calendar-orchestrator | Enable the Calendar API, choose a credential mode, then `python scripts/oauth_bootstrap.py` if using OAuth mode — see [calendar-orchestrator.md § Setup](calendar-orchestrator.md#setup) |
 
 Set the corresponding `MC_*`/`ORCH_*` environment variables (`.env` in each repo) before
@@ -220,9 +218,9 @@ agent→meet 696KiB in 371 frames, 1.5s audible / 8.5s silent · fMP4 out 113KiB
   the most common cause differs per platform (missing mic selection for Zoom, blocked CSP for
   Teams).
 - **Session created but stuck in `JOINING`** — check `GET /sessions/{id}` for `components`
-  and `errors`; for Zoom specifically, this can mean RTMS hasn't attached yet (webhook not
-  received, or not triggered on the Zoom side — see
-  [connectors/zoom.md](connectors/zoom.md#note-on-mc_zoom__rtms_auto_start)).
+  and `errors`; for Zoom running in `rtms` ingest mode specifically, this can mean RTMS hasn't
+  attached yet (webhook not received, or not triggered on the Zoom side — see
+  [connectors/zoom.md](connectors/zoom.md#optional-rtms-ingest-mode)).
 
 ## The avatar agent (external)
 

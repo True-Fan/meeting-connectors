@@ -2,8 +2,8 @@
 
 This is the internals reference for `meeting-connectors` itself. Read [HLD.md](HLD.md) first
 if you haven't — this doc assumes you know why the system is shaped the way it is and focuses
-on how. Platform-specific mechanics (RTMS handshakes, Graph calls, browser injection) live in
-the [connector docs](README.md#start-here); this doc covers everything shared, plus how the
+on how. Platform-specific mechanics (RTMS handshakes, browser injection) live in the
+[connector docs](README.md#start-here); this doc covers everything shared, plus how the
 per-platform pieces plug into it.
 
 File paths are relative to the repo root; `file.py:12` means "see that file around line 12" —
@@ -18,9 +18,7 @@ src/
 ├── domain/           Canonical model. Depends on nothing else in src/.
 ├── protocols/        The ports every connector implements — six of them
 ├── connectors/       Adapters. The ONLY place a platform SDK/API may appear.
-│   ├── zoom/         RTMS ingest · Meeting SDK publish via C++ sidecar (wire frozen)
 │   ├── zoom_web/     Browser join · RTMS or page-tapped ingest
-│   ├── teams/        Graph app-hosted media via a .NET sidecar on Windows
 │   ├── teams_web/    Browser join · page-tapped ingest
 │   └── google_meet/  Browser join · page-tapped ingest (Meet has no publish API at all)
 ├── services/
@@ -118,7 +116,8 @@ decorator) so the wiring stays visible at each call site.
   against. `ChatMessage` and `HandRaise` are kept as distinct types on purpose: a chat message
   waits its turn, a raised hand interrupts.
 - **`media.py`** — the shape contract. `SampleFormat.S16LE` and `PixelFormat.I420` are
-  currently the *only* members of their enums (Zoom Meeting SDK's required formats).
+  currently the *only* members of their enums (I420 is what every browser connector's video
+  pipeline standardises on).
   `AudioFormat`/`VideoFormat` validate positive (and, for video, even — I420 needs 2×2 chroma
   subsampling) dimensions. `AudioFrame`/`VideoFrame`/`MediaChunk` are the frame types that
   flow through every queue in the system; each carries a `FrameContext` rather than duplicating `session_id`/`correlation_id`.
@@ -188,7 +187,7 @@ the component itself. **Reconnect is always the component's own job** (e.g.
 session is *beyond* recovery.
 
 `SessionRegistry` is in-memory (not persisted), indexed by id, meeting number, and (for
-Zoom/Zoom-web) RTMS `meeting_uuid`. It also holds the **join/RTMS race** table: a
+Zoom-web) RTMS `meeting_uuid`. It also holds the **join/RTMS race** table: a
 `PendingRtmsBinding` can arrive (via webhook) before the session that should claim it exists,
 or vice versa. `DEFAULT_PENDING_TTL_S = 45.0`, deliberately under Zoom's own ~60s
 auto-teardown window — a documented production incident used 300s and attached sessions to
@@ -204,7 +203,7 @@ already-dead streams.
    allocating anything, so an unsupported/unconfigured platform fails in one step with a
    named error instead of partway through a join.
 3. Build a fresh `SessionContext`/`MeetingContext`.
-4. Zoom/Zoom-web only: try to claim any RTMS binding already parked in the registry
+4. Zoom-web only: try to claim any RTMS binding already parked in the registry
    (`_claim_pending_rtms`).
 5. Register the session, call `factory.build(session)`, transition to `JOINING`, `await
    connector_session.start()`. Any exception here fails the session and re-raises as a
@@ -278,7 +277,7 @@ has no coherent backpressure story.
   what's tapped). Adaptive noise floor, minimum duration, hysteresis, release window — not a
   real VAD, just a threshold plus arithmetic to avoid clipping the room's silence.
 - **`FileSink` / `NullSink`** — `FileSink` muxes raw output into a playable file, which is how
-  decode/clock/av-sync correctness was proven **before any platform SDK/sidecar existed**.
+  decode/clock/av-sync correctness was proven **before any platform integration existed**.
   `NullSink` counts and discards, for load testing and as the default in unit tests.
 
 ### Barge-in unification
@@ -337,8 +336,8 @@ default.
   process-global registry.
 - **`reconnect.py`** — `ReconnectPolicy(initial_delay_s, max_delay_s, max_attempts,
   multiplier)`, exponential backoff with **full jitter** (a uniform draw, not a fixed
-  fraction) to decorrelate simultaneous reconnect storms. Shared by the avatar client, both
-  sidecar links, and Google Meet's browser relaunch logic.
+  fraction) to decorrelate simultaneous reconnect storms. Shared by the avatar client, the
+  RTMS handshake, and Google Meet's browser relaunch logic.
 - **`context.py`** — `ContextVar`-based ambient session/correlation id, propagated into child
   asyncio tasks automatically, read by the logging processor. Frames never rely on this
   ambient state for correctness (they carry an explicit `FrameContext`, since a frame can
@@ -351,38 +350,36 @@ The **only** module allowed to import `src.connectors` — enforced by an archit
 Everything else composes against protocols/domain types. `Container` (a
 `dependency_injector.DeclarativeContainer`) wires, per connector, a structurally parallel and
 independent block: `<platform>_config` (built via `<Config>.from_settings(settings)`) →
-`<platform>_session_factory`. `build_connector_registry()` registers Zoom **unconditionally**
-(the production default, preserved exactly as it was before any other connector existed);
-every other connector registers only if `settings.<platform>.is_configured()`, and is passed
-as a **callable factory** (`providers.Delegate(...)`) rather than a resolved instance — this
-defers construction (and config validation) of optional connectors so a malformed optional
-config can never appear on Zoom's startup path. A failure building one optional connector is
-caught, logged, and the connector is simply absent — never a boot failure.
+`<platform>_session_factory`. `build_connector_registry()` registers one connector
+**unconditionally** as the production default (preserved exactly as it was before any other
+connector existed); every other connector registers only if `settings.<platform>.is_configured()`,
+and is passed as a **callable factory** (`providers.Delegate(...)`) rather than a resolved
+instance — this defers construction (and config validation) of optional connectors so a
+malformed optional config can never appear on the default connector's startup path. A failure
+building one optional connector is caught, logged, and the connector is simply absent — never
+a boot failure.
 
 `main.py` is one line: `app = create_app()`, imported once by `uvicorn src.main:app`.
 
-## 11. Cross-connector wire protocol comparison
+## 11. The browser-bridge wire protocol
 
-Two connectors (Zoom, Teams) reach their platform through a **native SDK behind a sidecar
-process**; three (Google Meet, Zoom-web, Teams-web) reach it through a **browser + injected
-JS + loopback WebSocket**. Both families converge on the same idea — a small binary header,
-platform-specific magic bytes, media as raw payload, JSON for control/observations — arrived
-at independently each time.
+All three connectors reach their platform through the same recipe: a **browser + injected JS
++ loopback WebSocket**. Each has its own small binary header and magic bytes, but the three
+converge on the same idea — arrived at independently each time, then converged on later.
 
-| | Zoom sidecar (`zoom/publisher/protocol.py`) | Teams sidecar (`teams/sidecar/protocol.py`) | Browser bridges (`*/page/protocol.py`, `google_meet/websocket/protocol.py`) |
+| | Google Meet (`google_meet/websocket/protocol.py`) | Zoom-web (`zoom_web/page/protocol.py`) | Teams-web (`teams_web/page/protocol.py`) |
 |---|---|---|---|
-| Transport | Unix domain socket, same container | TCP + TLS (optionally mTLS), separate Windows host | Loopback TCP WebSocket, same container, ephemeral port |
-| Magic | `ZMC1` | `TMC1` | `GMC1` (Meet) / `ZWB1` (Zoom-web) / `TWB1` (Teams-web) — deliberately distinct so a captured frame names its origin |
+| Transport | Loopback TCP WebSocket, same container, ephemeral port | Same | Same |
+| Magic | `GMC1` | `ZWB1` | `TWB1` — deliberately distinct per connector so a captured frame names its origin |
 | Header | 24 bytes, big-endian: magic, version, type, flags, reserved, seq(u32), pts_us(i64), length(u32) | identical shape | identical shape |
-| Media direction | Sidecar receives audio+video (publish only — Zoom ingest is a separate RTMS socket) | **Bidirectional** on one link — same `AUDIO_PCM` type used both ways | Bidirectional; audio only (video egress exists only for Google Meet) |
+| Media direction | Bidirectional; audio + video (the only one of the three that publishes video) | Bidirectional; audio only | Bidirectional; audio only |
 | Framing errors | Fatal, no resync — link torn down and rebuilt | Same | Same |
-| Backpressure | Video dropped over a size threshold (~4MB queued); audio always drains | Same policy | Same policy |
-| Auth | SDK JWT minted in Python, handed over inside `CONTROL_JOIN`; sidecar holds no long-lived credential | Azure AD client secret forwarded inside `CONTROL_JOIN`; TLS/mTLS on the transport | Per-session random token, compared with `hmac.compare_digest`, checked before the WS handshake completes |
+| Auth | Per-session random token, compared with `hmac.compare_digest`, checked before the WS handshake completes | Same | Same |
 
 Every one of these codecs is deliberately hand-rolled rather than using an existing framing
 library — each is small enough to fit in one file, and a byte-for-byte match between the two
-sides (Python ⇄ C++, Python ⇄ C#, Python ⇄ JS) is exactly the kind of thing worth pinning with
-a direct conformance test rather than trusting a shared dependency to stay in sync.
+sides (Python ⇄ the injected JS) is exactly the kind of thing worth pinning with a direct
+conformance test rather than trusting a shared dependency to stay in sync.
 
 ## 12. Testing seams
 
@@ -391,17 +388,15 @@ what lets each connector be built and verified before its real infrastructure ex
 
 | Real thing | Stand-in |
 |---|---|
-| Streaming Avatar Agent | `FakeAvatarTransport` (in-process); `FileSink`/`NullSink` on the publish side make output watchable/countable without any platform SDK |
-| Zoom Meeting SDK (C++) | The sidecar builds in a **stub SDK mode** (`MC_WITH_ZOOM_SDK` unset) that speaks the real IPC/framing/threading/pacing logic without linking the real SDK |
-| Teams Graph + Media SDK (.NET) | An in-process fake sidecar (`tests/fakes/teams_sidecar.py`) speaking the real wire protocol; the wire codec itself is pinned by a direct Python↔C# conformance test |
+| Streaming Avatar Agent | `FakeAvatarTransport` (in-process); `FileSink`/`NullSink` on the publish side make output watchable/countable without any platform integration |
 | A real browser | `BrowserDriver` is a `Protocol`; tests substitute a fake driver, so join/selector/observer logic is exercised without Playwright installed |
 | Zoom RTMS | `JsonWebSocket` is a `Protocol` seam; the handshake state machine is tested against an in-memory fake |
 
-This is also why the top-level README's status table can honestly say things like "IPC and
-control flow verified against a stub; real SDK build is a separate milestone" — the protocol
+This is also why each connector's own status section can honestly separate what's been run
+against a live meeting from what's only been verified against these stand-ins — the protocol
 layer and the platform-integration layer are verified separately, on purpose.
 
-## 13. Adding a sixth connector
+## 13. Adding a fourth connector
 
 1. New package under `src/connectors/<name>/`.
 2. Implement `ConnectorSession`/`ConnectorSessionFactory` (a `Protocol`, so no base class to
@@ -411,6 +406,6 @@ layer and the platform-integration layer are verified separately, on purpose.
    platform-specific fields.
 4. In `containers.py`: one `<name>_config` provider, one `<name>_session_factory` provider,
    one line in `build_connector_registry()` using `_register_optional` (unless it should be
-   unconditional like Zoom).
+   the unconditional production default).
 5. Nothing in `src/services/`, `src/api/`, or `src/avatar/` changes. This has held for every
    connector added after the first.

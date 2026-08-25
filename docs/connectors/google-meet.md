@@ -137,10 +137,10 @@ In practice this call is normally made by `calendar-orchestrator`, not by hand �
 
 ## Status
 
-Per the top-level README, Google Meet is now the most exercised connector in practice, ahead
-of its original "roadmap only" design status — see the avatar-agent repo's
-`README-gateway.md` for the specific run sequence used to verify it end to end (also
-reproduced in [RUNBOOK.md](../RUNBOOK.md)).
+Google Meet is now the most exercised connector in practice, ahead of its original
+"roadmap only" design status — see the avatar-agent repo's own `README-gateway.md` for the
+specific run sequence used to verify it end to end (also reproduced in
+[RUNBOOK.md](../RUNBOOK.md)).
 
 ## Troubleshooting
 
