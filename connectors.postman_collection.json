@@ -1,0 +1,166 @@
+{
+  "info": {
+    "_postman_id": "dcdc0f76-07bb-4eed-84ea-d5d8724f9a08",
+    "name": "connectors",
+    "description": "### Welcome to Postman! This is your first collection. \n\nCollections are your starting point for building and testing APIs. You can use this one to:\n\n• Group related requests\n• Test your API in real-world scenarios\n• Document and share your requests\n\nUpdate the name and overview whenever you’re ready to make it yours.\n\n[Learn more about Postman Collections.](https://learning.postman.com/docs/collections/collections-overview/)",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_exporter_id": "56595024",
+    "_collection_link": "https://go.postman.co/collection/56595024-dcdc0f76-07bb-4eed-84ea-d5d8724f9a08?source=collection_link"
+  },
+  "item": [
+    {
+      "name": "google meet normal flow",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n\"platform\":\"google_meet\",\n\"meeting_number\":\"rvrjyyjvgv\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "localhost:8000/sessions",
+          "host": [
+            "localhost"
+          ],
+          "port": "8000",
+          "path": [
+            "sessions"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "delete session",
+      "request": {
+        "method": "DELETE",
+        "header": [],
+        "url": {
+          "raw": "http://localhost:8000/sessions/ses_8943f2b4a0344ff4b6d02f592411d409",
+          "protocol": "http",
+          "host": [
+            "localhost"
+          ],
+          "port": "8000",
+          "path": [
+            "sessions",
+            "ses_8943f2b4a0344ff4b6d02f592411d409"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "sync meet",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "url": {
+          "raw": "http://localhost:8200/sync",
+          "protocol": "http",
+          "host": [
+            "localhost"
+          ],
+          "port": "8200",
+          "path": [
+            "sync"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "bridge created",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://localhost:8000/sessions",
+          "protocol": "http",
+          "host": [
+            "localhost"
+          ],
+          "port": "8000",
+          "path": [
+            "sessions"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "zoom basic",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"platform\": \"zoom_web\",\n    \"meeting_number\":\"88333001209\",\n    \"passcode\": \"jhE7Wv\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "localhost:8000/sessions",
+          "host": [
+            "localhost"
+          ],
+          "port": "8000",
+          "path": [
+            "sessions"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "teams",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"platform\": \"teams_web\",\n  \"meeting_number\": \"9350063851001\",\n  \"passcode\": \"VH2Er6\",\n  \"display_name\": \"AI Avatar\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "localhost:8000/sessions",
+          "host": [
+            "localhost"
+          ],
+          "port": "8000",
+          "path": [
+            "sessions"
+          ]
+        }
+      },
+      "response": []
+    }
+  ]
+}
