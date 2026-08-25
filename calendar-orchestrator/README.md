@@ -55,9 +55,7 @@ calendar-orchestrator/
 │   └── gmail_state.py       Durable "already processed" message-id store
 ├── scripts/
 │   └── oauth_bootstrap.py   One-time interactive sign-in for OAuth mode
-├── tests/
 ├── requirements.txt
-├── requirements-dev.txt
 └── .env.example
 ```
 
@@ -512,13 +510,6 @@ a broad result set and filtering in Python.
   start a second avatar in the same meeting.
 - **A failed join is retried, but only `ORCH_GMAIL__MAX_ATTEMPTS` times.** Without a cap, a
   bridge outage would retry the same invite every 5 seconds until it aged out.
-
-### Tests
-
-```bash
-pip install -r requirements.txt -r requirements-dev.txt
-pytest
-```
 
 ## Notes on scaling this up
 
