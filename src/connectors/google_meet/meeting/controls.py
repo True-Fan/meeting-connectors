@@ -21,6 +21,8 @@ connector here drains its sessions on shutdown.
 
 from __future__ import annotations
 
+import asyncio
+
 from src.connectors.google_meet.automation.driver import BrowserDriver
 from src.connectors.google_meet.automation.selectors import MeetSelectors
 from src.infrastructure.logging import get_logger
@@ -53,27 +55,38 @@ class MeetControls:
             return False
         return None
 
-    async def unmute(self) -> bool:
+    async def unmute(self, attempts: int = 8) -> bool:
         """Ensure the microphone is publishing. Idempotent.
 
         Returns True when the microphone is known to be live afterwards.
-        """
-        muted = await self.is_muted()
-        if muted is False:
-            return True
-        if muted is None:
-            logger.warning(
-                "meet_controls.no_microphone_button",
-                note="cannot confirm the avatar is unmuted; the call UI may not be "
-                "mounted yet, or the control was renamed (automation/selectors.py)",
-            )
-            return False
 
-        clicked = await self._driver.click_first(self._selectors.unmute_toggle)
-        if clicked is None:  # pragma: no cover - visible then unclickable is a race
-            return False
-        logger.info("meet_controls.unmuted", selector=clicked)
-        return await self.is_muted() is False
+        Nudged and retried for the reason ``camera_on`` is — the control bar fades out on an
+        idle pointer, so "unreadable" is usually "not rendered yet" rather than "renamed".
+        An already-unmuted avatar still returns on the first look, so the retry costs a
+        working join nothing.
+        """
+        for attempt in range(attempts):
+            await self._driver.nudge_pointer()
+
+            muted = await self.is_muted()
+            if muted is False:
+                if attempt:
+                    logger.info("meet_controls.unmuted", attempts=attempt + 1)
+                return True
+
+            if muted is True:
+                clicked = await self._driver.click_first(self._selectors.unmute_toggle)
+                if clicked is not None:
+                    logger.info("meet_controls.unmuted", selector=clicked)
+            await asyncio.sleep(0.5)
+
+        logger.warning(
+            "meet_controls.still_muted",
+            note="cannot confirm the avatar is unmuted, so nothing it says may be heard; "
+            "the call UI may not have mounted, or the control was renamed "
+            "(automation/selectors.py)",
+        )
+        return False
 
     async def mute(self) -> bool:
         """Stop publishing audio. Idempotent."""
@@ -95,24 +108,46 @@ class MeetControls:
             return False
         return None
 
-    async def camera_on(self) -> bool:
-        """Ensure the synthetic camera is publishing. Idempotent."""
-        state = await self.is_camera_on()
-        if state is True:
-            return True
-        if state is None:
-            logger.warning(
-                "meet_controls.no_camera_button",
-                note="cannot confirm the avatar's camera is on; the avatar would appear "
-                "as an initial rather than as a person",
-            )
-            return False
+    async def camera_on(self, attempts: int = 8) -> bool:
+        """Ensure the synthetic camera is publishing. Idempotent.
 
-        clicked = await self._driver.click_first(self._selectors.camera_on_toggle)
-        if clicked is None:
-            return False
-        logger.info("meet_controls.camera_on", selector=clicked)
-        return await self.is_camera_on() is True
+        **Retried, and each attempt nudges the pointer first.** Both of those were missing,
+        and together they are why the avatar joined Meet with its camera off. Meet fades its
+        control bar out when the pointer is idle — which in a headless page is always — so
+        ``camera_on_toggle`` was present but *invisible*, ``is_camera_on()`` returned ``None``
+        ("unreadable"), and this gave up after one look. Even when the control was found, a
+        single click was followed by an immediate re-read, before Meet had flipped the
+        button's label.
+
+        Unlike the Zoom joiner's equivalent, absence was never mistaken for success here —
+        ``is_camera_on`` has always distinguished "off" from "unreadable". The failure was
+        giving up rather than looking again.
+        """
+        for attempt in range(attempts):
+            await self._driver.nudge_pointer()
+
+            state = await self.is_camera_on()
+            if state is True:
+                if attempt:
+                    logger.info("meet_controls.camera_on", attempts=attempt + 1)
+                return True
+
+            if state is False:
+                clicked = await self._driver.click_first(self._selectors.camera_on_toggle)
+                if clicked is not None:
+                    logger.info("meet_controls.camera_on", selector=clicked)
+            # ``None`` is "the control bar has not rendered yet", which the next nudge and
+            # the sleep below are exactly the remedy for. Falling through rather than
+            # returning is the whole fix.
+            await asyncio.sleep(0.5)
+
+        logger.warning(
+            "meet_controls.camera_still_off",
+            note="cannot confirm the avatar's camera is on, so it may appear as an initial "
+            "rather than as a person; neither camera toggle resolved after retrying — "
+            "check them with tools/meet_inspect.py",
+        )
+        return False
 
     async def camera_off(self) -> bool:
         """Stop publishing video. Idempotent."""

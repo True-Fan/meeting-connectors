@@ -8,12 +8,16 @@ what `calendar-orchestrator` always uses for an invited meeting (see
 
 ## Architecture
 
-One addition specific to Zoom: a persistent Chromium profile with **a microphone already
-selected**. Zoom will not start its own capture pipeline until its device menu has a
-selection, and that selection lives in the profile's `Default/Preferences` — a throwaway
-profile means Zoom publishes nothing, however correct the injected synthetic track is. This
-was measured, not assumed, which is why `scripts/zoom_web_login.py` exists and spells out that
-step explicitly.
+One addition specific to Zoom: a persistent Chromium profile with **a microphone *and a
+camera* already selected**. Zoom will not start a capture pipeline until its device menu has a
+selection for that device, and the selection lives in the profile's `Default/Preferences` — a
+throwaway profile means Zoom publishes nothing, however correct the injected synthetic track
+is. This was measured, not assumed, which is why `scripts/zoom_web_login.py` exists and spells
+out both steps explicitly.
+
+**The camera half was missed originally**, and the symptom was precise: audio worked and the
+avatar joined with its video off, because only the microphone had ever been selected. If video
+is missing, re-run the login script and check step 5.
 
 ```
 Playwright ──▶ Chromium (persistent profile, mic pre-selected)
@@ -64,9 +68,10 @@ why this is a separate step from installing the package.
 .venv/bin/python scripts/zoom_web_login.py --profile ~/.mc/zoom-web-profile
 ```
 This launches a **headed** Chromium with real permission prompts (deliberately not faked).
-Sign in, join any meeting, click "Join Audio by Computer", and — the step that matters —
-**explicitly select a microphone** in the device menu before closing the browser. The profile
-only saves cleanly on a normal context close.
+Sign in, join any meeting, click "Join Audio by Computer", and — the steps that matter —
+**explicitly select a microphone AND a camera** in their device menus, then click Start Video
+once to confirm the camera selection took. Only then close the browser: the profile saves
+cleanly on a normal context close and not on a kill.
 
 ```bash
 MC_ZOOM_WEB__ENABLED=true

@@ -2,10 +2,10 @@
 
 Run **once**, interactively. It opens a visible browser against the profile
 directory the connector will use, so you can sign in to Zoom and — the part that
-actually matters — **select a microphone**.
+actually matters — **select a microphone and a camera**.
 
-WHY THE MICROPHONE SELECTION IS THE POINT
------------------------------------------
+WHY THE DEVICE SELECTION IS THE POINT
+-------------------------------------
 The connector publishes the avatar through a synthetic ``MediaStreamTrack`` injected
 into the page, exactly as the Google Meet connector does. That works only if Zoom
 starts its capture pipeline, and Zoom will not start it until its device menu has a
@@ -17,6 +17,12 @@ This was measured the hard way: with a fresh profile Zoom's microphone menu show
 device checked, its pipeline stayed idle, and the injected track was consumed and
 never transmitted. Joining the same meeting from a normal signed-in browser had a
 microphone selected by default and worked.
+
+**The camera is the same mechanism, and missing it is why the avatar joined with its
+video off.** Step 4 below covered only the microphone, so the audio pipeline started
+and the video one did not: Zoom had no camera selected, so "Start Video" either stayed
+inert or never enabled, and the injected canvas track went nowhere — the exact
+audio-era failure, one device across. Select both.
 
     python scripts/zoom_web_login.py --profile ~/.mc/zoom-web-profile
 
@@ -43,7 +49,12 @@ In the browser window that just opened:
   4. Open the caret beside Mute -> **Select a Microphone**, and click one so it
      shows a checkmark. THIS STEP IS THE WHOLE POINT: without a selected device
      Zoom never starts capturing, and the avatar is silent.
-  5. Leave the meeting.
+  5. Open the caret beside Start/Stop Video -> **Select a Camera**, and click one
+     so it shows a checkmark. Same reason, for video: without this the avatar
+     joins with its camera off and nobody sees it.
+  6. Click **Start Video** once, confirm you see a picture, and leave it on — that
+     is what proves the selection took.
+  7. Leave the meeting.
 
 Then close the browser window, or press Ctrl-C here.
 """

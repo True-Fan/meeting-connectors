@@ -82,6 +82,22 @@ class BrowserDriver(Protocol):
         """Click the first visible selector; return which one, or ``None``."""
         ...
 
+    async def nudge_pointer(self) -> None:
+        """Move the pointer, so an auto-hiding control bar reveals itself.
+
+        **Why a browser driver needs this at all.** Meet and Zoom both fade their in-call
+        controls out when the pointer sits still, and in a headless page the pointer never
+        moves *once* — so those controls are routinely **present in the DOM but not
+        visible**. Every check here is a visibility check (``wait_for_any``,
+        ``click_first``), so an invisible control is indistinguishable from an absent one,
+        and code that reads "the Start Video button is absent" as "the camera is already
+        on" concludes exactly the wrong thing.
+
+        Call this immediately before looking for a control that lives on a control bar.
+        Must never raise: it is a best-effort nudge, not a step that can fail a join.
+        """
+        ...
+
     async def fill_first(self, selectors: tuple[str, ...], value: str) -> str | None:
         """Type ``value`` into the first visible selector; return which one."""
         ...
@@ -357,6 +373,26 @@ class PlaywrightDriver:
                 continue
             return selector
         return None
+
+    async def nudge_pointer(self) -> None:
+        """Move the pointer so an auto-hiding control bar reveals itself.
+
+        Two moves rather than one, and the second lands over the bottom of the viewport
+        where both Meet's and Zoom's control bars live: these clients reveal on
+        ``mousemove``, and a single synthetic move to the coordinate the pointer already
+        occupies does not always produce one.
+
+        Deliberately silent on every failure. A page that is navigating or closing must not
+        turn a best-effort nudge into a join failure, and the caller re-checks visibility
+        immediately afterwards anyway.
+        """
+        page = self._page
+        if page is None:
+            return
+        size = page.viewport_size or {"width": 1280, "height": 720}
+        with suppress(Exception):
+            await page.mouse.move(size["width"] // 2, size["height"] // 2)
+            await page.mouse.move(size["width"] // 2, max(size["height"] - 24, 0))
 
     async def fill_first(self, selectors: tuple[str, ...], value: str) -> str | None:
         page = self._require_page()

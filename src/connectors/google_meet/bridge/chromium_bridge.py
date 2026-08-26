@@ -715,8 +715,24 @@ class ChromiumBridge:
         self._controls = MeetControls(driver=driver, selectors=self._selectors)
         audio_live, video_live = await self._controls.publish_both()
 
-        self._state = ComponentState.HEALTHY if audio_live else ComponentState.DEGRADED
-        self._detail = None if audio_live else "the avatar could not unmute"
+        # **Video counts toward health, and it did not used to.** ``video_live`` was computed
+        # here and then dropped on the floor: a camera that never came on left the component
+        # ``HEALTHY``, so the one trace of it was a single ``video_published=False`` field in
+        # the log line below. That is precisely the failure that shipped — the avatar in the
+        # meeting as an initial rather than a face, with nothing in ``GET /sessions/{id}``
+        # saying so. Audio-only is genuinely degraded-but-useful (``publish_both``'s own
+        # docstring says as much), which is what ``DEGRADED`` is for.
+        if audio_live and video_live:
+            self._state = ComponentState.HEALTHY
+            self._detail = None
+        else:
+            self._state = ComponentState.DEGRADED
+            self._detail = (
+                "the avatar could not unmute"
+                if not audio_live
+                else "the avatar's camera could not be confirmed on; it may appear as an "
+                "initial rather than as a person"
+            )
 
         logger.info(
             "meet_bridge.joined",

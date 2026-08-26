@@ -105,15 +105,46 @@ class ZoomWebSelectors:
         "button:has-text('Unmute')",
     )
     camera_on_button: tuple[str, ...] = (
-        # **Unverified against a live meeting — best-effort, same status every selector
-        # list in this file started at.** Zoom labels this control by what a click *does*,
-        # the same convention ``unmute_button`` relies on, so "Start Video" showing means
-        # the camera is off now. Never match "Stop Video" here: that would turn it back off.
-        "button[aria-label='Start Video']",
-        "button[aria-label*='start video' i]",
-        "[role='button'][aria-label*='start video' i]",
+        # Zoom labels this control by what a click *does*, the same convention
+        # ``unmute_button`` relies on, so "Start Video" showing means the camera is off
+        # now. Never match "Stop Video" here: that would turn it back off.
+        #
+        # **The two words are matched as separate attribute filters, not as one substring,
+        # and that is the whole fix.** This list used to lead with
+        # ``aria-label*='start video'`` — which cannot match Zoom's actual label,
+        # ``"start my video"``, because of the word in between. The evidence was three
+        # fields up this same class: ``unmute_button`` already records that Zoom's labels
+        # carry an infix ("unmute my microphone"). That one survived it by matching a single
+        # word; a two-word substring does not. Live result: audio joined, camera stayed off.
+        #
+        # Chaining ``[aria-label*='start' i][aria-label*='video' i]`` matches "Start Video",
+        # "start my video" and "start sending my video" alike, and still cannot match a
+        # "stop ... video" label, which is the one thing that must never be clicked here.
+        "button[aria-label*='start' i][aria-label*='video' i]",
+        "[role='button'][aria-label*='start' i][aria-label*='video' i]",
+        "div[role='button'][aria-label*='start' i][aria-label*='video' i]",
+        # Label text, for a build that drops the aria-label but keeps the caption.
         "button:has-text('Start Video')",
-        ".footer-button__video-icon[aria-label*='start' i]",
+        # Exact forms last: harmless, and they document what has actually been seen.
+        "button[aria-label='Start Video']",
+        "button[aria-label='start my video']",
+    )
+    camera_off_button: tuple[str, ...] = (
+        # **The positive confirmation that the camera is ON**, and the reason it exists is a
+        # bug this connector shipped with: ``ensure_camera_on`` used to read "the Start
+        # Video control is not visible" as "the camera is on". Zoom hides its footer
+        # whenever the pointer is idle — which, in a headless page, is always — so the
+        # control was routinely present but invisible, and the check returned success with
+        # the camera still off and no warning logged. Absence is not evidence; this is.
+        #
+        # Same chained-attribute matching as above, for the same infix reason.
+        # Never clicked. Read only.
+        "button[aria-label*='stop' i][aria-label*='video' i]",
+        "[role='button'][aria-label*='stop' i][aria-label*='video' i]",
+        "div[role='button'][aria-label*='stop' i][aria-label*='video' i]",
+        "button:has-text('Stop Video')",
+        "button[aria-label='Stop Video']",
+        "button[aria-label='stop my video']",
     )
     leave_button: tuple[str, ...] = (
         "button[aria-label='Leave']",
@@ -382,34 +413,75 @@ class ZoomWebJoiner:
         which is after ``join()`` has already returned, so the session calls this itself once
         the page is confirmed connected (see ``ZoomWebSession.start``).
 
-        Same shape as ``_ensure_unmuted`` for the same reason: a single click is not enough,
-        because Zoom may not have rendered the control yet on the first attempt, and success
-        is defined by the control disappearing rather than by the click itself succeeding —
-        "Start Video" absent means the camera is on, since Zoom names the button after what
-        pressing it would do.
+        Retried rather than clicked once, because Zoom may not have rendered the footer yet
+        on the first attempt.
+
+        **Success is a positive reading, never an absence.** This originally returned ``True``
+        as soon as the Start Video control was not *visible* — and that was the bug that left
+        the avatar's camera off in every live meeting. Zoom fades its footer out whenever the
+        pointer is idle, which in a headless page is always, so the control was present and
+        invisible; the check read that as "already on", returned success, and logged nothing.
+        Every attempt now nudges the pointer first to force the footer to render, and
+        confirmation requires the *Stop Video* control to actually appear.
 
         Never raises and a failure here is not fatal to the session: it means the avatar is
         heard but not seen, which is exactly what ``video_dropped``/``video_published`` in
         ``ZoomWebMediaSink.health()`` stays able to distinguish from a working publish.
         """
         for attempt in range(attempts):
-            still_off = await self._driver.wait_for_any(
-                self._selectors.camera_on_button, timeout_s=0.5
-            )
-            if still_off is None:
+            # Before *any* visibility check, not just before the click: an un-nudged footer
+            # makes both controls invisible, which is the state this used to misread.
+            await self._driver.nudge_pointer()
+
+            if await self._driver.wait_for_any(
+                self._selectors.camera_off_button, timeout_s=0.5
+            ):
                 if attempt:
                     logger.info("zoom_web.camera_on", attempts=attempt + 1)
                 return True
-            await self._driver.click_first(self._selectors.camera_on_button)
+
+            clicked = await self._driver.click_first(self._selectors.camera_on_button)
+            if clicked is None:
+                # Neither control is visible. Unknown, not "on" — keep trying, because the
+                # footer may simply not have rendered yet.
+                logger.debug("zoom_web.camera_control_not_found", attempt=attempt + 1)
             await asyncio.sleep(0.5)
 
         logger.warning(
             "zoom_web.camera_still_off",
-            note="the avatar is in the meeting but its camera is off, so nothing it "
-            "publishes will be seen; the start-video control did not clear — this "
-            "selector list is unverified against a live meeting",
+            controls=await self._describe_controls(),
+            note="the avatar is in the meeting but its camera could not be confirmed on, "
+            "so it may be publishing nothing anybody can see. Neither the start-video nor "
+            "the stop-video control resolved — the labels Zoom actually rendered are in "
+            "'controls' above; copy the video one into ZoomWebJoinSelectors",
         )
         return False
+
+    async def _describe_controls(self) -> list[str]:
+        """Every clickable control's label, harvested from the live page.
+
+        **So a selector miss reports the answer instead of only the symptom.** The camera
+        bug cost two live meetings to diagnose, and both times the missing fact was simply
+        *what Zoom actually called the button* — unobtainable from a headless run, because
+        the warning said only that nothing matched. This puts the real labels in the log
+        line, so the next mismatch is a one-line selector edit rather than another meeting.
+
+        Best-effort and never raises: a page that has gone away must not turn a diagnostic
+        into a failure. ``evaluate`` is optional on the driver protocol's implementations in
+        practice, so its absence is tolerated too.
+        """
+        script = """
+        Array.from(document.querySelectorAll("button,[role='button']"))
+          .map(el => (el.getAttribute('aria-label')
+                      || (el.textContent || '').trim()).slice(0, 60))
+          .filter(Boolean)
+          .slice(0, 60)
+        """
+        try:
+            labels = await self._driver.evaluate(script)
+        except Exception:
+            return []
+        return [str(label) for label in labels] if isinstance(labels, list) else []
 
     # -- page state --------------------------------------------------------
 
