@@ -323,6 +323,12 @@ class TeamsWebSession:
         if not await self._page_server.wait_connected(timeout_s=10.0):
             logger.warning("teams_web.page_never_attached")
 
+        # After the page attaches, not before: `getUserMedia`'s canvas track only exists once
+        # the injected script has connected, and clicking "Turn camera on" before that would
+        # turn the camera on over an empty track. Not fatal — a failed click means the avatar
+        # is heard but not seen, which `TeamsWebMediaSink.health()` keeps visible.
+        await self._joiner.ensure_camera_on()
+
         # Asked once, after the join, and it is the difference between a named cause and
         # silence. See ``_probe_page``.
         await self._probe_page()
@@ -557,6 +563,14 @@ class TeamsWebSession:
             "sampleRateHz": config.publish_audio_format.sample_rate_hz,
             "workletSource": playout_worklet(),
             "displayName": config.display_name,
+            # -- the synthetic camera -----------------------------------------
+            #
+            # Sizes the canvas the avatar's face is painted onto. Matched to
+            # ``video_format`` rather than a fixed constant so a deployment that changes the
+            # publish geometry does not silently shear the image against a canvas sized for
+            # the old one.
+            "videoWidth": config.video_format.width,
+            "videoHeight": config.video_format.height,
             # -- the audio tap ------------------------------------------------
             "captureWorkletSource": capture_worklet(),
             "captureFrameMs": config.capture_frame_ms,
@@ -711,7 +725,9 @@ class TeamsWebSessionFactory:
         )
 
         page_server = PageAudioServer()
-        publisher = self._sink_override or TeamsWebMediaSink(server=page_server)
+        publisher = self._sink_override or TeamsWebMediaSink(
+            server=page_server, video_format=config.video_format
+        )
 
         self_names = _self_name_candidates(session, config)
 

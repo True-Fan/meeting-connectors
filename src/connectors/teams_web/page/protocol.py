@@ -1,18 +1,22 @@
 """The page channel's two wire formats — one per direction, because they carry opposite
 kinds of thing.
 
-**Bridge → page: binary.** One message type, fixed header, raw PCM payload::
+**Bridge → page: binary.** Two message kinds sharing one fixed header::
 
     magic    4s   b'TWB1'
     version  B    1
-    kind     B    1 = audio pcm
+    kind     B    1 = audio pcm, 3 = video i420
     reserved H    0
     pts_us   Q    presentation timestamp
-    length   I    PCM byte count
+    length   I    payload byte count
 
-Binary rather than JSON because this carries 50 frames a second; base64 in an envelope
-would cost a third more bytes and a parse per frame, for readability nobody benefits from —
-nothing here is read by a human.
+Audio's payload is raw PCM. Video's is a 12-byte sub-header (``_VIDEO_HEADER`` —
+width/height/strides/fps, mirroring ``google_meet/websocket/protocol.py``'s own video frame)
+followed by the I420 planes, for the avatar's synthetic camera — see ``KIND_VIDEO_I420``.
+
+Binary rather than JSON because this carries up to 50 audio frames a second and one video
+frame per publish tick; base64 in an envelope would cost a third more bytes and a parse per
+frame, for readability nobody benefits from — nothing here is read by a human.
 
 **Page → bridge: two formats, one per kind.**
 
@@ -42,7 +46,10 @@ from __future__ import annotations
 
 import json
 import struct
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from src.domain.media import VideoFrame
 
 MAGIC = b"TWB1"
 VERSION = 1
@@ -55,8 +62,21 @@ KIND_AUDIO_CAPTURE = 2
 A separate kind rather than reusing ``KIND_AUDIO_PCM``, even though the direction already
 disambiguates them: the two are different things that happen to share a header."""
 
+KIND_VIDEO_I420 = 3
+"""Bridge → page: the avatar's face, for the synthetic camera.
+
+Carries a fixed 12-byte sub-header (``_VIDEO_HEADER``) ahead of the I420 planes, the same
+six-field layout ``google_meet/websocket/protocol.py`` uses for its own video frames —
+``width, height, stride_y, stride_uv, fps, reserved``. Strides are always ``width`` and
+``width // 2`` because ``VideoFrame.planes`` is a tightly packed buffer with no padding
+(``src/domain/media.py``); they travel on the wire anyway rather than being recomputed in
+``js/inject.js``, so a future change to the packing only has to change one side."""
+
 _HEADER = struct.Struct("!4sBBHQI")
 HEADER_SIZE = _HEADER.size
+
+_VIDEO_HEADER = struct.Struct("!HHHHHH")
+VIDEO_HEADER_SIZE = _VIDEO_HEADER.size
 
 MAX_EVENT_BYTES = 64 * 1024
 """Ceiling on one page→bridge event.
@@ -131,6 +151,26 @@ not answer is heard the second time — see ``chatSeen`` in ``js/inject.js``."""
 def encode_audio(pcm: bytes, *, pts_us: int) -> bytes:
     """Frame one PCM buffer for the page."""
     return _HEADER.pack(MAGIC, VERSION, KIND_AUDIO_PCM, 0, pts_us, len(pcm)) + pcm
+
+
+def encode_video(frame: VideoFrame) -> bytes:
+    """Frame one I420 ``VideoFrame`` for the page's synthetic camera.
+
+    The sub-header travels ahead of the planes inside the same outer frame ``encode_audio``
+    uses — one wire, one dispatch on the page side (``js/inject.js`` reads the outer ``kind``
+    byte to tell the two apart), rather than a second socket or a second message envelope for
+    what is, underneath, the same "bytes for the page" problem.
+    """
+    video_header = _VIDEO_HEADER.pack(
+        frame.format.width,
+        frame.format.height,
+        frame.format.width,  # stride_y — planes are packed, so stride == width
+        frame.format.width // 2,  # stride_uv
+        frame.format.fps,
+        0,  # reserved
+    )
+    payload = video_header + frame.planes
+    return _HEADER.pack(MAGIC, VERSION, KIND_VIDEO_I420, 0, frame.pts_us, len(payload)) + payload
 
 
 def decode_audio(data: bytes) -> bytes | None:

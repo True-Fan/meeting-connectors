@@ -189,6 +189,17 @@ class TeamsWebSelectors:
         "button[title*='unmute' i]",
         "button:has-text('Unmute')",
     )
+    camera_on_button: tuple[str, ...] = (
+        # **Unverified against a live meeting — best-effort, same status every selector list
+        # in this file started at.** Teams labels this control by what a click *does*, the
+        # same convention ``unmute_button`` relies on, so "Turn camera on" showing means the
+        # camera is off now. Never match "Turn camera off" here: that would turn it back off.
+        "button[data-tid='toggle-video'][aria-label*='turn camera on' i]",
+        "button[aria-label*='turn camera on' i]",
+        "[role='button'][aria-label*='turn camera on' i]",
+        "button[title*='turn camera on' i]",
+        "button:has-text('Turn camera on')",
+    )
     leave_button: tuple[str, ...] = (
         "button[data-tid='hangup-main-btn']",
         "button[data-tid='hangup-button']",
@@ -634,6 +645,43 @@ class TeamsWebJoiner:
                 note="the avatar is in the meeting but muted, so nothing it says will be "
                 "heard; the unmute control did not clear",
             )
+        return False
+
+    async def ensure_camera_on(self, attempts: int = 8) -> bool:
+        """Turn the synthetic camera on, retrying until the control disappears.
+
+        **Public, unlike ``_ensure_unmuted``**, because it is not part of the join sequence
+        proper: ``getUserMedia``'s canvas track only exists once the page bridge has attached,
+        which is after ``join()`` has already returned, so the session calls this itself once
+        the page is confirmed connected (see ``TeamsWebSession.start``).
+
+        Same shape as ``_ensure_unmuted`` for the same reason: a single click is not enough,
+        because Teams may not have rendered the control yet on the first attempt, and success
+        is defined by the control disappearing rather than by the click itself succeeding —
+        "Turn camera on" absent means the camera is on, since Teams names the button after
+        what pressing it would do.
+
+        Never raises and a failure here is not fatal to the session: it means the avatar is
+        heard but not seen, which is exactly what ``video_dropped``/``video_published`` in
+        ``TeamsWebMediaSink.health()`` stays able to distinguish from a working publish.
+        """
+        for attempt in range(attempts):
+            still_off = await self._driver.wait_for_any(
+                self._selectors.camera_on_button, timeout_s=0.5
+            )
+            if still_off is None:
+                if attempt:
+                    logger.info("teams_web.camera_on", attempts=attempt + 1)
+                return True
+            await self._driver.click_first(self._selectors.camera_on_button)
+            await asyncio.sleep(0.5)
+
+        logger.warning(
+            "teams_web.camera_still_off",
+            note="the avatar is in the meeting but its camera is off, so nothing it "
+            "publishes will be seen; the turn-camera-on control did not clear — this "
+            "selector list is unverified against a live meeting",
+        )
         return False
 
     # -- page state --------------------------------------------------------

@@ -1,20 +1,23 @@
 """The ``MediaSink`` for a browser-driven Teams session.
 
-Audio goes to the page's synthetic microphone — the same mechanism the Google Meet and Zoom-web
-connectors publish through, and for the same reason: it needs nothing from the host.
+Audio goes to the page's synthetic microphone — the same mechanism the Google Meet and
+Zoom-web connectors publish through, and for the same reason: it needs nothing from the host.
 
-**Video is accepted and counted, not published.** Publishing the avatar's face needs a canvas
-track and Teams' own camera controls driven as well; the audio path is what makes the avatar a
-participant rather than a picture. Counting the discards keeps it honest — an operator sees
-``video_dropped`` climbing rather than assuming a camera that was never wired.
+**Video goes to the page's synthetic camera, the same way.** ``js/inject.js`` mints a
+canvas-backed track behind a patched ``getUserMedia``, exactly as ``google_meet/js/bridge.js``
+does for Meet; this sink's job is only to frame each ``VideoFrame`` for the wire
+(``page/protocol.py``'s ``encode_video``) and hand it to the same page socket ``publish_audio``
+already uses. Getting the avatar's face into the meeting also needs Teams' own "camera on"
+control clicked — see ``TeamsWebJoiner._ensure_camera_on`` in ``meeting/join.py`` — which is a
+one-time UI action taken during join, not something this sink repeats per frame.
 """
 
 from __future__ import annotations
 
-from src.connectors.teams_web.page.protocol import encode_audio
+from src.connectors.teams_web.page.protocol import encode_audio, encode_video
 from src.connectors.teams_web.page.server import PageAudioServer
 from src.domain.health import ComponentHealth, ComponentState
-from src.domain.media import AudioFrame, VideoFrame
+from src.domain.media import AudioFrame, VideoFormat, VideoFrame
 from src.domain.meeting import MeetingContext, ParticipantRef
 from src.infrastructure.logging import get_logger
 
@@ -24,14 +27,16 @@ COMPONENT_NAME = "teams_web_publish"
 
 
 class TeamsWebMediaSink:
-    """Publishes the avatar's audio through the page's synthetic microphone."""
+    """Publishes the avatar's audio and video through the page's synthetic devices."""
 
-    __slots__ = ("_server", "published", "video_dropped")
+    __slots__ = ("_server", "_video_format", "published", "video_dropped", "video_published")
 
-    def __init__(self, *, server: PageAudioServer) -> None:
+    def __init__(self, *, server: PageAudioServer, video_format: VideoFormat) -> None:
         self._server = server
+        self._video_format = video_format
         self.published = 0
         self.video_dropped = 0
+        self.video_published = 0
 
     async def start(self, meeting: MeetingContext) -> None:
         """The session owns the page's lifecycle; the socket is already bound."""
@@ -63,8 +68,35 @@ class TeamsWebMediaSink:
         await self._server.send(encode_audio(frame.pcm, pts_us=frame.pts_us))
         self.published += 1
 
-    async def publish_video(self, frame: VideoFrame) -> None:  # noqa: ARG002
-        self.video_dropped += 1
+    async def publish_video(self, frame: VideoFrame) -> None:
+        """Publish one I420 frame through the page's synthetic camera.
+
+        Geometry is checked before encoding, the same guard
+        ``google_meet/virtual_camera/adapter.py`` applies: the pipeline is built for one
+        geometry from session start, so a mismatch means the decoder produced something the
+        page's canvas was never sized for, and drawing it anyway would shear the image rather
+        than fail loudly.
+        """
+        if (frame.format.width, frame.format.height) != (
+            self._video_format.width,
+            self._video_format.height,
+        ):
+            self.video_dropped += 1
+            logger.warning(
+                "teams_web.camera_geometry_mismatch",
+                got=str(frame.format),
+                expected=str(self._video_format),
+            )
+            return
+
+        if self.video_published == 0:
+            attached = self._server.attached_pages
+            (logger.info if attached else logger.warning)(
+                "teams_web.first_video_published",
+                attached_pages=attached,
+            )
+        await self._server.send(encode_video(frame))
+        self.video_published += 1
 
     def health(self) -> ComponentHealth:
         """Unhealthy while no page is attached.
@@ -75,8 +107,8 @@ class TeamsWebMediaSink:
         Chromium flag that makes the connection possible at all.
         """
         detail = (
-            f"audio={self.published} video_dropped={self.video_dropped} "
-            f"pages={self._server.attached_pages}"
+            f"audio={self.published} video={self.video_published} "
+            f"video_dropped={self.video_dropped} pages={self._server.attached_pages}"
         )
         if not self._server.connected:
             return ComponentHealth(

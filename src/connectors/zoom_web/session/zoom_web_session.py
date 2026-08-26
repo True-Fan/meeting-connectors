@@ -262,6 +262,12 @@ class ZoomWebSession:
         if not await self._page_server.wait_connected(timeout_s=10.0):
             logger.warning("zoom_web.page_never_attached")
 
+        # After the page attaches, not before: `getUserMedia`'s canvas track only exists
+        # once the injected script has connected, and clicking "Start Video" before that
+        # would turn the camera on over an empty track. Not fatal — a failed click means the
+        # avatar is heard but not seen, which `ZoomWebMediaSink.health()` keeps visible.
+        await self._joiner.ensure_camera_on()
+
         # Before the source, because starting it is what lets observations begin arriving
         # and a queue nobody has opened yet would drop the first of them.
         if self._chat is not None:
@@ -409,6 +415,14 @@ class ZoomWebSession:
             "sampleRateHz": self._config.publish_audio_format.sample_rate_hz,
             "workletSource": playout_worklet(),
             "displayName": self._config.display_name,
+            # -- the synthetic camera -----------------------------------------
+            #
+            # Sizes the canvas the avatar's face is painted onto. Matched to
+            # ``video_format`` rather than a fixed constant so a deployment that changes
+            # the publish geometry does not silently shear the image against a canvas
+            # sized for the old one.
+            "videoWidth": self._config.video_format.width,
+            "videoHeight": self._config.video_format.height,
             # -- browser ingest ---------------------------------------------
             #
             # **Every one of these is folded against its Python-side consumer here rather
@@ -542,7 +556,9 @@ class ZoomWebSessionFactory:
         )
 
         page_server = PageAudioServer()
-        publisher = self._sink_override or ZoomWebMediaSink(server=page_server)
+        publisher = self._sink_override or ZoomWebMediaSink(
+            server=page_server, video_format=config.video_format
+        )
 
         self_names = _self_name_candidates(session, config)
 

@@ -12,8 +12,14 @@ Chromium browser, joining as a participant). Three questions this page answers f
 ## The one-sentence version
 
 **All three connectors send the avatar audio only — never video — and get back audio *and*
-video; only Google Meet actually shows that video in the meeting today. None of them talks
-to LiveKit at all — LiveKit lives one hop further away, inside the avatar agent itself.**
+video, and all three now show that video in the meeting, via a synthetic camera track built
+the same way on every connector. None of them talks to LiveKit at all — LiveKit lives one hop
+further away, inside the avatar agent itself.**
+
+**Zoom's and Teams' camera path is newer than Google Meet's and its "turn the camera on"
+click has not been confirmed against a live meeting** — see the note under §2. If the
+avatar is heard but not seen on one of those two, that is the first thing to check
+(`video_published` vs `video_dropped` in `GET /sessions/{id}` health).
 
 ## The picture
 
@@ -28,9 +34,9 @@ to LiveKit at all — LiveKit lives one hop further away, inside the avatar agen
 │                   │        │                               │  audio │  "brain" of the avatar         │
 │                   │        │                               │        │                               │
 │  avatar's face +  │◀────── │  plays back whatever the       │◀────── │  renders its reply as a talking│
-│  voice, IF the    │ audio/ │  avatar agent sent             │  fMP4  │  -head video + voice, wrapped  │
-│  connector can     │ video  │                               │  audio+│  in a LiveKit room internally │
-│  show video        │        │                               │  video │  (agent.py + avatar_gateway)  │
+│  voice            │ audio/ │  avatar agent sent             │  fMP4  │  -head video + voice, wrapped  │
+│                   │ video  │                               │  audio+│  in a LiveKit room internally │
+│                   │        │                               │  video │  (agent.py + avatar_gateway)  │
 └──────────────────┘        └───────────────────────────────┘        └───────────────────────────────┘
 ```
 
@@ -63,19 +69,23 @@ video-streaming sites use to send video a few seconds at a time). What the conne
 
 | Connector | Avatar's **voice** heard in the meeting? | Avatar's **video** seen in the meeting? |
 |---|---|---|
-| **Google Meet** (`google_meet`) | ✅ Yes | ✅ Yes — the only one of the three that shows it, via a synthetic camera track |
-| **Zoom** (`zoom_web`) | ✅ Yes | ❌ No — video arrives from the avatar agent and is thrown away; nothing appears on camera |
-| **Teams** (`teams_web`) | ✅ Yes | ❌ No — same as Zoom |
+| **Google Meet** (`google_meet`) | ✅ Yes | ✅ Yes — a synthetic camera track (canvas + `captureStream`) behind a patched `getUserMedia`, in production the longest of the three |
+| **Zoom** (`zoom_web`) | ✅ Yes | ✅ Yes — same mechanism, plus a click on Zoom's own "Start Video" control; **the selector for that control is an unverified best guess**, not yet confirmed in a live meeting |
+| **Teams** (`teams_web`) | ✅ Yes | ✅ Yes — same mechanism, plus a click on Teams' own "Turn camera on" control; **same caveat as Zoom** |
 
-**Practical takeaway**: on Zoom and Teams you will **hear** the avatar but not **see** it.
-Only Google Meet shows the avatar's face today.
+**Practical takeaway**: you should now **see** the avatar on all three platforms. If Zoom or
+Teams shows the avatar's tile with no video, check `GET /sessions/{id}` — a `video_dropped`
+count that only ever climbs (never `video_published`) points at a camera-on selector that
+didn't match this Zoom/Teams build's DOM; `video_published` climbing with nothing visible
+points at Zoom's camera needing the same profile-persisted device-selection workaround its
+microphone did (see `zoom_web/js/inject.js`).
 
 ## 3. Does any of this publish into a LiveKit room?
 
 **No — not from this repo, ever.** Every connector publishes straight into the real
 meeting (Zoom, Teams, or Meet) through the browser tab it's joined with — a synthetic
-microphone (all three), plus a synthetic camera (Google Meet only). None of them opens a
-LiveKit connection or knows what LiveKit is.
+microphone and a synthetic camera, on all three now. None of them opens a LiveKit
+connection or knows what LiveKit is.
 
 LiveKit only exists **inside the avatar agent**, a separate service this repo doesn't own
 and never modifies — it's how that service's internal STT → LLM → TTS pipeline is wired

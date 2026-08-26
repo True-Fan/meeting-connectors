@@ -1,6 +1,6 @@
 /*
- * The avatar's microphone inside the Teams web client, the meeting's audio on the way back
- * out, and everything about the meeting that only a browser can see.
+ * The avatar's microphone and camera inside the Teams web client, the meeting's audio on
+ * the way back out, and everything about the meeting that only a browser can see.
  *
  * THE MICROPHONE
  * --------------
@@ -8,6 +8,20 @@
  * loopback WebSocket, an AudioWorklet turns it into a real `MediaStreamTrack`, and a patched
  * `getUserMedia` hands that track to the page instead of a physical device. No OS audio
  * device, nothing to install.
+ *
+ * THE CAMERA
+ * ----------
+ * Same trick, the other kind of track: an off-DOM `<canvas>`, `canvas.captureStream(0)`
+ * for a frame-paced `MediaStreamTrack`, painted via `drawImage(new VideoFrame(...))` from
+ * the I420 planes `page/protocol.py`'s `KIND_VIDEO_I420` frames carry — the exact mechanism
+ * `google_meet/js/bridge.js` uses for its synthetic camera. `getUserMedia` hands this track
+ * out for `wants.video`, and `enumerateDevices` now lists a fake `videoinput` alongside the
+ * fake microphone, for the same reason the microphone needed one: Teams checks the device
+ * list, not just what `getUserMedia` returns.
+ *
+ * Handing a track out is necessary and not sufficient: Teams still needs its own "turn
+ * camera on" control clicked, exactly as it does for the microphone's mute button — see
+ * `_ensureCameraOn` in `meeting/join.py`.
  *
  * **This connector does not need a profile with a device already chosen, and Zoom-web does.**
  * Zoom will not start its capture pipeline until its own device menu has a selection, so a
@@ -58,6 +72,12 @@
     building: null,
     socket: null,
     frames: 0,
+    // -- the avatar's face, on a canvas-backed track -----------------------
+    canvas: null,
+    canvasCtx: null,
+    cameraTrack: null,
+    videoFrames: 0,
+    cameraClones: 0,
     // The socket's own bookkeeping, read by ``TeamsWebSession._probe_page``. Counts rather
     // than a boolean, because "connected once and then flapped nine times" and "connected
     // once and held" are different diagnoses and the second is the healthy one.
@@ -193,9 +213,119 @@
     return state.building;
   }
 
+  // -- the avatar's face, on a canvas-backed track -------------------------
+
+  /*
+   * A canvas-backed track, driven frame for frame — the same technique
+   * ``google_meet/js/bridge.js`` uses, for the same reason.
+   *
+   * ``captureStream(0)`` disables automatic sampling, so the track produces a frame only
+   * when ``requestFrame()`` is called. That gives an exact 1:1 mapping from a Python-paced
+   * frame to a published frame — the Pacer already runs the media clock, and letting the
+   * canvas sample on its own timer would resample that cadence and reintroduce the jitter
+   * the Pacer exists to remove.
+   *
+   * ``drawImage`` takes a WebCodecs ``VideoFrame`` directly, so the I420 planes reach the
+   * compositor with no JavaScript-side colour conversion.
+   */
+  function ensureCanvas() {
+    if (state.canvas) return;
+    const canvas = document.createElement('canvas');
+    canvas.width = CONFIG.videoWidth || 1280;
+    canvas.height = CONFIG.videoHeight || 720;
+    state.canvas = canvas;
+    state.canvasCtx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+
+    // Mid grey rather than black, so a tile that appears before the first avatar frame
+    // reads as a camera warming up instead of a dead feed.
+    state.canvasCtx.fillStyle = '#808080';
+    state.canvasCtx.fillRect(0, 0, canvas.width, canvas.height);
+  }
+
+  function cameraTrack() {
+    ensureCanvas();
+    if (state.cameraTrack && state.cameraTrack.readyState === 'live') {
+      // Clone per request: Teams may stop a track it was handed, and a stopped master
+      // would leave every later request with a dead device.
+      state.cameraClones += 1;
+      return state.cameraTrack.clone();
+    }
+    const stream = state.canvas.captureStream(0);
+    state.cameraTrack = stream.getVideoTracks()[0];
+    state.cameraClones += 1;
+    return state.cameraTrack.clone();
+  }
+
+  function drawVideoFrame(header, planes) {
+    ensureCanvas();
+    const ySize = header.strideY * header.height;
+    const uvSize = header.strideUV * (header.height / 2);
+
+    let frame;
+    try {
+      frame = new VideoFrame(planes, {
+        format: 'I420',
+        codedWidth: header.width,
+        codedHeight: header.height,
+        timestamp: header.ptsUs,
+        // Explicit layout rather than an inferred one. An inferred stride that is wrong
+        // produces a sheared image, which is a slow fault to identify from the far side
+        // of a headless browser.
+        layout: [
+          { offset: 0, stride: header.strideY },
+          { offset: ySize, stride: header.strideUV },
+          { offset: ySize + uvSize, stride: header.strideUV },
+        ],
+      });
+    } catch (err) {
+      report('videoFrameFailed', { error: String((err && err.message) || err) });
+      return;
+    }
+
+    try {
+      state.canvasCtx.drawImage(frame, 0, 0, state.canvas.width, state.canvas.height);
+    } finally {
+      // VideoFrames hold non-GC'd media memory. Missing this leaks until the renderer
+      // is killed.
+      frame.close();
+    }
+
+    const track = state.cameraTrack;
+    if (track && typeof track.requestFrame === 'function') {
+      track.requestFrame();
+    }
+    state.videoFrames += 1;
+  }
+
   // -- transport ------------------------------------------------------------
 
   const HEADER_BYTES = 20;
+  const VIDEO_HEADER_BYTES = 12;
+  // Offsets into the fixed 20-byte header: magic(4) version(1) kind(1) reserved(2)
+  // pts_us(8) length(4) — see `page/protocol.py`.
+  const KIND_OFFSET = 5;
+  const PTS_OFFSET = 8;
+  const KIND_AUDIO_PCM = 1;
+  const KIND_VIDEO_I420 = 3;
+
+  /*
+   * One video frame: the 12-byte sub-header (`page/protocol.py`'s `_VIDEO_HEADER` —
+   * width, height, stride_y, stride_uv, fps, reserved), then the I420 planes.
+   */
+  function handleVideoMessage(view, buffer) {
+    if (buffer.byteLength < HEADER_BYTES + VIDEO_HEADER_BYTES) return;
+    const ptsUs = Number(view.getBigUint64(PTS_OFFSET, false));
+    const sub = HEADER_BYTES;
+    const header = {
+      width: view.getUint16(sub + 0, false),
+      height: view.getUint16(sub + 2, false),
+      strideY: view.getUint16(sub + 4, false),
+      strideUV: view.getUint16(sub + 6, false),
+      ptsUs: ptsUs,
+    };
+    const planes = new Uint8Array(buffer, sub + VIDEO_HEADER_BYTES);
+    drawVideoFrame(header, planes);
+  }
 
   /*
    * **The socket reconnects, and a live run is why this is not optional.**
@@ -275,6 +405,20 @@
     socket.onmessage = async (event) => {
       const buffer = event.data;
       if (!(buffer instanceof ArrayBuffer) || buffer.byteLength <= HEADER_BYTES) return;
+      const view = new DataView(buffer);
+      const kind = view.getUint8(KIND_OFFSET);
+
+      if (kind === KIND_VIDEO_I420) {
+        handleVideoMessage(view, buffer);
+        return;
+      }
+
+      // Anything that is not a recognised video frame is treated as PCM, which is what
+      // every message on this socket was before video existed — an unrecognised kind
+      // degrades to the old behaviour rather than being silently dropped.
+      if (kind !== KIND_AUDIO_PCM) {
+        report('unknownMessageKind', { kind: kind });
+      }
       await ensureBuilt();
       if (!state.node) return;
       // int16 PCM follows the fixed header; the worklet owns the ring buffer. Copy first,
@@ -664,16 +808,22 @@
     const original = media.getUserMedia.bind(media);
     media.getUserMedia = async (constraints) => {
       const wants = constraints || {};
+      const stream = new MediaStream();
+      let handled = false;
       if (wants.audio) {
         await ensureBuilt();
         if (state.micTrack) {
-          const stream = new MediaStream();
           // A fresh clone per call: Teams may stop the track it is handed, and a stopped
           // original would silence every later request.
           stream.addTrack(state.micTrack.clone());
-          return stream;
+          handled = true;
         }
       }
+      if (wants.video) {
+        stream.addTrack(cameraTrack());
+        handled = true;
+      }
+      if (handled) return stream;
       return original(constraints);
     };
   }
@@ -696,14 +846,22 @@
    *
    * So: one fake `audioinput`, the real devices left in place, and no fake output at all.
    *
-   * No fake `videoinput` either. The avatar publishes no video, and advertising a camera would
-   * have Teams offer one that produces a grey rectangle — the same objection
-   * `--use-fake-device-for-media-stream` gets in the launcher.
+   * **A fake `videoinput` too, now that there is a track behind it.** The same objection
+   * that used to rule this out — advertising a camera Teams would then offer and that
+   * produces a grey rectangle — no longer applies: `cameraTrack()` is a real, live
+   * `MediaStreamTrack` backed by the canvas, not a device with nothing behind it.
    */
   const FAKE_MIC = {
     deviceId: 'mc-avatar-mic',
     kind: 'audioinput',
     label: 'Avatar Microphone',
+    groupId: 'mc-avatar',
+  };
+
+  const FAKE_CAMERA = {
+    deviceId: 'mc-avatar-camera',
+    kind: 'videoinput',
+    label: 'Avatar Camera',
     groupId: 'mc-avatar',
   };
 
@@ -716,14 +874,20 @@
       } catch (err) {
         /* a host with no devices at all still gets ours */
       }
-      const fake = {
+      const fakeMic = {
         ...FAKE_MIC,
         toJSON() {
           return FAKE_MIC;
         },
       };
+      const fakeCamera = {
+        ...FAKE_CAMERA,
+        toJSON() {
+          return FAKE_CAMERA;
+        },
+      };
       // Ours first, so a client that picks the head of the list picks the one that works.
-      return [fake, ...devices];
+      return [fakeMic, fakeCamera, ...devices];
     };
   }
 
