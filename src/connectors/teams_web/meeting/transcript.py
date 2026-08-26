@@ -125,11 +125,6 @@ class TranscriptSnapshot:
                 seen.append(line.label)
         return tuple(seen)
 
-    def by_speaker(self, name: str) -> tuple[TranscriptLine, ...]:
-        """Everything one person said. Case-insensitive: the caller is quoting a human."""
-        folded = " ".join(name.split()).casefold()
-        return tuple(line for line in self.lines if line.label.casefold() == folded)
-
     @property
     def chat_lines(self) -> int:
         """How many lines were typed rather than spoken.

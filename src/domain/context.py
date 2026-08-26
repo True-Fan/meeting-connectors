@@ -25,6 +25,3 @@ class FrameContext:
     session_id: SessionId
     correlation_id: CorrelationId
 
-    def as_log_fields(self) -> dict[str, str]:
-        """Return the context as structured-log fields."""
-        return {"session_id": self.session_id, "correlation_id": self.correlation_id}

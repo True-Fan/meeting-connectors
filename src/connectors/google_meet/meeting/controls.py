@@ -88,16 +88,6 @@ class MeetControls:
         )
         return False
 
-    async def mute(self) -> bool:
-        """Stop publishing audio. Idempotent."""
-        if await self.is_muted() is True:
-            return True
-        clicked = await self._driver.click_first(self._selectors.mute_toggle)
-        if clicked is None:
-            return False
-        logger.info("meet_controls.muted", selector=clicked)
-        return True
-
     # -- camera ------------------------------------------------------------
 
     async def is_camera_on(self) -> bool | None:
@@ -148,16 +138,6 @@ class MeetControls:
             "check them with tools/meet_inspect.py",
         )
         return False
-
-    async def camera_off(self) -> bool:
-        """Stop publishing video. Idempotent."""
-        if await self.is_camera_on() is False:
-            return True
-        clicked = await self._driver.click_first(self._selectors.camera_off_toggle)
-        if clicked is None:
-            return False
-        logger.info("meet_controls.camera_off", selector=clicked)
-        return True
 
     # -- presence ----------------------------------------------------------
 

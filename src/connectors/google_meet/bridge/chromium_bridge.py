@@ -620,12 +620,6 @@ class ChromiumBridge:
         if self._roster.count:
             listener(self._roster)
 
-    def add_state_listener(self, listener: StateListener) -> None:
-        """Register a callback for meeting-state changes."""
-        self._state_listeners.append(listener)
-        if self._meet_state is not None:
-            listener(self._meet_state)
-
     # -- join --------------------------------------------------------------
 
     async def _launch_and_join(self, meeting: MeetingContext) -> None:

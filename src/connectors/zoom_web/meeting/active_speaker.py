@@ -384,19 +384,6 @@ class ZoomSpeakerTracker:
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("zoom_speaker.participants_failed", error=str(exc))
 
-    def observe_name(self, user_id: int | None, name: str | None) -> None:
-        """Record that a user id belongs to a name. Never raises.
-
-        Fed from every stream that carries both — participant events, transcript lines,
-        chat — because a speaker event that arrives with only an id can be named from any
-        of them, and which one saw the person first is not worth caring about.
-        """
-        cleaned = _clean(name or "")
-        if user_id is None or not cleaned:
-            return
-        self._names_by_id[user_id] = cleaned
-        self._backfill_names()
-
     def observe_self_name(self, name: str | None) -> None:
         """Add a name that means "this is us". Never raises; called from the read loop."""
         cleaned = _clean(str(name or ""))

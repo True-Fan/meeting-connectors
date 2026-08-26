@@ -131,59 +131,6 @@ class TeamsMeetingObserver:
     # surface, and ``on_chat`` in particular is called by ``_on_chat`` so that the ordering
     # rule it encodes is written down exactly once.
 
-    def on_participant(self, event: ParticipantEvent) -> None:
-        """Somebody joined or left.
-
-        The ledger first, because everything after it reads the roster the ledger keeps —
-        publishing the candidate list before folding in the event that changed it would hand
-        every consumer a view one event out of date, which in a two-person meeting is the
-        difference between "exactly one other person" and "nobody".
-        """
-        if self._attendance is not None:
-            _safe("attendance.observe", self._attendance.observe, event)
-        if self._speakers is not None:
-            _safe(
-                "speakers.observe_name",
-                self._speakers.observe_name,
-                event.user_id,
-                event.display_name,
-            )
-        self._publish_roster()
-
-    def on_speaker(self, event: SpeakerEvent) -> None:
-        """The floor changed hands.
-
-        Two consumers with genuinely different jobs, and both get it. The tracker records *who
-        is talking* for the whole meeting, which is what the agent is briefed with and what the
-        API serves. The interrupt source asks a much narrower question — is this somebody
-        talking over the avatar right now — and answers it by stopping the avatar.
-
-        The tracker first, so that if the interruption reaches the router in the same tick,
-        ``current_speaker`` already names the person who caused it.
-        """
-        if self._speakers is not None:
-            _safe("speakers.observe", self._speakers.observe, event)
-            _safe(
-                "speakers.observe_name",
-                self._speakers.observe_name,
-                event.user_id,
-                event.display_name,
-            )
-        if self._interrupts is not None:
-            _safe("interrupts.offer_voice", self._interrupts.offer_voice, event)
-
-    def on_transcript(self, line: TranscriptLine) -> None:
-        """Teams captioned a line of speech."""
-        if self._transcript is not None:
-            _safe("transcript.offer", self._transcript.offer, line)
-        if self._speakers is not None:
-            _safe(
-                "speakers.observe_name",
-                self._speakers.observe_name,
-                line.user_id,
-                line.display_name,
-            )
-
     def on_chat(self, message: ChatMessage) -> None:
         """Somebody typed in the meeting chat.
 
@@ -406,7 +353,7 @@ class TeamsMeetingObserver:
     def _on_speaker(self, event: dict[str, object]) -> None:
         """The page believes somebody has the floor.
 
-        Routed to exactly the two consumers ``on_speaker`` routes to, in the same order and for
+        Routed to exactly two consumers — the tracker, then the interrupt source — and for
         the same reasons — the tracker first, so that an interruption reaching the router in the
         same tick finds ``current_speaker`` already naming the person who caused it.
 

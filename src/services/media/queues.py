@@ -79,9 +79,6 @@ class BoundedFrameQueue[T]:
     def qsize(self) -> int:
         return len(self._deque)
 
-    def is_full(self) -> bool:
-        return len(self._deque) >= self._maxsize
-
     def put(self, item: T, *, ctx: FrameContext | None = None, reason: str = "overflow") -> bool:
         """Offer an item. Never blocks, never raises when full.
 

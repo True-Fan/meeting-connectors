@@ -371,21 +371,6 @@ class TeamsSpeakerTracker:
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("teams_speaker.participants_failed", error=str(exc))
 
-    def observe_name(self, user_id: int | None, name: str | None) -> None:
-        """Record that a participant id belongs to a name. Never raises.
-
-        **Dead on this connector today, and kept for one specific reason.** The page reports
-        names and no ids, so nothing calls this with a non-``None`` id — the observer wires it
-        up anyway. If a Teams build starts exposing a participant id in its roster markup,
-        adding it to the page's payload is then the whole change, rather than a change here
-        too.
-        """
-        cleaned = _clean(name or "")
-        if user_id is None or not cleaned:
-            return
-        self._names_by_id[user_id] = cleaned
-        self._backfill_names()
-
     def observe_self_name(self, name: str | None) -> None:
         """Add a name that means "this is us". Never raises; called from the read loop."""
         cleaned = _clean(str(name or ""))
@@ -583,8 +568,8 @@ def _identity(*, user_id: int | None, name: str | None) -> str:
     """The tracker's key for a speaker.
 
     Folded name first, and on this connector the name is all there is. The id branch is the
-    fallback the type allows for and the page never populates — see
-    ``TeamsSpeakerTracker.observe_name``.
+    fallback the observation types allow for and the page never populates: a DOM has no
+    participant id, so ``SpeakerEvent.user_id`` is always ``None`` here.
     """
     if name:
         return f"name:{name.casefold()}"

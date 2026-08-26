@@ -125,15 +125,6 @@ class SessionContext:
         """The identity every frame from this session carries."""
         return FrameContext(session_id=self.session_id, correlation_id=self.correlation_id)
 
-    def log_fields(self) -> dict[str, str]:
-        """Structured-log fields identifying this session."""
-        return {
-            "session_id": self.session_id,
-            "correlation_id": self.correlation_id,
-            "meeting_number": self.meeting.meeting_number,
-            "session_state": self.state,
-        }
-
     def record_error(self, component: str, message: str, *, fatal: bool = False) -> SessionError:
         """Append a failure to this session's history and return it."""
         error = SessionError(

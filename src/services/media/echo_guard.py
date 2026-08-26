@@ -27,7 +27,6 @@ speech decisions — it only knows what it published and when.
 from __future__ import annotations
 
 from src.domain.media import AudioFrame
-from src.domain.meeting import ParticipantRef
 from src.infrastructure.logging import get_logger
 from src.infrastructure.metrics import MetricName, MetricsCollector
 
@@ -94,16 +93,6 @@ class EchoGuard:
     @property
     def is_strict(self) -> bool:
         return self._strict
-
-    def set_own_participant(self, participant: ParticipantRef | None) -> None:
-        """Record the identity the publisher joined as.
-
-        Called once the sink reports it. Until then only the gate protects us.
-        """
-        if participant is None:
-            return
-        self._own_user_id = participant.user_id
-        logger.info("echo_guard.own_participant_known", user_id=participant.user_id)
 
     def note_publishing(self, pts_us: int) -> None:
         """Record that avatar audio was published at ``pts_us``.

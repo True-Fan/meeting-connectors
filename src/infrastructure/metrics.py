@@ -53,18 +53,11 @@ class MetricName(StrEnum):
     DECODE_US = "decode_us"
     PACE_WAIT_US = "pace_wait_us"
     PUBLISH_US = "publish_us"
-    SIDECAR_IPC_US = "sidecar_ipc_us"
     WEBSOCKET_SEND_US = "websocket_send_us"
-    END_TO_END_US = "end_to_end_us"
 
     # --- synchronisation ---
     AUDIO_DELAY_US = "audio_delay_us"
     VIDEO_DELAY_US = "video_delay_us"
-    AV_SKEW_US = "av_skew_us"
-    """Direct observable for whether the shared media clock is working. Zoom's
-    send-audio and send-video are separate paths with documented desync risk
-    (doc 001 §7.1); this is how we know rather than assume."""
-
     # --- counters ---
     FRAMES_RECEIVED_TOTAL = "frames_received_total"
     FRAMES_PUBLISHED_TOTAL = "frames_published_total"
@@ -272,9 +265,6 @@ class MetricsCollector:
         for a long-running process; aggregate series are unaffected.
         """
         self._sessions.pop(session_id, None)
-
-    def tracked_sessions(self) -> tuple[SessionId, ...]:
-        return tuple(self._sessions)
 
     # -- reading -----------------------------------------------------------
 

@@ -163,15 +163,6 @@ class SessionSupervisor:
         if self._metrics is not None:
             self._metrics.drop_session(session_id)
 
-    async def shutdown_all(self) -> None:
-        """Drain every session.
-
-        Called on application shutdown so a redeploy never leaves a bot sitting in a
-        meeting talking to nobody.
-        """
-        for session_id in list(self._tasks):
-            await self.shutdown(session_id)
-
     def get(self, session_id: SessionId) -> ConnectorSession | None:
         return self._sessions.get(session_id)
 
