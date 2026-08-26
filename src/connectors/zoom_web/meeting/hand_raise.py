@@ -10,7 +10,7 @@ the router and a second copy of that answer, for a distinction nothing downstrea
 **Why the voice half does not use audio energy, unlike the Google Meet connector.** That
 connector detects speech by measuring the inbound mix — and it can, because its echo gate
 is *open*: its capture tap is inbound-only, so the avatar's own voice structurally cannot
-enter it. Here it can and does. RTMS delivers the meeting's mix including the avatar, so
+enter it. Here it can and does. The page tap carries the meeting's mix, so
 ``EchoGuard`` runs its speaking gate in strict mode, and while the avatar is talking every
 inbound frame is withheld before anything could measure it. An energy detector would
 therefore be deaf during the *only* window barge-in exists for. Observed as exactly that:
@@ -36,7 +36,7 @@ import asyncio
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
-from src.connectors.zoom.rtms.observations import SpeakerEvent
+from src.connectors.zoom_web.observations import SpeakerEvent
 from src.domain.health import ComponentHealth
 from src.domain.meeting import HandRaise
 from src.infrastructure.logging import get_logger
@@ -270,7 +270,7 @@ class ZoomInterruptSource:
     def _avatar_is_talking(self) -> bool:
         """Whether the avatar is mid-sentence right now.
 
-        Total by construction: this runs on the RTMS pump, so a predicate that raises must
+        Total by construction: this runs on the page read loop, so a predicate that raises must
         cost the interruption rather than the connection. Failing *open* — treating an
         error as "yes, it is talking" — because a missed barge-in is the failure this
         feature exists to fix, and a spurious one is merely polite.

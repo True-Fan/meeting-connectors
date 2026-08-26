@@ -997,8 +997,9 @@ def _self_name_candidates(
     **The session's name comes first**, because that is the string ``TeamsWebJoiner`` types into
     Teams' pre-join form — so it is the name every participant sees and the name the page reads
     back off the roster. It is *not* ``TeamsWebSettings.display_name``: ``MeetingService`` fills
-    it from the ``POST /sessions`` request, falling back to ``MC_ZOOM__DISPLAY_NAME``. The two
-    agree only while the defaults are untouched.
+    it from the ``POST /sessions`` request, falling back to the service-wide default
+    (``MC_ZOOM_WEB__DISPLAY_NAME``, since ``zoom_web`` is the default platform). The two agree
+    only while the defaults are untouched.
 
     The consequence of getting it wrong is silent and expensive, because five separate things key
     on it. The avatar would count itself as an attendee (every headcount wrong by one), report

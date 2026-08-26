@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "meeting-connectors"
 version = "0.1.0"
-description = "Bridge between Zoom meetings and a Streaming Avatar Agent"
+description = "Bridge between browser-joined meetings and a Streaming Avatar Agent"
 authors = ["Platform Engineering"]
 readme = "README.md"
 packages = [{ include = "src" }]
@@ -17,33 +17,27 @@ dependency-injector = "^4.42.0"
 structlog = "^24.4.0"
 orjson = "^3.10.0"
 
-# `src/connectors/zoom/api/rtms_trigger.py` calls the Zoom API directly with this — the RTMS
-# start/OAuth calls, reachable from both the SDK-based `zoom` connector and `zoom_web`'s
-# `rtms_auto_start`. A hard dependency, not a dev one: it used to live only in the `dev`
-# group below (pulled in by the test suite's own `httpx.AsyncClient` usage against FastAPI),
-# which meant a production `pip install -e .` with no dev group came up short at import time
-# rather than at test time — the exact gap that made `pip install httpx` a manual step here.
-httpx = "^0.27.0"
-
-# A real, signed-in browser via Playwright is how three of the four web-facing connectors
-# publish and observe a meeting: `google_meet` (Google's Media API is receive-only, so there
-# is no server-side way in), and `zoom_web`/`teams_web`, which both drive the same
-# `PlaywrightDriver`/`build_launch_plan` (`connectors/google_meet/automation/driver.py`,
-# `connectors/google_meet/browser/launcher.py` — imported across connectors rather than
-# duplicated, see the docstring on that coupling in each `session.py`).
+# A real browser via Playwright is how **every** connector publishes and observes a meeting:
+# `google_meet` (Google's Media API is receive-only, so there is no server-side way in), and
+# `zoom_web`/`teams_web`, which both drive the same `PlaywrightDriver`/`build_launch_plan`
+# (`connectors/google_meet/automation/driver.py`, `connectors/google_meet/browser/launcher.py`
+# — imported across connectors rather than duplicated, see the docstring on that coupling in
+# each `session.py`).
 #
-# **A hard dependency, not the `google-meet`-only extra it used to be.** That framing predated
-# `zoom_web`/`teams_web` existing; today only the SDK-based `zoom`/`teams` connectors (Zoom
-# Meeting SDK, Teams Graph app-hosted media — a different code path entirely) can run without
-# it. Since every browser connector needs it and installing it selectively bought nothing but
-# a `ModuleNotFoundError` at session start for whoever forgot the extra, it is installed by
-# default. `automation/driver.py` still imports it lazily and raises
-# `PlaywrightUnavailableError` naming the install command, so a missing *browser binary*
+# **A hard dependency, and now unconditionally so.** It was once a `google-meet` extra, then a
+# hard dependency that the two SDK-based connectors (Zoom Meeting SDK, Teams Graph app-hosted
+# media) could technically run without. Both of those have been removed, so there is no code
+# path left that does not need a browser. `automation/driver.py` still imports it lazily and
+# raises `PlaywrightUnavailableError` naming the install command, so a missing *browser binary*
 # (`playwright install chromium` — a separate step this dependency does not cover) still fails
 # with a clear, actionable error rather than a bare stack trace.
 playwright = "^1.49.0"
 
 [tool.poetry.group.dev.dependencies]
+# For the test suite's `httpx.AsyncClient` against the FastAPI app. Nothing in `src/` calls
+# out over HTTP any more — the one module that did was the Zoom RTMS start trigger, which
+# went with the Meeting-SDK connector — so this is a dev dependency again.
+httpx = "^0.27.0"
 pytest = "^8.3.0"
 pytest-asyncio = "^0.24.0"
 pytest-cov = "^5.0.0"
@@ -105,5 +99,5 @@ asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
 markers = [
-    "integration: requires external services (Zoom, avatar agent, ffmpeg)",
+    "integration: requires external services (a browser, avatar agent, ffmpeg)",
 ]

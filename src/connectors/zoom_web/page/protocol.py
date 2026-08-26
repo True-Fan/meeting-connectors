@@ -22,31 +22,30 @@ frame, for readability nobody benefits from — nothing here is read by a human.
 **Page → bridge: two formats, one per kind.**
 
 *Binary* is the meeting's audio, framed with the same header as the outbound direction and
-a different ``kind``. It exists for ``ingest_mode="browser"``, where the page's own audio
-tap replaces RTMS as the ingest leg — see ``js/inject.js`` and ``ingest/page_audio_source.py``.
-It carries 50 frames a second, which is the same argument the outbound direction makes for
-not being JSON.
+a different ``kind``. It is the ingest leg — see ``js/inject.js`` and
+``ingest/page_audio_source.py``. It carries 50 frames a second, which is the same argument
+the outbound direction makes for not being JSON.
 
-*Text* is everything the page **observes**: a raised hand, and — again only in browser
-ingest mode — the roster, the active speaker, the chat and the captions. A few messages a
-second at most, so the per-message cost is irrelevant and being readable in a log is worth
-a great deal: every one of these depends on selectors matching a UI Zoom is free to change,
+*Text* is everything the page **observes**: a raised hand, the roster, the active speaker,
+the chat and the captions. A few messages a second at most, so the per-message cost is
+irrelevant and being readable in a log is worth a great deal: every one of these depends on
+selectors matching a UI Zoom is free to change,
 and the first question when one stops working is always *what did the page actually see*.
 
 The two are told apart by WebSocket frame type rather than by a discriminator — binary is
 audio, text is an event — which is a property the transport already guarantees, so nothing
 has to be parsed to route it.
 
-**Why this grew.** It was, deliberately, the smallest page codec in the repository: RTMS
-supplied everything except a raised hand, so the page was asked for exactly one signal.
-Browser ingest removes RTMS from the picture entirely — the point of it is that the meeting
-need not be hosted on an RTMS-enabled account — and every signal RTMS used to carry has to
-come from somewhere. The browser is the only thing left that can see them. So this codec
-converges on the Google Meet one, because in that mode the two connectors have the same
-problem.
+**Why this grew.** It was, deliberately, the smallest page codec in the repository: this
+connector used to read the meeting from Zoom's RTMS stream, which supplied everything except
+a raised hand, so the page was asked for exactly one signal. RTMS required the meeting to be
+hosted on an RTMS-enabled account, which a deployment cannot arrange for meetings other
+people book, so it was removed — and every signal it carried now has to come from the only
+thing left that can see them. So this codec converged on the Google Meet one, because the two
+connectors have the same problem.
 
-Both modes share this file. An RTMS deployment simply never sees the events below
-``EVENT_HAND_RAISE``: the page does not emit them unless its config switches them on.
+Each event below is still gated by the page's config: an observer whose Python-side consumer
+is switched off is never asked to scan for it.
 """
 
 from __future__ import annotations
@@ -114,22 +113,22 @@ Carried because this is the one feature in the connector whose failure mode is *
 a selector that stopped matching produces exactly the same observable behaviour as a meeting
 where nobody raised a hand. These messages are what tell the two apart."""
 
-# -- browser-ingest events -------------------------------------------------
+# -- what the page observes ------------------------------------------------
 #
-# Emitted only when the page is configured for browser ingest. Each replaces an RTMS
-# stream, and each is deliberately shaped like the RTMS observation it stands in for
-# (``connectors/zoom/rtms/observations.py``) so that the ledgers consuming them did not
-# have to change: ``ZoomAttendanceLedger``, ``ZoomSpeakerTracker``, ``ZoomTranscript`` and
-# ``ZoomChatSource`` were already written against those types rather than against RTMS.
-# That is what makes this a new *source* rather than a second implementation of the
-# connector.
+# Each of these replaced an RTMS stream when that leg was removed, and each is deliberately
+# shaped like the observation it stands in for (``observations.py``) so that the ledgers
+# consuming them did not have to change: ``ZoomAttendanceLedger``, ``ZoomSpeakerTracker``,
+# ``ZoomTranscript`` and ``ZoomChatSource`` were already written against those types rather
+# than against a wire format. That is what made this a new *source* rather than a second
+# implementation of the connector.
 
 EVENT_ROSTER = "roster"
 """Who the page can currently see in the meeting. ``{type, names: [...]}``.
 
-**A level, not an edge, and that is the opposite of every other event here.** RTMS reports
-joins and leaves; a DOM reports a list. Deriving the edges in the page would mean the page
-holding the authoritative roster, and a page reload would then re-announce the whole meeting
+**A level, not an edge, and that is the opposite of every other event here.** An event
+stream reports joins and leaves; a DOM reports a list. Deriving the edges in the page would
+mean the page holding the authoritative roster, and a page reload would then re-announce the
+whole meeting
 as having just joined. So the page reports what it sees and ``ZoomMeetingObserver`` diffs it
 against the ledger, which survives the page and is where "who was here" already lives."""
 
@@ -146,10 +145,9 @@ EVENT_CAPTION = "caption"
 """One line of Zoom's live transcription, as rendered. ``{type, name, text, final}``.
 
 **Requires captions to be switched on in the meeting**, which is a visible action and hence
-a setting (``MC_ZOOM_WEB__CAPTIONS_AUTO_ENABLE``). Where RTMS transcription is an invisible
-subscription, this is the avatar pressing a button everybody can see — the same trade the
-Google Meet connector makes, and the reason it is off by default here for anyone who still
-has RTMS.
+a setting (``MC_ZOOM_WEB__CAPTIONS_AUTO_ENABLE``). This is the avatar pressing a button
+everybody in the meeting can see — the same trade the Google Meet connector makes, which is
+why it is a setting rather than simply always on.
 
 ``final`` distinguishes a caption still being revised from one Zoom has settled on. Interim
 lines are what make a caption panel feel live and are worthless as a record, so only final
@@ -223,7 +221,7 @@ def decode_event(data: str | bytes) -> dict[str, Any] | None:
     Never raises, and that is the contract rather than a convenience: this is called from
     the page server's read loop with bytes a *browser* produced, against a script running
     inside a page this service does not control. A malformed frame is a fact about the page,
-    not an error condition here — so it is dropped and counted, exactly as a malformed RTMS
+    not an error condition here — so it is dropped and counted, exactly as a malformed page
     audio frame is.
 
     ``None`` covers everything unusable in one answer: oversized, not UTF-8, not JSON, not an

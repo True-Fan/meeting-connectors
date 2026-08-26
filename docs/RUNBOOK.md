@@ -94,12 +94,11 @@ pip install -e .
 playwright install chromium
 ```
 
-`pip install -e .` reads `pyproject.toml` and pulls in everything every connector needs —
-`playwright` and `httpx` included, both hard dependencies as of this repo's video-parity
-change (previously `playwright` was gated behind a now-stale `google-meet`-only extra, and
-`httpx` sat in the dev group despite `connectors/zoom/api/rtms_trigger.py` importing it at
-runtime; a plain install used to come up short on both and need `pip install playwright` /
-`pip install httpx` by hand — that gap is closed).
+`pip install -e .` reads `pyproject.toml` and pulls in everything every connector needs,
+`playwright` included — every connector drives a browser, so it is an unconditional hard
+dependency (it was once gated behind a `google-meet`-only extra, and a plain install came up
+short and needed `pip install playwright` by hand; that gap is closed). `httpx` is a *dev*
+dependency: nothing in `src/` makes outbound HTTP calls any more.
 
 `playwright install chromium` is separate on purpose and cannot be folded into the line
 above: the `playwright` *package* is Python glue, and the browser binary it drives is a
@@ -244,9 +243,9 @@ agent→meet 696KiB in 371 frames, 1.5s audible / 8.5s silent · fMP4 out 113KiB
   the most common cause differs per platform (missing mic selection for Zoom, blocked CSP for
   Teams).
 - **Session created but stuck in `JOINING`** — check `GET /sessions/{id}` for `components`
-  and `errors`; for Zoom running in `rtms` ingest mode specifically, this can mean RTMS hasn't
-  attached yet (webhook not received, or not triggered on the Zoom side — see
-  [connectors/zoom.md](connectors/zoom.md#optional-rtms-ingest-mode)).
+  and `errors`. A leg reporting `UNKNOWN` here usually means the browser is still working
+  through a join form or sitting in a waiting room; a leg that genuinely failed reports
+  `UNHEALTHY` with a reason.
 
 ## The avatar agent (external)
 

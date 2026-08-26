@@ -9,7 +9,7 @@ through.
 Contrast the three, because the asymmetry is the architecture rather than an
 inconsistency:
 
-* ``RtmsAudioSource`` is a large object: it owns its own WebSocket, handshake, keep-alive
+* The removed RTMS source was a large object: it owned its own WebSocket, handshake, keep-alive
   and reconnect loop, because Zoom's ingest genuinely is an independent integration that can
   fail and heal on its own.
 * ``TeamsAudioSource`` is thin, because one ``LocalMediaSession`` carries both directions.

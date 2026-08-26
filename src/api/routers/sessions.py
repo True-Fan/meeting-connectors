@@ -40,14 +40,14 @@ async def create_session(
 ) -> SessionResponse:
     """Start a session.
 
-    Returns 202: the avatar joins and begins publishing idle media immediately, while
-    audio ingest may still be waiting on Zoom's ``rtms_started`` webhook.
+    Returns 202: the avatar joins and begins publishing idle media immediately. Every
+    connector opens its ingest leg inside that join, so a session that reports running is
+    both publishing and listening.
     """
     command = CreateSessionCommand(
         meeting_number=request.meeting_number,
         passcode=request.passcode,
         display_name=request.display_name,
-        meeting_uuid=request.meeting_uuid,
         platform=request.platform,
         meeting_url=request.meeting_url,
         # Carry the request's correlation id into the session so one HTTP call can be

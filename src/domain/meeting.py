@@ -1,11 +1,10 @@
 """Meeting and participant models.
 
 Deliberately platform-shaped-but-not-platform-typed: ``meeting_number`` and
-``passcode`` are what a join needs on every platform we support, and no RTMS, Graph,
-or SDK type appears here. ``platform_data`` holds the connector-private payload (Zoom:
-RTMS stream id and server urls; Teams: the resolved Graph join descriptor) as opaque
-data — only the owning connector may interpret it, and it validates it into a typed
-model at its own boundary.
+``passcode`` are what a join needs on every platform we support, and no DOM, selector
+or browser type appears here. ``platform_data`` holds the connector-private payload
+(currently a join URL, where the platform offers one) as opaque data — only the owning
+connector may interpret it, and it validates it into a typed model at its own boundary.
 """
 
 from __future__ import annotations
@@ -18,10 +17,15 @@ from typing import Any
 class MeetingPlatform(StrEnum):
     """The meeting platform a session runs against.
 
-    Added when Teams arrived: with one connector the platform was a constant folded
-    into the code (doc 003 §0.1), and with two it is data. It is a *domain* enum
+    Added when the second connector arrived: with one, the platform was a constant folded
+    into the code (doc 003 §0.1); with more than one it is data. It is a *domain* enum
     rather than a connector concept precisely so that ``api/`` and ``services/`` can
     route on it without importing a connector.
+
+    **Every member is browser-based**, which is not a coincidence but the conclusion two
+    removed connectors led to: on all three platforms, the officially supported way to put
+    media into somebody else's meeting either does not exist or requires something of that
+    meeting's host that a deployment cannot obtain.
 
     A member carries **identity only** — no urls, no ports, no SDK hints — which is what
     keeps "route on the enum" cheap and "reach for a connector" expensive.
@@ -29,33 +33,31 @@ class MeetingPlatform(StrEnum):
     the whole of what a new connector needs from the domain.
     """
 
-    ZOOM = "zoom"
-    TEAMS = "teams"
     GOOGLE_MEET = "google_meet"
+    """Google Meet, joined with a browser. Google ships no way to publish media into a
+    conference, so a browser is the only way in — see
+    ``connectors/google_meet/capabilities.py`` for the evidence."""
 
     ZOOM_WEB = "zoom_web"
-    """The same Zoom meetings as ``ZOOM``, but joined with a browser.
+    """Zoom, joined with a browser.
 
-    A separate member rather than a flag, because the two are different connectors
-    with different failure modes and different host requirements. ``ZOOM`` publishes
-    through a native sidecar built against the Meeting SDK; this one drives Chromium
-    and publishes through a virtual microphone. Both ingest over RTMS. Choosing one
-    is choosing which machinery runs, which belongs in the request rather than being
-    inferred from configuration."""
+    **There were once two Zoom members.** The other published through a native C++ sidecar
+    built against the Meeting SDK and ingested over RTMS; it has been removed, because the
+    SDK is a licensed download buildable only on Linux and RTMS requires the meeting to be
+    hosted on an account with RTMS enabled for the app — neither of which a deployment can
+    arrange for meetings other people book. This one drives Chromium, publishes through a
+    virtual microphone and reads the meeting off the page."""
 
     TEAMS_WEB = "teams_web"
-    """The same Teams meetings as ``TEAMS``, but joined with a browser.
+    """Microsoft Teams, joined with a browser as an anonymous guest.
 
-    A separate member for the reason ``ZOOM_WEB`` is one, and here the gap between the
-    two is even wider. ``TEAMS`` needs an Azure AD app with admin-consented
-    ``Calls.AccessMedia.All``, a tenant that will grant it, and a **Windows** host running
+    **There were once two Teams members**, and the gap between them was even wider than
+    Zoom's. The removed one needed an Azure AD app with admin-consented
+    ``Calls.AccessMedia.All``, a tenant that would grant it, and a **Windows** host running
     the .NET media SDK — three requirements a deployment often cannot satisfy for meetings
-    other people booked. This one drives Chromium, joins as an anonymous guest through the
-    ordinary web client, publishes through a synthetic microphone and hears the meeting by
-    tapping the page. It needs nothing from the tenant.
-
-    Choosing between them is choosing which machinery runs, which belongs in the request
-    rather than being inferred from configuration (doc 010 §1)."""
+    other people booked. This one drives Chromium, joins through the ordinary web client,
+    publishes through a synthetic microphone and hears the meeting by tapping the page. It
+    needs nothing from the tenant."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,10 +78,10 @@ class ChatMessage:
     """One text message from a meeting's chat.
 
     Platform-neutral on purpose: every platform this service targets has a chat, and none of
-    them agree on its shape. Meet renders a DOM list with display names, Zoom delivers chat
-    over its own event channel, Teams over Graph. What is common is a line of text, who
-    appeared to send it, and when we learned of it — so that is what crosses the boundary,
-    and each connector's adapter is responsible for reducing its platform to this.
+    them agree on its shape — each renders a different panel, with different markup, and
+    attributes a message differently. What is common is a line of text, who appeared to send
+    it, and when we learned of it — so that is what crosses the boundary, and each
+    connector's adapter is responsible for reducing its platform to this.
 
     ``sender`` is the display name rather than an id because that is what a conversational
     agent can use: "Priya asks…" is meaningful to an LLM in a way a participant id is not.
@@ -99,9 +101,9 @@ class ChatMessage:
 class HandRaise:
     """One participant asking for the floor.
 
-    Platform-neutral for the same reason ``ChatMessage`` is: Meet renders a hand indicator in
-    the DOM, Zoom raises an SDK event, Teams reports it over Graph, and none of them agree on
-    the shape. What is common is *who* wants to speak and *when* we learned of it.
+    Platform-neutral for the same reason ``ChatMessage`` is: each platform draws a hand
+    indicator its own way, in its own markup, in its own panel. What is common is *who* wants
+    to speak and *when* we learned of it.
 
     **Why this is not a ``ChatMessage`` with different text.** A chat message is a question
     waiting its turn; a raised hand is a request to take the turn *now*, and the two produce
@@ -135,24 +137,6 @@ class MeetingContext:
     meeting_number: str
     display_name: str
     passcode: str | None = None
-    meeting_uuid: str | None = None
     platform_data: dict[str, Any] = field(default_factory=dict)
-    platform: MeetingPlatform = MeetingPlatform.ZOOM
-    """Which connector owns this meeting. Defaults to ``ZOOM`` so every existing
-    construction site — and every Zoom code path — behaves exactly as before."""
-
-    def with_uuid(self, meeting_uuid: str) -> MeetingContext:
-        """Return a copy carrying the meeting UUID learned from a webhook.
-
-        The UUID is not known when an operator creates a session by meeting number;
-        it arrives with ``meeting.rtms_started``. It is the key used to bind an
-        inbound RTMS stream to an existing session (doc 003 §3.1).
-        """
-        return MeetingContext(
-            meeting_number=self.meeting_number,
-            display_name=self.display_name,
-            passcode=self.passcode,
-            meeting_uuid=meeting_uuid,
-            platform_data=dict(self.platform_data),
-            platform=self.platform,
-        )
+    platform: MeetingPlatform = MeetingPlatform.ZOOM_WEB
+    """Which connector owns this meeting."""

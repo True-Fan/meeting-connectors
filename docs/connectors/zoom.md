@@ -20,40 +20,27 @@ Playwright ──▶ Chromium (persistent profile, mic pre-selected)
                     │
         navigates to app.zoom.us/wc/{meeting_number}/join
                     │
-        ┌───────────┴────────────┐
-   ingest_mode=rtms          ingest_mode=browser
-        │                          │
-   RTMS WebSocket                  tapped from the page's own
-   (structured events)             playout graph + DOM (roster,
-        │                          speaker, chat, captions)
-        └───────────┬──────────────┘
-                     ▼
+        tapped from the page's own playout graph (audio)
+        + DOM (roster, speaker, chat, captions)
+                    │
+                    ▼
         loopback WebSocket (ZWB1) ──▶ PageAudioSource / ZoomWebMediaSink
-                     │
+                    │
         (shared media pipeline — LLD.md §7)
 ```
 
-`ingest_mode` (`MC_ZOOM_WEB__INGEST_MODE`, `browser` by default) is the single most
-consequential setting on this connector:
+**There used to be a second ingest leg here: Zoom's RTMS API.** It was a strictly better
+signal — audio, transcript, chat and participant events all arriving as data with a name
+attached, nothing depending on markup Zoom can rename. It required the meeting to be hosted
+on an account with RTMS enabled for the app, and a meeting the bot was merely *invited* to can
+never carry that entitlement. Since that is the case this bridge exists for, the leg was
+removed along with the `MC_ZOOM__*` credentials, the `/webhooks/zoom` endpoint and the
+Meeting-SDK connector it shared them with.
 
-| | `rtms` | `browser` |
-|---|---|---|
-| Requires | RTMS enabled for this app on the hosting account | Nothing |
-| Audio | RTMS stream | Tapped from Zoom's own playout |
-| Who's present / speaking / what was said | Structured events, exact | DOM scraping — degrades if Zoom's UI changes |
-| Echo gate | **Strict** — RTMS delivers the mix *including* the avatar, round-trip well over a second; hangover needs to be long (see below) | **Backstop only** — the synthetic mic never reaches the tap, so the avatar's voice is structurally absent |
-| Barge-in trigger | Zoom's `ACTIVE_SPEAKER_CHANGE` event | Audio energy + DOM |
-
-Because a meeting the bot was invited to can't carry the RTMS entitlement, `browser` is both
-the default and, in practice, the only mode that works for an invited meeting — which is also
-why `calendar-orchestrator` never needs to know this switch exists.
-
-**If running `rtms` mode**, `MC_ZOOM_WEB__ECHO_GATE_HANGOVER_MS` needs to be set well above the
-shared default (200ms) — RTMS here carries the avatar's own voice back in the mix, and a short
-hangover was observed, live, causing the agent to transcribe and answer the tail of its own
-sentences in a loop. **Leave it unset in `browser` mode** — a long hangover there would make
-barge-in detection deaf for no benefit, since the echo it exists to prevent can't happen on
-that path.
+One consequence worth knowing: `MC_ZOOM_WEB__ECHO_GATE_HANGOVER_MS` should be left **unset**.
+It existed because RTMS carried the avatar's own voice back in the mix. The page tap does not
+— Zoom never plays a participant their own microphone — so a long hangover now only makes
+barge-in detection deaf, for no benefit.
 
 ## Setup
 
@@ -89,28 +76,18 @@ Opt-in on purpose (`enabled`, default `false`): it takes no credentials of its o
 "wanted" from, and it carries a host dependency (a real capture device) that should never
 appear in a deployment that didn't ask for it.
 
-### Optional: RTMS ingest mode
+**No Zoom Marketplace app, credentials, or webhook endpoint is needed.** Those were only ever
+required by the removed RTMS leg; this connector joins as a guest and needs nothing registered
+on Zoom's side.
 
-Only needed if you're setting `MC_ZOOM_WEB__INGEST_MODE=rtms` for a meeting the bot's own
-Zoom account hosts (an invited meeting can never use this — see the table above). It needs a
-Zoom Marketplace app plus a webhook endpoint:
+### 2. Captions, if you want a transcript
 
-| App | Grants | Settings |
-|---|---|---|
-| **General App** (RTMS feature) | Webhook signature (`meeting.rtms_started`/`stopped`), RTMS handshake signature | `MC_ZOOM__CLIENT_ID`, `MC_ZOOM__CLIENT_SECRET`, `MC_ZOOM__WEBHOOK_SECRET_TOKEN` |
-| **Server-to-Server OAuth App** (scope `meeting:update:participant_rtms_app_status`) | Lets the bridge trigger RTMS to start via REST, without a manual toggle | `MC_ZOOM__ACCOUNT_ID`, `MC_ZOOM__S2S_CLIENT_ID`, `MC_ZOOM__S2S_CLIENT_SECRET` |
-
-Register a webhook endpoint at `https://<host>/webhooks/zoom` for `meeting.rtms_started` and
-`meeting.rtms_stopped`; Zoom's endpoint-validation challenge is answered automatically (signed
-with `MC_ZOOM__WEBHOOK_SECRET_TOKEN`) as soon as the bridge is reachable at that URL.
-`MC_ZOOM__RTMS_AUTO_START` (default on) makes `zoom_web`'s own session start trigger RTMS via
-that S2S app automatically, rather than waiting on an account auto-start rule or a manual
-toggle in the Zoom web portal.
-
-RTMS is negotiated for **exactly** the avatar's own input format (16kHz mono S16LE), so there
-is zero resampling anywhere on this ingest path. **RTMS cannot resume across a reconnect** —
-every reconnect is a full re-handshake, and audio during the gap is permanently lost and
-logged as such.
+```bash
+MC_ZOOM_WEB__CAPTIONS_AUTO_ENABLE=true
+```
+Turning captions on is a **visible action in somebody else's meeting**, which is why it is a
+setting rather than default behaviour. It is also the only way this connector can answer "what
+did they say" — there is no invisible per-participant transcription available to a guest.
 
 ## Run
 
@@ -135,20 +112,20 @@ curl --location 'localhost:8000/sessions' \
 | Leg | State |
 |---|---|
 | `zoom_web` bridge/join logic | ✅ built and unit-tested |
-| `zoom_web` in `browser` ingest mode | ⚠️ selectors not yet verified against a live meeting |
-| `zoom_web` in `rtms` ingest mode | ✅ built and verified against Zoom's real handshake |
+| Page tap (audio ingest + publish) | ✅ confirmed attaching by the Web Audio path in a live meeting |
+| DOM observers (roster, speaker, chat, captions) | ⚠️ selectors not yet verified against a live meeting |
 
 ## Troubleshooting
 
 - **Avatar joins, publishes idle video, never speaks or is never heard** — the single most
   common cause is a profile with no microphone selected; re-run `scripts/zoom_web_login.py`
   and confirm the selection step specifically.
-- **Agent answers its own words in a loop (`rtms` mode)** — raise
-  `MC_ZOOM_WEB__ECHO_GATE_HANGOVER_MS`; this is the exact symptom of too short a value on this
-  path.
-- **RTMS socket silently stops delivering audio** — check for a `KeepAliveTimeoutError` in the
-  logs; RTMS gives no resume, so a reconnect after a gap is expected to show a logged gap
-  duration, not silently continue.
-- **A `meeting.rtms_started` webhook arrives with no session to bind** — expected if the
-  webhook beats `POST /sessions`; it's parked for up to 45s and claimed automatically once the
-  session exists. Longer than 45s apart and the binding expires — check ordering upstream.
+- **Avatar never reacts to a raised hand, chat, or somebody speaking** — these are DOM
+  observers, so a Zoom UI change is the first suspect. Run with
+  `MC_ZOOM_WEB__HEADLESS=false` and watch whether the participants/chat panel actually opens;
+  the selectors are data, in `connectors/zoom_web/automation/selectors.py`.
+- **Barge-in never fires** — check `MC_ZOOM_WEB__ECHO_GATE_HANGOVER_MS` is unset. A large
+  value left over from the removed RTMS leg withholds inbound audio during exactly the window
+  an interruption arrives in.
+- **No transcript** — captions have to be on in the meeting; see
+  `MC_ZOOM_WEB__CAPTIONS_AUTO_ENABLE` above.

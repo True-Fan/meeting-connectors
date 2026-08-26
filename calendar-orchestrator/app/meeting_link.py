@@ -34,20 +34,22 @@ from urllib.parse import quote, unquote
 
 PLATFORM_GOOGLE_MEET = "google_meet"
 PLATFORM_ZOOM = "zoom_web"
-"""The bridge's ``zoom_web`` connector — a browser joining as an ordinary participant — and
-not ``zoom``, which is the Meeting-SDK connector and needs the meeting to be hosted on an
-RTMS-enabled account. An invite that arrives by mail or calendar is by definition a meeting
-somebody else scheduled, so that entitlement is exactly what is not available."""
+"""The bridge's ``zoom_web`` connector — a browser joining as an ordinary participant.
+
+The bridge once had a second Zoom connector, ``zoom``, which published through a Meeting-SDK
+sidecar and needed the meeting hosted on an RTMS-enabled account. An invite that arrives by
+mail or calendar is by definition a meeting somebody else scheduled, so that entitlement was
+exactly what was never available — and it is why this orchestrator only ever named the
+browser connector. That connector has since been removed from the bridge entirely."""
 
 PLATFORM_TEAMS = "teams_web"
-"""The bridge's ``teams_web`` connector, and **never** ``teams``, for a stronger version of
-the argument ``PLATFORM_ZOOM`` makes.
+"""The bridge's ``teams_web`` connector — Chromium joining as an anonymous guest.
 
-``teams`` is the Graph/media-SDK connector: it needs an Azure AD app with admin-consented
-``Calls.AccessMedia.All``, a tenant willing to grant it, and a Windows host. A meeting that
-arrives as an invite belongs to somebody else's tenant — often a personal ("Teams for Life")
-account with no tenant at all — so none of those three is available. ``teams_web`` drives
-Chromium and joins as an anonymous guest, which is the only route an invited meeting has."""
+Same story as ``PLATFORM_ZOOM``, in a stronger form. The removed ``teams`` connector needed an
+Azure AD app with admin-consented ``Calls.AccessMedia.All``, a tenant willing to grant it, and
+a Windows host. A meeting that arrives as an invite belongs to somebody else's tenant — often
+a personal ("Teams for Life") account with no tenant at all — so none of those three was ever
+available here."""
 
 # A Meet code is three groups of letters: abc-defg-hij.
 #

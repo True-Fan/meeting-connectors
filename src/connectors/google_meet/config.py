@@ -1,7 +1,7 @@
 """Google Meet connector configuration.
 
 A flattened, connector-local view of ``Settings`` — the same pattern as
-``connectors/zoom/config.py`` and ``connectors/teams/config.py``, and for the same
+``connectors/zoom_web/config.py`` and ``connectors/teams_web/config.py``, and for the same
 reason: this feature depends on the fields it needs rather than on the whole settings
 tree, so an unrelated setting cannot change this package and a test can build one of
 these in a line.

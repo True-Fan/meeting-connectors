@@ -7,7 +7,7 @@ because nothing carried the ledger across the avatar socket. Serving it over HTT
 *available*; this makes the agent *hold* it.
 
 **Why a poller and not a callback on the observer.** ``ZoomMeetingObserver`` runs on the
-RTMS pump, which is the media channel — the one place in this connector that must not be
+page read loop, which is the media channel — the one place in this connector that must not be
 given anything that can block. Sending on the avatar socket is I/O with a queue behind it,
 so hanging it off that observer would put a network send on the path that also carries
 audio. A separate task reading a snapshot is the same information at a cost that cannot
@@ -62,7 +62,7 @@ cadence."""
 SETTLE_DELAY_S = 1.5
 """Grace before the first push.
 
-RTMS attaches a moment after the browser joins, and the first participant events arrive in
+The page attaches a moment after the browser joins, and the first participant events arrive in
 a burst. Waiting one interval means the agent's first brief is the meeting as it is, rather
 than a snapshot mid-arrival followed by a correction."""
 

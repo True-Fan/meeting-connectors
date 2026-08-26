@@ -5,9 +5,9 @@ Two legs, each using the mechanism Zoom actually supports:
 * **publish** — Chromium joins the meeting and the avatar speaks through a virtual
   microphone. Measured: Zoom transmits a device, and does not transmit an injected
   ``MediaStreamTrack``.
-* **ingest** — one of two, selected by ``ingest_mode``. See doc 009.
+* **ingest** — the page's own audio, tapped at playout. See doc 009.
 
-**Ingest was RTMS-only, and this file used to say tapping the browser for audio was not an
+**Ingest was once RTMS, and this file used to say tapping the browser for audio was not an
 option "regardless, because Zoom's web client has no audio transceiver to tap."** The second
 half of that is still true and the conclusion did not follow. A peer-connection tap finds
 nothing because Zoom decodes audio in WebAssembly and renders it through Web Audio — so the
@@ -15,28 +15,22 @@ tap belongs at *playout*, where every transport has to arrive, rather than at th
 That is what ``js/inject.js`` does, and a live meeting confirmed it attaches by the Web Audio
 path on the first try.
 
-It matters because RTMS requires the meeting to be hosted on an account with RTMS enabled,
-which is not something a deployment can arrange for meetings other people book. ``browser``
-mode is what makes the connector usable in an ordinary meeting; ``rtms`` remains the better
-leg wherever an account can serve it.
+It matters because RTMS required the meeting to be hosted on an account with RTMS enabled,
+which is not something a deployment can arrange for meetings other people book. Tapping the
+page is what makes this connector usable in an ordinary meeting, so it is now the only leg
+and the RTMS one has been removed along with the Meeting-SDK connector it shared its
+credentials with.
 
 **Start order is load-bearing.** The microphone comes up before the join, because
 Zoom picks its capture device *while* joining — a device that appears afterwards is
 not the one selected, and the avatar ends up holding a microphone nobody listens to.
 
-The legs recover independently, as on the other connectors: RTMS reattaching does not
-disturb the browser, and the browser is not torn down because a webhook was late.
-
-**Where the avatar's knowledge of the meeting comes from follows the ingest mode.** Under
-``rtms`` it comes down the ingest leg — Zoom reports who joined, who is speaking, what was
-said and what was typed, each with a name attached, so those features are ledgers over an
-event stream. Under ``browser`` there is no such stream and the page reads them, which makes
-this connector look much more like the Google Meet one. Both produce the same observation
-types, so everything downstream is shared.
-
-A **raised hand** is read from the page in both modes, because RTMS does not report it at
-all — which is why this session has a page event handler as well as a page audio sender.
-See ``meeting/hand_raise.py``.
+**Everything the avatar knows about the meeting is read from the page** — who joined, who is
+speaking, what was said, what was typed, and who wants the floor — which makes this
+connector look much like the Google Meet one. The observation types are this connector's own
+(``observations.py``), so everything downstream is written against plain values rather than
+against a DOM payload. See ``meeting/hand_raise.py`` for why a raised hand and a voice
+talking over the avatar are one source rather than two.
 """
 
 from __future__ import annotations
@@ -63,10 +57,6 @@ from src.connectors.google_meet.automation.driver import (
     PlaywrightDriver,
 )
 from src.connectors.google_meet.browser.launcher import build_launch_plan
-from src.connectors.zoom.api.rtms_trigger import RtmsTrigger
-from src.connectors.zoom.rtms.audio_source import RtmsAudioSource
-from src.connectors.zoom.rtms.observations import MeetingObserver
-from src.connectors.zoom_web.audio_capture.self_filter import SelfAudioFilter
 from src.connectors.zoom_web.automation.selectors import (
     DEFAULT_HAND_SELECTORS,
     DEFAULT_OBSERVER_SELECTORS,
@@ -130,8 +120,6 @@ class ZoomWebSession:
         "_task",
         "_temp_profile",
         "_transcript",
-        "_trigger",
-        "_trigger_task",
     )
 
     def __init__(
@@ -146,7 +134,6 @@ class ZoomWebSession:
         source: AudioSource,
         publisher: MediaSink,
         router: MediaRouter,
-        trigger: RtmsTrigger | None = None,
         chat: ZoomChatSource | None = None,
         interrupts: ZoomInterruptSource | None = None,
         attendance: ZoomAttendanceLedger | None = None,
@@ -163,7 +150,6 @@ class ZoomWebSession:
         self._source = source
         self._publisher = publisher
         self._router = router
-        self._trigger = trigger
         # Every one of these is optional, and ``None`` means the feature is switched off
         # rather than broken — the same terms the Google Meet session holds its equivalents
         # on, so a disabled session carries no inert surface at all.
@@ -175,7 +161,6 @@ class ZoomWebSession:
         self._announcer = announcer
         self._joined = False
         self._task: asyncio.Task[None] | None = None
-        self._trigger_task: asyncio.Task[None] | None = None
         self._temp_profile: str | None = None
 
     @property
@@ -275,7 +260,7 @@ class ZoomWebSession:
         if self._interrupts is not None:
             await self._interrupts.start()
 
-        # RTMS may not be bound yet; the source waits rather than failing.
+        # The page is already tapping by this point; this only opens the queue.
         await self._source.start()
         self._task = asyncio.create_task(self._router.run(), name="media-router")
 
@@ -284,37 +269,6 @@ class ZoomWebSession:
         # later, by which time the negotiated version is known.
         if self._announcer is not None:
             await self._announcer.start()
-
-        # Last, and only once ingest is waiting: Zoom stops an RTMS stream nobody
-        # attaches to within about a minute, so the webhook this provokes must have
-        # somewhere to land the moment it arrives.
-        if self._trigger is not None:
-            self._trigger_task = asyncio.create_task(
-                self._start_rtms(), name="rtms-trigger"
-            )
-
-    async def _start_rtms(self) -> None:
-        """Ask Zoom to start RTMS. Best-effort — never fails the session.
-
-        RTMS can also be started by an account auto-start rule or by hand, so a
-        failure here is not proof that ingest will not arrive. If it genuinely does
-        not, the ingest leg times out on its own with a message about the missing
-        webhook, which describes the situation better than this call can.
-        """
-        meeting = self._session.meeting
-        if meeting.meeting_uuid is not None:
-            logger.info("zoom_web.rtms_trigger_skipped", reason="already bound")
-            return
-        try:
-            await self._trigger.start(meeting.meeting_number)  # type: ignore[union-attr]
-        except Exception as exc:
-            logger.warning(
-                "zoom_web.rtms_trigger_failed",
-                meeting_number=meeting.meeting_number,
-                error=str(exc),
-            )
-            return
-        logger.info("zoom_web.rtms_trigger_started", meeting_number=meeting.meeting_number)
 
     async def stop(self) -> None:
         """Tear down in a fixed order. Idempotent.
@@ -326,21 +280,17 @@ class ZoomWebSession:
         if self._announcer is not None:
             await self._announcer.stop()
 
-        for name, task in (
-            ("rtms-trigger", self._trigger_task),
-            ("media-router", self._task),
-        ):
-            if task is None:
-                continue
+        task, self._task = self._task, None
+        if task is not None:
             task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
                 pass
             except Exception as exc:
-                logger.warning("zoom_web.task_failed_on_stop", task=name, error=str(exc))
-        self._trigger_task = None
-        self._task = None
+                logger.warning(
+                    "zoom_web.task_failed_on_stop", task="media-router", error=str(exc)
+                )
 
         # Before anything else is torn down, and before the browser is closed:
         # leaving is a UI action that needs a live page, and the participant must be
@@ -378,7 +328,7 @@ class ZoomWebSession:
             except Exception as exc:
                 logger.warning("zoom_web.stop_step_failed", step=step, error=str(exc))
 
-        # No further speaker event will arrive for whoever held the floor when RTMS went
+        # No further speaker event will arrive for whoever held the floor when the page went
         # away, so the open turn is closed here rather than being left "speaking" forever
         # in whatever the API serves after the session ends.
         if self._speakers is not None:
@@ -409,7 +359,6 @@ class ZoomWebSession:
         """
         selectors = DEFAULT_HAND_SELECTORS
         observe = DEFAULT_OBSERVER_SELECTORS
-        browser = self._config.browser_ingest
         config = {
             "endpoint": self._page_server.endpoint,
             "sampleRateHz": self._config.publish_audio_format.sample_rate_hz,
@@ -423,33 +372,28 @@ class ZoomWebSession:
             # sized for the old one.
             "videoWidth": self._config.video_format.width,
             "videoHeight": self._config.video_format.height,
-            # -- browser ingest ---------------------------------------------
+            # -- what the page observes --------------------------------------
             #
             # **Every one of these is folded against its Python-side consumer here rather
-            # than in the page**, which is the same rule the RTMS subscriptions follow in
-            # ``config.from_settings``: an observer whose ledger is switched off would be
-            # scanning a DOM on the thread that encodes the avatar's audio to produce events
-            # nothing reads. Under RTMS ingest they are all false and the page runs exactly
-            # the script it ran before this existed.
-            "ingestMode": self._config.ingest_mode,
-            "captureWorkletSource": capture_worklet() if browser else None,
+            # than in the page**: an observer whose ledger is switched off would be scanning
+            # a DOM on the thread that encodes the avatar's audio to produce events nothing
+            # reads.
+            "captureWorkletSource": capture_worklet(),
             "captureFrameMs": self._config.capture_frame_ms,
             "observeMs": self._config.observe_interval_ms,
-            "rosterEnabled": browser and self._config.attendance_enabled,
+            "rosterEnabled": self._config.attendance_enabled,
             # Also on for the interrupt source, which is a separate consumer of the same
             # signal: barge-in wants to know *who* took the floor even where nobody is
             # keeping a speaker ledger.
-            "speakerEnabled": browser
-            and (
+            "speakerEnabled": (
                 self._config.speaker_tracking_enabled
                 or self._config.voice_interrupt_enabled
             ),
             "speakerMinMs": self._config.speaker_min_ms,
             # The transcript is a consumer of chat as well as the chat source is — a meeting
             # held largely in chat should still be answerable — so this is on when either
-            # wants it, exactly as ``rtms_chat_enabled`` is folded.
-            "chatEnabled": browser
-            and (self._config.chat_enabled or self._config.transcript_enabled),
+            # wants it.
+            "chatEnabled": self._config.chat_enabled or self._config.transcript_enabled,
             "chatPanelSelectors": list(observe.chat_panel_button)
             if self._config.chat_open_panel
             else [],
@@ -523,7 +467,7 @@ class ZoomWebSessionFactory:
     """Builds a fully wired ``ZoomWebSession``.
 
     All concrete-type knowledge lives here, so ``MeetingService`` composes one
-    without naming Chromium, RTMS, or a capture device.
+    without naming Chromium, a page tap, or a capture device.
     """
 
     def __init__(
@@ -562,35 +506,33 @@ class ZoomWebSessionFactory:
 
         self_names = _self_name_candidates(session, config)
 
-        # **The gate is the one piece of the media path that browser ingest changes**, and
-        # it changes because the thing it was defending against is no longer there.
+        # **The gate is off, and that is a property of the ingest leg rather than a
+        # preference.**
         #
-        # RTMS delivers the meeting's mix *with the avatar in it*, so the avatar's own voice
-        # arrives back over a round trip well over a second. A mixed stream carries no
-        # attribution, so identity filtering cannot bite, and the strict gate — withholding
-        # every inbound frame while the avatar talks — is the only defence. Doc 008 §4
-        # records what happens without it: the agent answering the tail of its own sentences,
-        # in a loop.
+        # The RTMS leg this connector used to have delivered the meeting's mix *with the
+        # avatar in it*, so the avatar's own voice arrived back over a round trip well over a
+        # second. A mixed stream carries no attribution, so identity filtering could not
+        # bite, and the strict gate — withholding every inbound frame while the avatar talks
+        # — was the only defence. Doc 008 §4 records what happened without it: the agent
+        # answering the tail of its own sentences, in a loop.
         #
         # The page tap has no such loop. Zoom does not play a participant their own
         # microphone, and the synthetic microphone lives in an ``AudioContext`` that connects
         # only to a ``MediaStreamDestination`` — never to a destination the tap watches. So
         # the avatar's audio is structurally absent, exactly as it is on Google Meet, and the
-        # gate is switched off there for the same reason it is here: a shut gate cannot tell
-        # the avatar's echo from somebody talking over it, so it suppresses the interruption
+        # gate stays shut off for the same reason it is there: a shut gate cannot tell the
+        # avatar's echo from somebody talking over it, so it suppresses the interruption
         # along with the echo. What remains is the acoustic path — a participant on speakers
         # — which is a real echo the gate could not have caught anyway.
         #
-        # That is what makes energy-based barge-in possible in this mode and impossible in
-        # the other, and it is the whole reason ``speech`` is passed to the router below.
+        # That is what makes energy-based barge-in possible here at all, and it is the whole
+        # reason ``speech`` is passed to the router below.
         echo_guard = EchoGuard(
-            per_participant_audio=config.per_participant_audio and not config.browser_ingest,
+            per_participant_audio=False,
             hangover_ms=config.echo_gate_hangover_ms,
-            gate_enabled=not config.browser_ingest,
+            gate_enabled=False,
             metrics=self._metrics,
         )
-        if not config.browser_ingest:
-            echo_guard.set_own_participant(publisher.own_participant())
 
         avatar = AvatarClient(
             transport=WebSocketAvatarTransport(
@@ -709,40 +651,34 @@ class ZoomWebSessionFactory:
             transcript=transcript,
             chat=chat,
             interrupts=interrupts,
-            # Only the page's observations need stamping — RTMS's arrive already timed. Passed
-            # unconditionally anyway: the RTMS path never calls the clock, so a mode branch
-            # here would buy nothing and be one more thing to get wrong.
+            # The page's observations carry no time of their own — the browser runs on its
+            # own timeline — so the observer stamps them on the media clock.
             clock=clock,
-            # Only the page's roster needs this: RTMS reports joins and leaves as exact
-            # events, so nothing there is ever debounced.
-            leave_grace_s=config.roster_leave_grace_s if config.browser_ingest else 0.0,
+            # The page reports the roster it can see rather than exact join/leave events, so
+            # a row that flickers must not read as somebody leaving.
+            leave_grace_s=config.roster_leave_grace_s,
         )
         page_server.set_event_handler(observer.on_page_event)
 
-        source = self._source_override or self._build_source(
-            session, ctx, clock, observer=observer, server=page_server
+        # No credentials, no webhook, no attachment to wait for. The page is already tapping
+        # by the time this exists — it started patching before Zoom's own scripts ran — so
+        # this only has to collect what arrives.
+        source = self._source_override or PageAudioSource(
+            server=page_server,
+            ctx=ctx,
+            clock=clock,
+            queue_size=config.inbound_queue_size,
+            metrics=self._metrics,
         )
 
-        # **Whether a voice can interrupt from audio at all is a property of the ingest leg,
-        # not a preference**, which is why this is a branch on the mode rather than on a
-        # setting of its own.
-        #
-        # Under RTMS there is deliberately no detector, and doc 008 §4 is the argument: the
-        # router's energy detector reads inbound frames *after* ``EchoGuard``, the guard runs
-        # strict there because RTMS carries the avatar's own voice, and so every frame is
-        # withheld during precisely the window a barge-in exists in. A detector would be a
-        # second interrupt path that can only fire when no interruption is needed. Zoom's
-        # ``ACTIVE_SPEAKER_CHANGE`` is used instead — a control message, delivered regardless
-        # of the gate.
-        #
-        # Under browser ingest the gate is open (see ``echo_guard`` above), so the detector
-        # works, and it is the better of the two triggers: it fires on the first syllable
-        # rather than when Zoom gets round to redrawing whose tile is highlighted. Both run —
-        # the DOM speaker observer still feeds ``ZoomInterruptSource.offer_voice`` — and they
-        # converge on the same handover, which the cooldown there already de-duplicates.
+        # **Energy-based barge-in is possible because the gate is open** (see ``echo_guard``
+        # above). It is the better of the two triggers available: it fires on the first
+        # syllable rather than when Zoom gets round to redrawing whose tile is highlighted.
+        # Both run — the DOM speaker observer still feeds ``ZoomInterruptSource.offer_voice``
+        # — and they converge on the same handover, which the cooldown there de-duplicates.
         speech: SpeechDetector | None = None
         voice_prompt = ""
-        if config.browser_ingest and config.voice_interrupt_enabled:
+        if config.voice_interrupt_enabled:
             speech = SpeechDetector(rms_threshold=config.speech_interrupt_threshold)
             # The anonymous rendering is the fallback. With a tracker attached the router
             # renders the same template with the speaker's name instead — the tapped mix
@@ -791,7 +727,6 @@ class ZoomWebSessionFactory:
         )
 
         return ZoomWebSession(
-            trigger=self._build_trigger(),
             session=session,
             config=config,
                 clock=clock,
@@ -807,109 +742,6 @@ class ZoomWebSessionFactory:
             speakers=speakers,
             transcript=transcript,
             announcer=announcer,
-        )
-
-    def _build_trigger(self) -> RtmsTrigger | None:
-        """The RTMS starter, or ``None`` when it is not fully configured.
-
-        ``rtms_auto_start`` already folds in the credential check, so an
-        unconfigured deployment — or a test — silently gets no trigger and makes no
-        outbound call.
-        """
-        config = self._config
-        # Browser ingest has nothing to trigger: there is no RTMS connection waiting for a
-        # stream to start, and asking Zoom to start one would provoke a webhook nothing is
-        # listening for — on an account that, in the case this mode exists for, cannot serve
-        # the request at all.
-        if config.browser_ingest or not config.rtms_auto_start:
-            return None
-        return RtmsTrigger(
-            account_id=config.account_id,
-            client_id=config.s2s_client_id,
-            client_secret=config.s2s_client_secret,
-            app_client_id=config.client_id,
-            api_base_url=config.api_base_url,
-            oauth_base_url=config.oauth_base_url,
-            timeout_s=config.api_timeout_s,
-        )
-
-    def _build_source(
-        self,
-        session: SessionContext,
-        ctx: object,
-        clock: MediaClock,
-        *,
-        observer: MeetingObserver | None = None,
-        server: PageAudioServer,
-    ) -> AudioSource:
-        """The ingest leg — whichever of the two this deployment is configured for.
-
-        **The branch is here and nowhere else.** Both sides satisfy ``AudioSource``, both
-        feed the same observer, and everything downstream — the router, the pacer, the
-        decoder, the ledgers, the announcer, every HTTP endpoint — is written against those
-        two interfaces rather than against either implementation. That is what made browser
-        ingest an addition rather than a fork of the connector.
-        """
-        if self._config.browser_ingest:
-            # No credentials, no webhook, no attachment to wait for, no trigger to fire.
-            # The page is already tapping by the time this exists — it started patching
-            # before Zoom's own scripts ran — so this only has to collect what arrives.
-            return PageAudioSource(
-                server=server,
-                ctx=ctx,  # type: ignore[arg-type]
-                clock=clock,
-                queue_size=self._config.inbound_queue_size,
-                metrics=self._metrics,
-            )
-        return self._build_rtms_source(session, ctx, clock, observer=observer)
-
-    def _build_rtms_source(
-        self,
-        session: SessionContext,
-        ctx: object,
-        clock: MediaClock,
-        *,
-        observer: MeetingObserver | None = None,
-    ) -> AudioSource:
-        """RTMS ingest — audio, and everything else the avatar knows about the meeting.
-
-        No attachment is read here: it may not exist yet. The source is handed the
-        live ``session`` and resolves the binding itself once
-        ``meeting.rtms_started`` has arrived — which is why a browser join and a
-        webhook can land in either order without either failing the session.
-
-        **The observer rides the same attachment**, which is why it is passed here rather
-        than being started separately. Transcript, chat and participant events are streams
-        on the RTMS connection, so they attach when it attaches and re-subscribe when it
-        reconnects, with no second lifecycle to get wrong. If the account refuses the text
-        subscriptions the connection survives on audio alone and says why in its health
-        detail (``RtmsService._media_handshake``).
-        """
-        # Wrapped because RTMS returns every participant — us included — and a
-        # mixed stream carries no names, so this filter only bites when
-        # ``per_participant_audio`` is turned back on. It is kept rather than
-        # deleted because that setting is the one knob that reintroduces the echo,
-        # and identity beats timing whenever identity is available.
-        #
-        # On the mixed stream that is now the default, the avatar's own voice is
-        # suppressed by ``EchoGuard``'s strict gate instead.
-        return SelfAudioFilter(
-            display_name=session.meeting.display_name,
-            inner=RtmsAudioSource(
-                session=session,
-                client_id=self._config.client_id,
-                client_secret=self._config.client_secret,
-                ctx=ctx,  # type: ignore[arg-type]
-                clock=clock,
-                queue_size=self._config.inbound_queue_size,
-                send_rate_ms=self._config.rtms_send_rate_ms,
-                per_participant_audio=self._config.per_participant_audio,
-                metrics=self._metrics,
-                observer=observer,
-                subscribe_transcript=self._config.rtms_transcript_enabled,
-                subscribe_chat=self._config.rtms_chat_enabled,
-                subscribe_events=self._config.rtms_events_enabled,
-            ),
         )
 
 
@@ -961,9 +793,10 @@ def _self_name_candidates(
     **The session's name comes first, and reading only the configured one was a bug.**
     The browser joins under ``session.meeting.display_name`` — that is the string
     ``ZoomWebJoiner`` types into Zoom's form, so it is the name every participant sees and
-    the name RTMS puts on the avatar's own events. It is *not* ``ZoomWebSettings.display_name``:
-    ``MeetingService`` fills it from the ``POST /sessions`` request, falling back to
-    ``MC_ZOOM__DISPLAY_NAME``. The two agree only while all three defaults are untouched.
+    the name the page reads back on the avatar's own roster row and captions. It is *not*
+    ``ZoomWebSettings.display_name``: ``MeetingService`` fills it from the ``POST /sessions``
+    request, falling back to ``MC_ZOOM_WEB__DISPLAY_NAME``. The two agree only while all
+    three defaults are untouched.
 
     The consequence of getting it wrong is silent and expensive, because five separate
     things key on it. The avatar would count itself as an attendee (every headcount wrong by
@@ -971,9 +804,6 @@ def _self_name_candidates(
     sentences back to the agent as things a participant said, answer its own chat messages,
     and — worst — **interrupt itself continuously**, since it is an active speaker precisely
     when the barge-in gate is open.
-
-    ``SelfAudioFilter`` has always read the session's name for the same reason; this brings
-    the rest of the connector onto the source that is actually authoritative.
 
     Both are kept rather than one replacing the other. They are usually the same string, and
     when they differ there is no cost to recognising either — an extra name can only make

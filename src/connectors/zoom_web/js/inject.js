@@ -31,23 +31,19 @@
  * `deviceId` — and this patch answers it. That is why the connector uses a
  * persistent profile rather than a fresh directory per session.
  *
- * TWO INGEST MODES, AND WHY THIS FILE HAS A BIG CONDITIONAL IN IT
- * --------------------------------------------------------------
- * Under `ingestMode: 'rtms'` almost everything the Google Meet connector scrapes out
- * of a page, Zoom hands over as data: RTMS reports who joined, who left, who is
- * speaking, what each person said and what they typed, each with a name attached. So
- * in that mode this script does *not* read the roster, the chat panel or the
- * captions, and adding that would be paying Meet's price for a problem Zoom does not
- * have. A raised hand is the one exception — RTMS's event list has no hand-raise
- * event in it, so the indicator exists only on screen.
+ * WHY THIS PAGE READS THE WHOLE MEETING
+ * -------------------------------------
+ * This connector once had a second ingest leg — Zoom's RTMS API — which handed over
+ * as data almost everything the Google Meet connector scrapes out of a page: who
+ * joined, who left, who is speaking, what each person said and what they typed, each
+ * with a name attached. It was removed because RTMS requires the meeting to be hosted
+ * on an account with it enabled, which most deployments do not have and cannot obtain
+ * — and the avatar has to work in an ordinary person's ordinary meeting.
  *
- * Under `ingestMode: 'browser'` there is no RTMS at all. That mode exists because
- * RTMS requires the meeting to be hosted on an account with it enabled, which most
- * deployments do not have and cannot obtain — and the avatar has to work in an
- * ordinary person's ordinary meeting. Every signal RTMS used to carry then has to
- * come from the only thing left that can see it, which is this page. So the roster,
- * the active speaker, the chat and the captions are all read here, and the meeting's
- * audio is tapped out of Zoom's own playout graph.
+ * So every signal RTMS used to carry now comes from the only thing left that can see
+ * it, which is this page. The roster, the active speaker, the chat and the captions
+ * are all read here, and the meeting's audio is tapped out of Zoom's own playout
+ * graph.
  *
  * Nothing here decides what any of it *means*. The page reports what it sees; Python
  * decides whether to interrupt, whose hand it was, which names are new, and what the
@@ -65,7 +61,7 @@
  * for ingest in the first place.
  *
  * So the tap is placed at the **playout** end instead of the transport end, where
- * both modes have to converge: audio that is going to be heard must reach either an
+ * all transports have to converge: audio that is going to be heard must reach either an
  * `AudioContext`'s destination or a media element. `installAudioTap` patches all
  * three paths — Web Audio, media elements, and peer connections — and fans whatever
  * it finds into one capture context. That makes it indifferent to which transport
@@ -79,7 +75,6 @@
   const WORKLET_SOURCE = CONFIG.workletSource;
   if (!ENDPOINT || !WORKLET_SOURCE) return;
 
-  const BROWSER_INGEST = CONFIG.ingestMode === 'browser';
 
   const state = {
     context: null,
@@ -708,7 +703,7 @@
   }
 
   function installAudioTap() {
-    if (!BROWSER_INGEST || !CONFIG.captureWorkletSource) return;
+    if (!CONFIG.captureWorkletSource) return;
     installWebAudioTap();
     installMediaElementTap();
     installPeerConnectionTap();
@@ -1400,7 +1395,7 @@
    *
    * Advisory only: Python re-decides this against every name the avatar might have joined
    * under (`_self_name_candidates`), and this knows only the one it was configured with.
-   * The two disagree whenever `MC_ZOOM__DISPLAY_NAME` and the name in the `POST /sessions`
+   * The two disagree whenever `MC_ZOOM_WEB__DISPLAY_NAME` and the name in the `POST /sessions`
    * request differ, which is why nothing downstream is allowed to trust it.
    */
   function isSelfName(name) {
@@ -1964,7 +1959,6 @@
   }
 
   function startMeetingObservers() {
-    if (!BROWSER_INGEST) return;
     // One timer for all four rather than four timers, because they share a thread with the
     // microphone and the capture graph: four independent intervals means four chances to
     // land in the same tick as an audio callback, for no benefit — none of these needs to

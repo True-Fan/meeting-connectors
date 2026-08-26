@@ -5,7 +5,7 @@ way, and the difference is worth stating because it is most of this file's desig
 Meet has no participant API a guest can call, so that connector re-reads a DOM roster
 several times a second, deduplicates it, cleans status text out of names, and folds the
 result into a ledger. Zoom raises ``PARTICIPANT_JOIN`` and ``PARTICIPANT_LEAVE`` over
-RTMS with a user id and a display name attached. So there is no scanning here, no
+the page's roster diff with a display name attached. So there is no scanning here, no
 selector, no cleaning pass, and no "scan count" in the sense Meet means one — this is an
 event log, and the ledger is what accumulates it.
 
@@ -23,7 +23,7 @@ monotonic value orders events and measures durations, and "when did Priya join" 
 number a person can read.
 
 Every method is synchronous, total and non-blocking, because ``observe_*`` is called
-from the RTMS pump — the loop that also carries the meeting's audio. A bug in a
+from the page read loop — which also carries the avatar's voice. A bug in a
 bookkeeping feature must never be able to stall or tear down ingest.
 """
 
@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from time import perf_counter_ns
 
-from src.connectors.zoom.rtms.observations import ParticipantEvent
+from src.connectors.zoom_web.observations import ParticipantEvent
 from src.infrastructure.logging import get_logger
 
 logger = get_logger(__name__)
@@ -227,11 +227,11 @@ def _join_names(records: tuple[AttendanceRecord, ...]) -> str:
 
 
 class ZoomAttendanceLedger:
-    """Accumulates who was in the meeting, from RTMS participant events.
+    """Accumulates who was in the meeting, from the page's participant events.
 
     Not a component in the health report and not on any media path: it holds no task,
     opens nothing, and every method returns rather than raising — because ``observe`` is
-    called from the RTMS pump.
+    called from the page read loop.
     """
 
     __slots__ = ("_entries", "_events", "_over_capacity", "_self_names")
@@ -307,7 +307,7 @@ class ZoomAttendanceLedger:
         try:
             self._observe(event)
         except Exception as exc:  # pragma: no cover - defensive
-            # Swallowed on purpose: this runs on the RTMS pump, so an unexpected payload
+            # Swallowed on purpose: this runs on the page read loop, so an unexpected payload
             # must cost an attendance update and nothing else. Losing a name is a
             # bookkeeping gap; propagating would drop the meeting's audio.
             logger.warning("zoom_attendance.observe_failed", error=str(exc))
@@ -326,7 +326,7 @@ class ZoomAttendanceLedger:
 
         if entry is None:
             if not event.joined:
-                # A leave for somebody never seen joining. Zoom does this when RTMS
+                # A leave for somebody never seen joining. This happens when the page
                 # attaches to a meeting already in progress — the join happened before we
                 # were listening. Recording a departure for a person with no arrival would
                 # put somebody in "was here and left" who, as far as this ledger can

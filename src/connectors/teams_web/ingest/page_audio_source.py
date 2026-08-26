@@ -5,7 +5,7 @@ so that ``MediaRouter`` — shared, platform-blind, already shipped for Zoom, Te
 consume browser-tapped Teams audio through the identical port it consumes everything else
 through.
 
-**Deliberately thin.** ``RtmsAudioSource`` is a large object — its own WebSocket, handshake,
+**Deliberately thin.** The removed RTMS source was a large object — its own WebSocket, handshake,
 keep-alive and reconnect loop — because RTMS genuinely is an independent integration that can
 fail and heal without the browser noticing. Here ingest and egress are the *same page channel*:
 the socket the avatar's voice travels out on is the socket the meeting's audio travels in on.

@@ -9,7 +9,7 @@ drifted apart.
 Pure: no sockets, no asyncio, no Playwright. Encoding is a function of its arguments and
 decoding is a function of a single frame — so the entire boundary is testable with no
 Chromium, no Google account, and no meeting. That is the same argument
-``connectors/teams/sidecar/protocol.py`` makes for writing the codec before the sidecar
+the removed Teams sidecar's protocol made for writing the codec before the sidecar
 exists, and it is what makes this connector developable on a laptop.
 
 **Why there is no incremental decoder here, unlike Teams.** ``TeamsFrameDecoder``

@@ -1,7 +1,7 @@
 """Google Meet connector exceptions.
 
-A separate hierarchy from ``connectors.zoom.exceptions`` and
-``connectors.teams.exceptions``, for the same reason those two are separate from each
+A separate hierarchy from ``connectors.zoom_web.exceptions`` and
+``connectors.teams_web.exceptions``, for the same reason those two are separate from each
 other: the failure modes have nothing in common. A Chromium crash, a Google sign-in
 challenge, and a "you have been removed from the meeting" banner are not variants of
 an RTMS handshake failure or a Graph call rejection, and a shared base class would be

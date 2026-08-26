@@ -13,7 +13,7 @@ deployment that actually asked for Meet.
 protocol is the seam that makes the connector testable: ``ChromiumBridge``, the join flow,
 and the session all drive it, so the entire Meet pipeline can be exercised against an
 in-process fake with no Chromium, no Google account, and no meeting. It is the same move
-``TeamsSidecarLink``'s injectable ``client_factory`` makes, for the same reason.
+the removed Teams sidecar link's injectable ``client_factory`` made, for the same reason.
 
 The protocol is deliberately **thin and dumb**: wait for a selector, click a selector,
 read the page's text, evaluate a script. It has no idea what a meeting is. Every decision

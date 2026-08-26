@@ -70,7 +70,7 @@ a signed-in personal account redirects to the Teams app home. No join form, noth
 and a join that times out with no selector at fault. That is the bug this list exists to
 prevent, and it is why ``/meet/`` is here.
 
-``connectors/teams/graph/join_url.looks_like_join_url`` makes the narrower test on purpose:
+The removed Graph connector's ``looks_like_join_url`` made the narrower test on purpose:
 Graph needs a thread id, which only the first shape carries. Duplicated rather than imported
 because a connector that imports another's parser is coupled to its release cycle, which
 ``tests/architecture/test_layering.py`` exists to prevent — and this connector needs a *URL to

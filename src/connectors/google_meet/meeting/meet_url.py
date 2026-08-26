@@ -1,7 +1,7 @@
 """Resolve a ``MeetingContext`` into a Google Meet URL.
 
 The outbound anti-corruption boundary for this connector, and the counterpart to
-``connectors/teams/graph/join_url.py``: the only module that reads ``MeetingContext`` and
+``connectors/teams_web/meeting/join.py``: the only module that reads ``MeetingContext`` and
 speaks Google Meet, and the only one that knows what a Meet link looks like.
 
 Two routes, preferred in this order — the same ordering Teams uses, for the same reason:

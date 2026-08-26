@@ -32,9 +32,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app=settings.app_name,
         version=__version__,
         env=settings.env,
-        zoom_ingest_configured=settings.zoom.is_configured(),
-        zoom_publish_configured=settings.zoom.is_publish_configured(),
-        zoom_rtms_auto_start=settings.zoom.is_rtms_auto_start_configured(),
+        platforms=sorted(container.connector_registry().supported()),
         avatar_url=settings.avatar.url,
     )
     try:
@@ -64,7 +62,7 @@ def create_app(*, container: Container | None = None) -> FastAPI:
     app = FastAPI(
         title=settings.app_name,
         version=__version__,
-        summary="Bridge between Zoom meetings and a Streaming Avatar Agent",
+        summary="Bridge between browser-joined meetings and a Streaming Avatar Agent",
         lifespan=_lifespan,
     )
     app.state.container = container
@@ -78,9 +76,10 @@ def create_app(*, container: Container | None = None) -> FastAPI:
     # claim intact — it still mentions no platform and no connector-specific concept.
     app.include_router(participants.router)
 
-    # Platform-specific webhook, resolved from the container rather than imported, so
-    # this module names no connector (doc 003 §1.5).
-    app.include_router(container.zoom_webhook_router(), prefix="/webhooks/zoom")
-    app.include_router(container.zoom_oauth_router())
+    # **No platform-specific HTTP surface any more.** There used to be two Zoom routes
+    # mounted here from the container: an RTMS webhook receiver, and an app-install OAuth
+    # callback for the Zoom Marketplace app that webhook belonged to. Both went with the
+    # Meeting-SDK connector — every remaining connector joins with a browser and is driven
+    # entirely by ``POST /sessions``, so nothing calls in from outside.
 
     return app

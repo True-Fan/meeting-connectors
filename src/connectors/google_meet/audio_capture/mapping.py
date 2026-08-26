@@ -48,7 +48,7 @@ def to_audio_frame(
     arbitrary origin and drifts against the monotonic clock the rest of the pipeline is
     paced on. Mixing two timelines would corrupt the single-clock invariant that A/V sync
     depends on. The wire ``pts_us`` is retained on the message for latency attribution,
-    never for presentation — the same rule ``connectors/teams/ingest/mapping.py`` follows
+    never for presentation — the same rule every other connector's ingest follows
     for the sidecar's timestamps, and for the same reason.
 
     Raises:

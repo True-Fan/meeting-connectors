@@ -7,14 +7,13 @@ Secrets are ``SecretStr`` so they cannot be leaked by an accidental ``repr()`` i
 log line — with structured logging that would otherwise be an easy mistake to make.
 
 Environment variables use the ``MC_`` prefix and ``__`` as the nesting delimiter,
-e.g. ``MC_ZOOM__CLIENT_ID``.
+e.g. ``MC_ZOOM_WEB__DISPLAY_NAME``.
 """
 
 from __future__ import annotations
 
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal
 
 from pydantic import BaseModel, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -50,147 +49,6 @@ class ObservabilitySettings(BaseModel):
         if level not in allowed:
             raise ValueError(f"log_level must be one of {sorted(allowed)}, got {value!r}")
         return level
-
-
-class ZoomSettings(BaseModel):
-    """Zoom credentials and RTMS subscription parameters.
-
-    Two independent credential paths (doc 003 §1.1):
-
-    * ``client_id`` / ``client_secret`` / ``webhook_secret_token`` — RTMS webhook
-      verification and handshake signature.
-    * ``sdk_key`` / ``sdk_secret`` — Meeting SDK JWT for the publishing bot.
-    """
-
-    client_id: str = ""
-    client_secret: SecretStr = SecretStr("")
-    webhook_secret_token: SecretStr = SecretStr("")
-
-    sdk_key: str = ""
-    sdk_secret: SecretStr = SecretStr("")
-
-    account_id: str = ""
-    s2s_client_id: str = ""
-    s2s_client_secret: SecretStr = SecretStr("")
-    """Server-to-Server OAuth credentials — a *separate* app from the General App
-    above. Needs the ``meeting:update:participant_rtms_app_status`` scope."""
-
-    rtms_auto_start: bool = True
-    """Ask Zoom to start RTMS ourselves when a session is created.
-
-    Zoom only emits ``meeting.rtms_started`` if RTMS was explicitly triggered, and
-    tears the stream down again if nobody attaches within about a minute. Triggering
-    it by hand means racing that window; triggering it here means the session is
-    already registered and waiting when the webhook lands. Inert unless the S2S
-    credentials above are set, so it cannot fire from an unconfigured deployment."""
-
-    api_base_url: str = "https://api.zoom.us"
-    oauth_base_url: str = "https://zoom.us"
-    api_timeout_s: float = Field(default=10.0, gt=0.0, le=60.0)
-
-    rtms_send_rate_ms: int = Field(default=20, ge=20, le=1000, multiple_of=20)
-    """RTMS audio delivery interval. 20 ms is the protocol floor; the samples
-    default to 100, which donates 80 ms of latency at the first hop (doc 003 §3.2)."""
-
-    rtms_per_participant_audio: bool = True
-    """Subscribe ``AUDIO_MULTI_STREAMS`` so the avatar's own audio can be filtered
-    by participant. Disabling it forces ``EchoGuard`` into strict gating."""
-
-    display_name: str = "AI Avatar"
-    """The name other participants see. The avatar should read as a person."""
-
-    def is_configured(self) -> bool:
-        """True when RTMS ingest credentials are present."""
-        return bool(
-            self.client_id
-            and self.client_secret.get_secret_value()
-            and self.webhook_secret_token.get_secret_value()
-        )
-
-    def is_publish_configured(self) -> bool:
-        """True when Meeting SDK publish credentials are present."""
-        return bool(self.sdk_key and self.sdk_secret.get_secret_value())
-
-    def is_rtms_auto_start_configured(self) -> bool:
-        """True when we can ask Zoom to start RTMS ourselves.
-
-        Requires the General App ``client_id`` too: it names the app RTMS starts
-        for, and Zoom rejects the call without it.
-        """
-        return bool(
-            self.rtms_auto_start
-            and self.account_id
-            and self.s2s_client_id
-            and self.s2s_client_secret.get_secret_value()
-            and self.client_id
-        )
-
-
-class TeamsSettings(BaseModel):
-    """Microsoft Teams credentials and app-hosted media sidecar settings.
-
-    Teams' real-time media is only reachable from a **Windows** host running the
-    .NET ``Microsoft.Graph.Communications.Calls.Media`` SDK, so unlike Zoom the
-    sidecar is a separate machine rather than a sibling process on a shared volume
-    (doc 005 §2). Everything here is therefore either an Azure AD credential the
-    Python bridge holds, or the network coordinates of that Windows host.
-
-    The bridge itself never calls Graph: the app-hosted media blob can only be
-    produced by the media platform inside the sidecar, so the sidecar owns the join
-    (doc 005 §3.1). The credentials below are what the *sidecar* is provisioned with;
-    they live here so a deployment configures one place, and are forwarded over the
-    IPC join message rather than being baked into the Windows image.
-    """
-
-    tenant_id: str = ""
-    client_id: str = ""
-    client_secret: SecretStr = SecretStr("")
-    """Azure AD app registration with the ``Calls.JoinGroupCall.All`` and
-    ``Calls.AccessMedia.All`` *application* permissions, admin-consented."""
-
-    sidecar_host: str = ""
-    sidecar_port: int = Field(default=8445, ge=1, le=65535)
-    sidecar_connect_timeout_s: float = Field(default=20.0, gt=0)
-    sidecar_ready_timeout_s: float = Field(default=60.0, gt=0)
-    """Longer than Zoom's: a Graph call has to be created, signalled, and negotiated
-    before media flows, where the Zoom sidecar only has to attach a local SDK."""
-    sidecar_reconnect_max_attempts: int = Field(default=10, ge=1)
-
-    sidecar_tls_enabled: bool = True
-    """The link crosses a host boundary carrying meeting audio and a bearer token,
-    so TLS is on by default and turning it off is an explicit local-dev act."""
-    sidecar_ca_file: Path | None = None
-    sidecar_client_cert_file: Path | None = None
-    sidecar_client_key_file: Path | None = None
-    """Client certificate for mutual TLS. When unset the link is server-authenticated
-    only — acceptable on a private subnet, not on a shared network."""
-
-    unmixed_audio: bool = True
-    """Request per-participant (unmixed) audio from the media platform. Teams gives
-    up to four dominant speakers with a source id, which is what lets ``EchoGuard``
-    filter by identity instead of falling back to the gate alone."""
-
-    publish_sample_rate_hz: int = Field(default=16_000, ge=8_000)
-    """PCM rate handed to the Teams media platform. Its own value rather than the
-    shared ``media.publish_sample_rate_hz`` because the two SDKs want different
-    rates, and Zoom's is already set for Zoom."""
-
-    video_width: int = Field(default=1280, ge=2)
-    video_height: int = Field(default=720, ge=2)
-    video_fps: int = Field(default=30, ge=1, le=30)
-    """Teams' send formats are an enumerated set, not a free choice — see
-    ``connectors/teams/config.py``, which validates the triple against it."""
-
-    display_name: str = "AI Avatar"
-
-    def is_configured(self) -> bool:
-        """True when the connector has everything it needs to join a meeting."""
-        return bool(
-            self.tenant_id
-            and self.client_id
-            and self.client_secret.get_secret_value()
-            and self.sidecar_host
-        )
 
 
 class GoogleMeetSettings(BaseModel):
@@ -622,8 +480,11 @@ class ZoomWebSettings(BaseModel):
     not start its capture pipeline until its device menu has a selection, and that
     selection lives in the Chromium profile.
 
-    Ingest has two modes — see ``ingest_mode``, which is the single most consequential
-    setting in this class.
+    **Ingest is the page's own audio tap**, and the roster, active speaker, chat and
+    captions are read off the DOM. There used to be a second mode here — Zoom's RTMS API,
+    a better signal in every respect — which required the meeting to be hosted on an
+    account with RTMS enabled for the app. A deployment cannot arrange that for meetings
+    other people book, so it was removed and its settings with it.
     """
 
     enabled: bool = False
@@ -633,63 +494,6 @@ class ZoomWebSettings(BaseModel):
     deliberate choice."""
 
     display_name: str = "AI Avatar"
-
-    ingest_mode: Literal["browser", "rtms"] = "browser"
-    """Where the meeting's audio and everything the avatar knows about the meeting comes from.
-
-    ``browser`` — **the default, and the reason it is the default is availability rather
-    than quality.** The page taps Zoom's own playout graph for audio, and reads the roster,
-    the active speaker, the chat and the captions off the DOM. It needs nothing from the
-    Zoom account hosting the meeting: no RTMS entitlement, no app authorisation, no
-    server-to-server credentials. The avatar joins an ordinary meeting as an ordinary
-    browser participant, which is the only thing that works when the meeting belongs to
-    whoever booked it rather than to the operator.
-
-    ``rtms`` — Zoom's Real-Time Media Streams. **A better signal in every respect**, and
-    worth selecting wherever it is available. Audio, transcript, chat and participant events
-    all arrive as data with a name attached, nothing depends on markup Zoom can rename, and
-    no panel is opened in front of the meeting. It requires the meeting to be hosted on an
-    account with RTMS enabled for this app, plus ``MC_ZOOM__*`` credentials.
-
-    What actually changes when you switch:
-
-    ============================  ==========================  =========================
-    signal                        ``rtms``                    ``browser``
-    ============================  ==========================  =========================
-    audio                         RTMS stream                 tapped from Zoom's playout
-    audio contains the avatar     yes — needs a strict gate    no — gate is a backstop
-    barge-in trigger              ``ACTIVE_SPEAKER_CHANGE``   audio energy + DOM
-    who is present                participant events          participants panel
-    who is speaking               active-speaker events       speaking indicator
-    what was said                 Zoom's per-speaker ASR      captions, if switched on
-    what was typed                chat events                 chat panel
-    two people named "Dev"        told apart by user id       one person
-    survives a Zoom UI change     yes                         selectors may need an edit
-    ============================  ==========================  =========================
-
-    The hand-raise observer reads the page in **both** modes: RTMS has no hand-raise event.
-
-    Everything downstream of ingest is identical. The ledgers, the announcer, the interrupt
-    source and every HTTP endpoint consume the same observation types either way, so a
-    session's API surface does not depend on this."""
-
-    per_participant_audio: bool = False
-    """Ask RTMS for one **mixed** stream rather than a stream per participant.
-
-    The opposite of the SDK connector's default, and for a reason specific to this
-    one: here the avatar is *in* the meeting, so RTMS carries at least two speakers.
-    ``AUDIO_MULTI_STREAMS`` then delivers their audio as separate streams, which this
-    pipeline drains into a single sequential one — splicing two speakers together and
-    handing the transcriber audio that is chopped between them. Observed live: an
-    English question came back as Indonesian fragments, and transcripts lagged by
-    fourteen seconds.
-
-    A mixed stream is one coherent conversation, which is what the transcriber wants.
-    The cost is losing per-speaker attribution — so the avatar's own voice can no
-    longer be filtered by name, and ``EchoGuard`` runs in strict gate mode instead.
-    That is the case the strict gate exists for, and it is armed by *audible* avatar
-    audio only, so a participant can still interrupt.
-    """
 
     join_timeout_s: float = Field(default=90.0, gt=0)
     """Generous, because it spans a waiting room: failing early turns a slow host
@@ -734,7 +538,7 @@ class ZoomWebSettings(BaseModel):
     **This connector needs a far longer hangover than the shared default, and the reason is
     specific to it.** RTMS delivers the meeting's mix *including the avatar*, so the avatar's
     own voice comes back — page → Zoom encode → Zoom mix → RTMS → us — with a round trip well
-    over a second. A mixed stream carries no per-frame attribution, so ``SelfAudioFilter``
+    over a second. A mixed stream carries no per-frame attribution, so name-based filtering
     cannot bite (it matches on a name that is only present with per-participant audio), which
     leaves the speaking gate as the only defence. At 200 ms the gate reopens long before the
     *tail* of each utterance arrives, and that tail is forwarded to the agent, transcribed,
@@ -760,23 +564,22 @@ class ZoomWebSettings(BaseModel):
     to the avatar is being clipped. The gate is also released the moment an interruption is
     delivered, so a barge-in does not have to wait this out — see ``MediaRouter._yield_floor``.
 
-    **None of the above applies under ``ingest_mode="browser"``, and leaving a large value
-    set there is actively harmful.** Everything here follows from RTMS delivering the mix
-    with the avatar in it. The page tap does not: Zoom does not play a participant their own
-    microphone, and the synthetic microphone is built in an ``AudioContext`` that never
-    connects to a destination, so the avatar's voice is structurally absent from the tapped
-    audio. The gate therefore runs as a *backstop* rather than as the only defence, and
-    barge-in is detected from audio energy — which a long hangover would make deaf, exactly
-    the failure this connector used to have. Leave it unset in browser mode.
+    **A large value here is actively harmful, which is why it is unset by default.** The
+    reasoning above came from the removed RTMS leg, which delivered the mix with the avatar
+    in it. The page tap does not: Zoom does not play a participant their own microphone, and
+    the synthetic microphone is built in an ``AudioContext`` that never connects to a
+    destination, so the avatar's voice is structurally absent from the tapped audio. The gate
+    therefore runs as a *backstop* rather than as the only defence, and barge-in is detected
+    from audio energy — which a long hangover would make deaf, exactly the failure this
+    connector used to have.
     """
 
-    # -- browser ingest ----------------------------------------------------
+    # -- the page's observers ----------------------------------------------
     #
-    # Read only when ``ingest_mode`` is ``browser``. These tune the page-side observers
-    # that stand in for the RTMS streams; the *consumer* switches further down
-    # (``attendance_enabled``, ``transcript_enabled``, …) still decide whether a signal is
-    # wanted at all, in both modes. An observer whose consumer is off is never started, so
-    # a deployment that has turned everything off scans nothing.
+    # These tune the page-side observers. The *consumer* switches further down
+    # (``attendance_enabled``, ``transcript_enabled``, …) decide whether a signal is wanted
+    # at all. An observer whose consumer is off is never started, so a deployment that has
+    # turned everything off scans nothing.
 
     capture_frame_ms: int = Field(default=20, ge=10, le=60)
     """Length of one tapped audio frame, in milliseconds.
@@ -813,7 +616,7 @@ class ZoomWebSettings(BaseModel):
     This is *reading*, not enabling — see ``captions_auto_enable``. Costs nothing and finds
     nothing in a meeting with captions off, which is why it can default to true.
 
-    Under ``ingest_mode="browser"`` this is the only source of **who said what**, and that
+    This is the only source of **who said what**, and that
     question is otherwise unanswerable in principle: the agent's own transcription receives
     one mixed stream and knows the words without knowing whose they are, while the speaker
     observer knows who is talking without knowing the words."""
@@ -852,8 +655,7 @@ class ZoomWebSettings(BaseModel):
 
     The asymmetry is deliberate: there is no layout in which Zoom invents a participant, so an
     arrival is believed at once. Raise this if the roster still flaps; lower it if a real
-    departure takes too long to reach the agent. Unused under ``ingest_mode="rtms"``, where
-    joins and leaves are Zoom's own events and exact."""
+    departure takes too long to reach the agent."""
 
     speech_interrupt_threshold: int = Field(default=350, ge=0)
     """Floor under the energy a voice must reach to take the floor from the avatar, in
@@ -863,11 +665,6 @@ class ZoomWebSettings(BaseModel):
     the meeting — so this only decides how quiet a room has to be before the learned floor
     stops mattering, and its job is to stop a near-silent meeting setting a bar low enough
     that line noise interrupts the avatar. See ``services/media/speech_detector.py``.
-
-    **Only reachable under ``ingest_mode="browser"``.** Energy-based barge-in requires the
-    echo gate to be open, which requires the avatar's own voice to be absent from inbound
-    audio — true of the page tap and false of RTMS. Under RTMS the trigger is Zoom's
-    active-speaker event instead and this is not read.
 
     Raise it if the avatar stops for a keyboard or a passing truck; lower it if a softly
     spoken interruption is ignored. One caveat before tuning: a participant listening on
@@ -897,59 +694,14 @@ class ZoomWebSettings(BaseModel):
 
     # -- meeting awareness -------------------------------------------------
     #
-    # **What serves these depends on ``ingest_mode``**, and that is the one thing to hold in
-    # mind reading them. Under ``rtms`` they turn *subscriptions and ledgers* on and off:
-    # Zoom reports who joined, who left, who is speaking, what each person said and what they
-    # typed, each with a name attached. Under ``browser`` the same switches turn *DOM
-    # observers* on and off and the connector looks much more like ``GoogleMeetSettings``.
-    #
-    # ``hand_raise_enabled`` is read the same way in both, because RTMS has no hand-raise
-    # event and the indicator exists only on screen.
-
-    rtms_transcript_enabled: bool = True
-    """Subscribe to Zoom's live transcript, so the avatar knows **who said what**.
-
-    This is what makes an avatar able to answer *"what did they ask you?"* and *"what did
-    Dev say?"*, and those questions are otherwise unanswerable in principle: the avatar's
-    own transcription lives in the agent, which receives one mixed stream and knows the
-    words without knowing whose they are, while this connector knows who is speaking
-    without knowing the words. Zoom transcribes per participant, so its transcript is the
-    only place the two arrive together.
-
-    **Requires RTMS transcription to be enabled for the app on the Zoom account.** If it is
-    not, Zoom refuses the data handshake — and because a refused handshake ends the whole
-    connection, the connector retries once with audio alone rather than letting the avatar
-    go deaf. The reason then appears in the ingest component's health detail. Set this
-    false to stop asking.
-
-    Invisible to the meeting: nobody sees the avatar enable anything, and no participant's
-    own caption setting changes."""
-
-    rtms_chat_enabled: bool = True
-    """Subscribe to the meeting's chat over RTMS.
-
-    Zoom delivers each message with the sender's name, so no panel is opened and nothing is
-    scraped — the whole visible-UI-action objection that makes ``chat_enabled`` a judgement
-    call on Google Meet does not apply here. Same handshake caveat as
-    ``rtms_transcript_enabled``.
-
-    This controls whether messages *arrive*. Whether the avatar answers them is
-    ``chat_enabled``, and whether they are remembered is ``transcript_enabled`` — three
-    different questions that were one setting until it became clear they were not."""
-
-    rtms_events_enabled: bool = True
-    """Subscribe to participant join/leave and active-speaker events.
-
-    The source of attendance, of who-is-speaking, and of voice barge-in. Best-effort by
-    construction: some accounts deliver these unsolicited, so a rejected subscription is
-    never allowed to fail an attach that otherwise succeeded."""
+    # Each of these turns a *DOM observer* and its ledger on or off, which is why this class
+    # reads much like ``GoogleMeetSettings`` from here down.
 
     chat_enabled: bool = True
     """Forward meeting chat to the avatar agent, so a typed question gets a spoken answer.
 
-    Requires ``rtms_chat_enabled``, which is what makes the messages arrive at all. Turn
-    this off — with ``rtms_chat_enabled`` left on — for an avatar that never replies to the
-    chat but still remembers what was typed when asked to summarise the meeting."""
+    Turn this off — with ``transcript_enabled`` left on — for an avatar that never replies
+    to the chat but still remembers what was typed when asked to summarise the meeting."""
 
     chat_require_mention: bool = True
     """Answer only chat messages that ``@``-tag the avatar, ignoring the rest of the room.
@@ -959,9 +711,9 @@ class ZoomWebSettings(BaseModel):
     that was not talking to it. With this on, "@AI Avatar what is the notice period?" is
     answered while "sounds good, thanks!" and "did the avatar join?" are not.
 
-    Zoom's chat box offers an ``@`` autocomplete, but what reaches RTMS is plain text with
-    no participant token in it — so the ``@`` is the only deliberate signal that survives
-    the wire, and it is **required**. What follows it is matched loosely, ignoring case and
+    Zoom's chat box offers an ``@`` autocomplete, but what the page can read back is plain
+    text with no participant token in it — so the ``@`` is the only deliberate signal that
+    survives, and it is **required**. What follows it is matched loosely, ignoring case and
     optional separators, so ``@AI Avatar``, ``@ai_avatar`` and ``@AIAvatar`` all count; the
     name must still stand as whole words, so ``@Aisha`` does not trigger an avatar named
     "AI". The mention is stripped before the text reaches the agent.
@@ -979,7 +731,7 @@ class ZoomWebSettings(BaseModel):
     transcript_enabled: bool = True
     """Keep a ledger of what each person said — spoken and typed — for the whole meeting.
 
-    Fed by whichever of ``rtms_transcript_enabled`` and ``rtms_chat_enabled`` are on, and
+    Fed by the caption and chat observers, and
     it is worth having with either: a meeting held largely in chat still has a conversation
     to remember, and gating the ledger on the transcript alone would leave that deployment
     able to answer every question except what was asked.
@@ -991,7 +743,7 @@ class ZoomWebSettings(BaseModel):
     """Keep a record of who was in the meeting, so the agent can be asked about it later.
 
     On by default because it costs nothing: no scanning, no visible action, and no extra
-    traffic — it accumulates the participant events ``rtms_events_enabled`` already
+    traffic — it accumulates the participant events the roster observer already
     subscribes to.
 
     What it makes answerable: who is here now, who was here and left, who rejoined, and —
@@ -1155,12 +907,12 @@ class ZoomWebSettings(BaseModel):
 class TeamsWebSettings(BaseModel):
     """Microsoft Teams joined with a browser, publishing through a synthetic microphone.
 
-    **Why this exists alongside ``TeamsSettings``.** That connector is the better one where
-    it can run: Graph's app-hosted media gives per-participant audio with a source id, no
-    DOM anywhere, and a single session carrying both directions. It also needs an Azure AD
-    app registration with admin-consented ``Calls.AccessMedia.All`` **in the tenant that
-    owns the meeting**, plus a Windows host running the .NET media SDK. A deployment that
-    joins meetings other people booked can obtain neither.
+    **There used to be a second Teams connector**, and it was the better one where it could
+    run: Graph's app-hosted media gives per-participant audio with a source id, no DOM
+    anywhere, and a single session carrying both directions. It also needed an Azure AD app
+    registration with admin-consented ``Calls.AccessMedia.All`` **in the tenant that owns
+    the meeting**, plus a Windows host running the .NET media SDK. A deployment that joins
+    meetings other people booked can obtain neither, so it was removed.
 
     This connector needs neither. The avatar joins the ordinary Teams web client as an
     anonymous guest — the same thing a person clicking a meeting link without a Teams
@@ -1168,10 +920,8 @@ class TeamsWebSettings(BaseModel):
     by tapping the page's own playout graph. The whole cost is that everything it knows
     about the meeting is read off a DOM Microsoft is free to change.
 
-    Structurally this is ``ZoomWebSettings`` with the RTMS half removed, because there is no
-    RTMS equivalent: Teams' event streams live behind the same Graph entitlement the other
-    connector needs. So there is one ingest mode here rather than two, and every awareness
-    switch below turns a **DOM observer** on or off.
+    Structurally this is ``ZoomWebSettings``: one ingest leg, and every awareness switch
+    below turning a **DOM observer** on or off.
     """
 
     enabled: bool = False
@@ -1629,16 +1379,6 @@ class MediaSettings(BaseModel):
         )
 
 
-class SidecarSettings(BaseModel):
-    """C++ publisher sidecar IPC settings (M5)."""
-
-    uds_path: Path = Path("/run/meeting-connectors/sidecar.sock")
-    connect_timeout_s: float = Field(default=15.0, gt=0)
-    heartbeat_interval_s: float = Field(default=2.0, gt=0)
-    heartbeat_timeout_s: float = Field(default=6.0, gt=0)
-    reconnect_max_attempts: int = Field(default=10, ge=1)
-
-
 class Settings(BaseSettings):
     """Root application settings."""
 
@@ -1654,11 +1394,8 @@ class Settings(BaseSettings):
     env: Environment = Environment.LOCAL
 
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
-    zoom: ZoomSettings = Field(default_factory=ZoomSettings)
-    teams: TeamsSettings = Field(default_factory=TeamsSettings)
     google_meet: GoogleMeetSettings = Field(default_factory=GoogleMeetSettings)
     zoom_web: ZoomWebSettings = Field(default_factory=ZoomWebSettings)
     teams_web: TeamsWebSettings = Field(default_factory=TeamsWebSettings)
     avatar: AvatarSettings = Field(default_factory=AvatarSettings)
     media: MediaSettings = Field(default_factory=MediaSettings)
-    sidecar: SidecarSettings = Field(default_factory=SidecarSettings)

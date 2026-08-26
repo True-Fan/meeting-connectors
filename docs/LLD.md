@@ -2,7 +2,7 @@
 
 This is the internals reference for `meeting-connectors` itself. Read [HLD.md](HLD.md) first
 if you haven't — this doc assumes you know why the system is shaped the way it is and focuses
-on how. Platform-specific mechanics (RTMS handshakes, browser injection) live in the
+on how. Platform-specific mechanics (selectors, page injection) live in the
 [connector docs](README.md#start-here); this doc covers everything shared, plus how the
 per-platform pieces plug into it.
 
@@ -18,7 +18,7 @@ src/
 ├── domain/           Canonical model. Depends on nothing else in src/.
 ├── protocols/        The ports every connector implements — six of them
 ├── connectors/       Adapters. The ONLY place a platform SDK/API may appear.
-│   ├── zoom_web/     Browser join · RTMS or page-tapped ingest
+│   ├── zoom_web/     Browser join · page-tapped ingest
 │   ├── teams_web/    Browser join · page-tapped ingest
 │   └── google_meet/  Browser join · page-tapped ingest (Meet has no publish API at all)
 ├── services/
@@ -39,12 +39,13 @@ never import each other; no relative imports anywhere in `src/`.
 ## 2. API layer (`src/api/`)
 
 `app.py` — `create_app(container=None)` factory (no module-level `app`, so tests get real
-isolation). Mounts `CorrelationIdMiddleware`, then `health`, `metrics`, `sessions`,
-`participants` routers, then two connector-owned routers resolved **from the container**
-rather than imported (`container.zoom_webhook_router()` at `/webhooks/zoom`,
-`container.zoom_oauth_router()`) — so `api/` never names a connector even though one of its
-mounted routes is Zoom-specific. Lifespan: on shutdown, drains every session
-(`meeting_service().stop_all()`) so a redeploy never leaves a bot talking to an empty room.
+isolation). Mounts `CorrelationIdMiddleware`, then the `health`, `metrics`, `sessions` and
+`participants` routers — and nothing else. There were once two connector-owned routers
+resolved from the container (a Zoom RTMS webhook at `/webhooks/zoom` and its app-install OAuth
+callback); both went with the Meeting-SDK connector, so there is no platform-specific HTTP
+surface left and every connector is driven entirely by `POST /sessions`. Lifespan: on shutdown,
+drains every session (`meeting_service().stop_all()`) so a redeploy never leaves a bot talking
+to an empty room.
 
 ### `routers/sessions.py` — lifecycle (prefix `/sessions`)
 
@@ -62,14 +63,15 @@ mounted routes is Zoom-specific. Lifespan: on shutdown, drains every session
   "meeting_number": "1234567890",   // required; also accepts a full join URL for Teams
   "passcode": "abc123",             // optional
   "display_name": "AI Avatar",      // optional
-  "platform": "zoom",               // MeetingPlatform enum; defaults to "zoom"
-  "meeting_url": null,               // Teams/Meet/Zoom-web use this instead of/with meeting_number
-  "meeting_uuid": null               // Zoom only — pins an inbound RTMS stream to this exact session
+  "platform": "zoom_web",           // MeetingPlatform enum; defaults to "zoom_web"
+  "meeting_url": null                // used instead of/with meeting_number where a link is to hand
 }
 ```
 
-`SessionResponse` reports `audio_attached` — platform-dependent: for Zoom, `True` only once
-`meeting_uuid` is bound (i.e. RTMS attached); for everything else, `state.is_running`.
+`SessionResponse` reports `audio_attached`, which is `state.is_running` for every platform:
+each connector opens its ingest leg inside its own join, so a running session is both
+publishing and listening. (This was once platform-dependent — the removed Meeting-SDK Zoom
+connector attached ingest only when an RTMS webhook supplied a `meeting_uuid`.)
 
 ### `routers/participants.py` — attendance/speakers/transcript (also `/sessions` prefix)
 
@@ -186,12 +188,12 @@ the component itself. **Reconnect is always the component's own job** (e.g.
 `AvatarClient.reconnect()` under a `ReconnectPolicy`); the supervisor only judges when a
 session is *beyond* recovery.
 
-`SessionRegistry` is in-memory (not persisted), indexed by id, meeting number, and (for
-Zoom-web) RTMS `meeting_uuid`. It also holds the **join/RTMS race** table: a
-`PendingRtmsBinding` can arrive (via webhook) before the session that should claim it exists,
-or vice versa. `DEFAULT_PENDING_TTL_S = 45.0`, deliberately under Zoom's own ~60s
-auto-teardown window — a documented production incident used 300s and attached sessions to
-already-dead streams.
+`SessionRegistry` is in-memory (not persisted), indexed by id and meeting number. It used to
+carry a third index and a **join/RTMS race** table — a binding delivered by webhook could
+arrive before the session that should claim it, or vice versa, so unclaimed bindings were
+parked with a TTL. That was the removed Meeting-SDK Zoom connector's problem: *Zoom* initiated
+its ingest, not the bridge. Every remaining connector opens ingest synchronously inside
+`start()`, so there is no second initiator and no arrival order to reconcile.
 
 ## 6. Meeting service (`src/services/meeting/`)
 
@@ -203,22 +205,15 @@ already-dead streams.
    allocating anything, so an unsupported/unconfigured platform fails in one step with a
    named error instead of partway through a join.
 3. Build a fresh `SessionContext`/`MeetingContext`.
-4. Zoom-web only: try to claim any RTMS binding already parked in the registry
-   (`_claim_pending_rtms`).
-5. Register the session, call `factory.build(session)`, transition to `JOINING`, `await
+4. Register the session, call `factory.build(session)`, transition to `JOINING`, `await
    connector_session.start()`. Any exception here fails the session and re-raises as a
    service error (→ the API's 409/500).
-6. Hand the running session to `SessionSupervisor.supervise()` and return.
+5. Hand the running session to `SessionSupervisor.supervise()` and return.
 
 `ConnectorRegistry` is a plain `{MeetingPlatform: ConnectorSessionFactory}` lookup table —
 `register()` refuses to silently replace an existing entry, `get()` raises a named
 `UnsupportedPlatformError` listing what *is* supported. No lifecycle or negotiation logic
 lives here; adding a connector is one `register()` call, made from `containers.py`.
-
-Zoom's webhook handler calls back into this service too: `bind_rtms(binding)` looks the
-session up by uuid, falls back to "the one session currently waiting for RTMS" if there's
-exactly one, or parks the binding if neither exists yet; `handle_rtms_stopped()` tears the
-matching session down.
 
 ## 7. The shared media pipeline (`src/services/media/`)
 
@@ -243,7 +238,7 @@ has no coherent backpressure story.
 
 - **`MediaClock`** — one monotonic clock rooted at session start; every PTS is expressed on
   it. Exists because a connector's ingest and publish are separate paths with real desync
-  risk (decode-completion time ≠ presentation time) — RTMS frames get their PTS stamped from
+  risk (decode-completion time ≠ presentation time) — inbound frames get their PTS stamped from
   this clock, never from the platform's own timestamp, for the same reason.
 - **`DecodePipeline`** — owns one `MediaDecoder` and its restart policy (max 5 restarts).
   Caches the fMP4 **init segment** (`ftyp+moov`) and replays it on every restart — without
@@ -258,7 +253,7 @@ has no coherent backpressure story.
   by `user_id`, precise but needs per-participant attribution; (2) a **speaking gate** — while
   the avatar is audibly publishing, plus a hangover window afterward (default 200ms, tunable
   per connector), drop all inbound audio regardless of attribution. Runs in strict mode
-  automatically when no per-participant attribution exists (e.g. a mixed RTMS stream, or any
+  automatically when no per-participant attribution exists (e.g. a page-tapped mix, or any
   browser connector where the avatar's own audio never reaches the tap at all — see the
   per-connector docs for which case applies where).
 - **`Pacer`** — releases decoded frames at their PTS (late video is dropped, not
@@ -337,7 +332,7 @@ default.
 - **`reconnect.py`** — `ReconnectPolicy(initial_delay_s, max_delay_s, max_attempts,
   multiplier)`, exponential backoff with **full jitter** (a uniform draw, not a fixed
   fraction) to decorrelate simultaneous reconnect storms. Shared by the avatar client, the
-  RTMS handshake, and Google Meet's browser relaunch logic.
+  page channel, and Google Meet's browser relaunch logic.
 - **`context.py`** — `ContextVar`-based ambient session/correlation id, propagated into child
   asyncio tasks automatically, read by the logging processor. Frames never rely on this
   ambient state for correctness (they carry an explicit `FrameContext`, since a frame can
@@ -390,7 +385,7 @@ what lets each connector be built and verified before its real infrastructure ex
 |---|---|
 | Streaming Avatar Agent | `FakeAvatarTransport` (in-process); `FileSink`/`NullSink` on the publish side make output watchable/countable without any platform integration |
 | A real browser | `BrowserDriver` is a `Protocol`; tests substitute a fake driver, so join/selector/observer logic is exercised without Playwright installed |
-| Zoom RTMS | `JsonWebSocket` is a `Protocol` seam; the handshake state machine is tested against an in-memory fake |
+| Page channel | The loopback WebSocket server is injectable; the codec is tested against in-memory frames |
 
 This is also why each connector's own status section can honestly separate what's been run
 against a live meeting from what's only been verified against these stand-ins — the protocol

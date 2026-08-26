@@ -2,8 +2,8 @@
 
 Two responsibilities, deliberately separate: deciding whether a message was addressed to
 the avatar at all, and handing the survivors to the router as they arrive. Parsing is not
-one of them — Zoom delivers a chat message over RTMS with the sender's name on it, so
-``connectors/zoom/rtms/mapping.to_chat_message`` has already produced a domain
+one of them — the page reads a chat row with the sender's name beside it, so
+``meeting/observer.py`` has already produced a domain
 ``ChatMessage`` before anything here runs. The Meet connector's equivalent spends most of
 its length reconstructing that from a DOM.
 
@@ -13,7 +13,7 @@ that speaks up after every line is interrupting a room that was not talking to i
 Requiring the tag makes answering opt-in per message, which is how a person in the room
 behaves.
 
-**Why the page cannot be trusted to decide it, and here neither can RTMS.** What deserves
+**Why the page cannot be trusted to decide it.** What deserves
 an answer is policy, and policy lives in Python beside the settings that govern it. Zoom
 reports what was typed; this decides what it means.
 """
@@ -44,7 +44,7 @@ def _mention_pattern(name: str) -> re.Pattern[str] | None:
     """A compiled matcher for one name the avatar answers to, or ``None`` if unusable.
 
     **The ``@`` is required.** Zoom's chat box does offer an ``@`` autocomplete, but what
-    arrives over RTMS is plain text with no participant token in it — so the ``@`` is the
+    arrives off the page is plain text with no participant token in it — so the ``@`` is the
     only deliberate signal that survives the wire, and it is the difference between talking
     *to* the avatar and talking *about* it. "did the AI avatar join?" is a question for the
     room; "@AI Avatar are you there?" is a question for the avatar.
@@ -96,7 +96,7 @@ def strip_mention(text: str, names: Sequence[str]) -> str | None:
 
 
 class ZoomChatSource:
-    """``ChatSource`` fed by RTMS chat messages.
+    """``ChatSource`` fed by the page's chat messages.
 
     A bounded queue, and small: chat arrives at human typing speed, so anything that fills
     this is a malfunction rather than load. Overflow drops the *newest* — the opposite of
@@ -154,7 +154,7 @@ class ZoomChatSource:
         return self._mention_names
 
     def observe_self_name(self, name: str | None) -> None:
-        """Add a name the avatar answers to. Never raises; called from the RTMS pump."""
+        """Add a name the avatar answers to. Never raises; called from the page read loop."""
         cleaned = " ".join(str(name or "").split())
         if not cleaned:
             return
@@ -207,9 +207,9 @@ class ZoomChatSource:
         self._started = False
 
     def offer(self, message: ChatMessage) -> bool:
-        """Accept one chat message from RTMS. Never blocks, never raises.
+        """Accept one chat message from the page. Never blocks, never raises.
 
-        Called from the RTMS pump, which is the media channel — so this must not be able to
+        Called from the page read loop, which is the media channel — so this must not be able to
         stall it or throw into it. Both properties are why it is a plain method returning a
         bool rather than a coroutine that might await.
         """
@@ -227,7 +227,7 @@ class ZoomChatSource:
         # the sender's display name and nothing that says "this is you", so ``is_self``
         # arrives False on the avatar's own line. Left as it was, an avatar that ever posts
         # to the chat would answer itself — the text-channel version of the echo loop
-        # ``SelfAudioFilter`` exists to break.
+        # the removed name-based self-audio filter existed to break.
         if not message.is_self and self._is_self(message.sender):
             message = replace(message, is_self=True)
 

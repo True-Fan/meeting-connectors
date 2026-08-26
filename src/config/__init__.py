@@ -3,19 +3,21 @@
 from src.config.settings import (
     AvatarSettings,
     Environment,
+    GoogleMeetSettings,
     MediaSettings,
     ObservabilitySettings,
     Settings,
-    SidecarSettings,
-    ZoomSettings,
+    TeamsWebSettings,
+    ZoomWebSettings,
 )
 
 __all__ = [
     "AvatarSettings",
     "Environment",
+    "GoogleMeetSettings",
     "MediaSettings",
     "ObservabilitySettings",
     "Settings",
-    "SidecarSettings",
-    "ZoomSettings",
+    "TeamsWebSettings",
+    "ZoomWebSettings",
 ]

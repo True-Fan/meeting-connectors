@@ -130,7 +130,7 @@ class PageAudioServer:
     def set_audio_handler(self, handler: AudioHandler | None) -> None:
         """Register where tapped meeting audio goes. ``None`` discards it.
 
-        ``None`` is the normal state under RTMS ingest: the page is not asked to tap
+        ``None`` before the page has attached: it is not yet asked to tap
         anything, so nothing arrives, and a frame that did arrive would be a script left
         over from a previous configuration rather than something to route.
         """
@@ -291,7 +291,7 @@ class PageAudioServer:
         listening to the wrong frame; dispatching all of them costs a duplicate hand-raise
         event, which is exactly what the per-participant cooldown downstream is for.
 
-        The handler's exceptions are swallowed for the reason ``RtmsService._notify``
+        The handler's exceptions are swallowed for the reason the observer's ``_safe``
         swallows its observer's: this is the loop that carries the avatar's voice into the
         page, and a bookkeeping listener may not be able to close it.
         """

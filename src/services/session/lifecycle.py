@@ -83,8 +83,8 @@ class SessionLifecycle:
     def heartbeat(self, session: SessionContext) -> None:
         """Record liveness.
 
-        Distinct from RTMS's ``msg_type 12``/``13``, which is a Zoom wire detail owned
-        by ``connectors/zoom/rtms/keepalive.py``. This is session liveness — a domain
+        Distinct from any transport-level ping a connector's own channel runs, which is
+        a wire detail owned by that connector. This is session liveness — a domain
         concern (doc 002 §1.2 D6).
         """
         session.last_heartbeat_at = datetime.now(UTC)

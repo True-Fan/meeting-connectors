@@ -1,4 +1,4 @@
-"""The one place RTMS observations are fanned out to the things that remember them.
+"""The one place the page's observations are fanned out to the things that remember them.
 
 **Why this exists rather than five listeners registered on the service.** The Google Meet
 connector registers roster listeners individually, which is right there: its roster is one
@@ -13,25 +13,25 @@ subscriptions would leave the order implicit and the derivation duplicated.
 
 So this is the wiring, written down once, in the order it has to happen.
 
-**Every method here is synchronous and total**, because ``RtmsService`` calls them from the
-media and signaling pumps — the loops that also carry the meeting's audio. The service
-guards against an exception anyway (``RtmsService._notify``), and this does not rely on
-that: each consumer already swallows its own, so the belt and the braces are both present
-on the path where the cost of being wrong is the meeting going silent.
+**Every method here is synchronous and total**, because the page server calls them from its
+read loop — the loop that also carries the avatar's voice into the page. That loop guards
+against an exception anyway, and this does not rely on it: each consumer already swallows its
+own, so the belt and the braces are both present on the path where the cost of being wrong is
+the meeting going silent.
 """
 
 from __future__ import annotations
 
-from src.connectors.zoom.rtms.observations import (
-    ParticipantEvent,
-    SpeakerEvent,
-    TranscriptLine,
-)
 from src.connectors.zoom_web.meeting.active_speaker import ZoomSpeakerTracker
 from src.connectors.zoom_web.meeting.attendance import ZoomAttendanceLedger
 from src.connectors.zoom_web.meeting.chat import ZoomChatSource
 from src.connectors.zoom_web.meeting.hand_raise import ZoomInterruptSource
 from src.connectors.zoom_web.meeting.transcript import ZoomTranscript
+from src.connectors.zoom_web.observations import (
+    ParticipantEvent,
+    SpeakerEvent,
+    TranscriptLine,
+)
 from src.domain.meeting import ChatMessage
 from src.infrastructure.logging import get_logger
 from src.services.media.clock import MediaClock
@@ -48,10 +48,10 @@ def _safe(name: str, call: object, *args: object) -> None:
     list rather than an accident. This way a bug in the transcript costs the transcript
     and the chat source still sees the message.
 
-    Redundant with ``RtmsService._notify``, deliberately. That guard protects the
-    connection; this one protects the other consumers, and neither substitutes for the
-    other. Each consumer also guards itself, which is why nothing here is expected to fire
-    — a log line from this function means something is wrong that nobody predicted.
+    Redundant with the page server's own guard, deliberately. That one protects the socket;
+    this one protects the other consumers, and neither substitutes for the other. Each
+    consumer also guards itself, which is why nothing here is expected to fire — a log line
+    from this function means something is wrong that nobody predicted.
     """
     try:
         call(*args)  # type: ignore[operator]
@@ -60,7 +60,7 @@ def _safe(name: str, call: object, *args: object) -> None:
 
 
 class ZoomMeetingObserver:
-    """Routes RTMS observations to the ledger, tracker, transcript, chat and interrupts.
+    """Routes the page's observations to the ledger, tracker, transcript, chat and interrupts.
 
     Every collaborator is optional, and an absent one means that feature is switched off —
     never a fault. A session with attendance disabled and chat enabled builds this with a
@@ -96,8 +96,8 @@ class ZoomMeetingObserver:
         self._transcript = transcript
         self._chat = chat
         self._interrupts = interrupts
-        # Optional so the RTMS path builds this exactly as it did before browser ingest
-        # existed: those observations arrive already stamped, so nothing there needs a clock.
+        # Optional only so a test can build this without one. The page's observations carry
+        # no time of their own, so in the connector it is always supplied.
         self._clock = clock
         # Casefolded name -> the name as the page spelled it. **Held here rather than read
         # back off the ledger**, and the difference shows up in one specific case: the ledger
@@ -194,21 +194,15 @@ class ZoomMeetingObserver:
     def on_page_event(self, event: dict[str, object]) -> None:
         """One JSON event from the injected page script. Never raises.
 
-        **What arrives here depends on the ingest mode**, and the branch below is the same
-        list either way — the page simply does not emit most of it under RTMS ingest.
+        **Everything the avatar knows about the meeting arrives here**: the roster, the active
+        speaker, the captions, the chat, a raised hand, and the diagnostics that say whether
+        each observer is actually finding anything. This connector once read most of that from
+        Zoom's RTMS stream instead, which required the meeting to be hosted on an
+        RTMS-enabled account; the page is what removes that requirement.
 
-        Under ``rtms``: a raised hand, and the diagnostics that say whether the observer
-        looking for one is running. Everything else about the meeting comes from RTMS with a
-        name attached.
-
-        Under ``browser``: all of it. The roster, the active speaker, the captions and the
-        chat are read off the page because there is no RTMS connection to read them from —
-        that being the entire point of the mode, which exists so the meeting does not have to
-        be hosted on an RTMS-enabled account.
-
-        Each branch translates into the *same observation types* the RTMS path produces and
-        hands them to the *same consumers*, which is why none of the ledgers below knew this
-        was added.
+        Each branch translates into one of this connector's observation types and hands it to
+        the same consumers, so nothing below this method knows the difference between a DOM
+        sweep and an event stream.
         """
         try:
             kind = str(event.get("type") or "")
@@ -271,7 +265,7 @@ class ZoomMeetingObserver:
         if self._interrupts is not None:
             self._interrupts.offer_hand(self._named(dict(event)))
 
-    # -- browser ingest: the page's observations, as RTMS observations -------
+    # -- the page's observations, translated -------------------------------
 
     def _on_roster(self, event: dict[str, object]) -> None:
         """A list of who the page can see, turned into joins and leaves.
@@ -349,12 +343,12 @@ class ZoomMeetingObserver:
     def _participant(self, name: str, *, joined: bool, at_us: int) -> None:
         """Feed one derived join/leave to the same consumers ``on_participant`` feeds.
 
-        ``user_id=None`` throughout, and that is a real difference from the RTMS path rather
-        than a placeholder. Zoom's participant id identifies a *presence* and is what lets
-        the RTMS path tell two people with the same display name apart; a DOM has no such
-        thing. ``ZoomAttendanceLedger`` already keys on the name — it has to, because ids are
-        minted afresh on a rejoin — so nothing downstream breaks. What is genuinely lost is
-        the ability to distinguish two participants who are both called "Dev".
+        ``user_id=None`` throughout, and that is a real loss rather than a placeholder. A
+        participant id identifies a *presence*, which is what would let two people with the
+        same display name be told apart; a DOM has no such thing. ``ZoomAttendanceLedger``
+        already keys on the name — it has to, because ids are minted afresh on a rejoin — so
+        nothing downstream breaks. What is genuinely lost is the ability to distinguish two
+        participants who are both called "Dev".
         """
         event = ParticipantEvent(
             user_id=None, display_name=name, joined=joined, at_us=at_us
@@ -420,9 +414,8 @@ class ZoomMeetingObserver:
     def _now_us(self) -> int:
         """Media-clock time, or zero when this observer has no clock.
 
-        The clock is optional because the RTMS path stamps its own events and never calls
-        this. Zero is what the observation types already default to, so an unclocked observer
-        behaves exactly as one built before the clock existed.
+        Zero is what the observation types already default to, so an observer built without a
+        clock — which only a test does — degrades to unstamped rather than failing.
         """
         if self._clock is None:
             return 0

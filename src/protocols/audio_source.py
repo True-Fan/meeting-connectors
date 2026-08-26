@@ -2,7 +2,11 @@
 
 Implementations:
 
-* ``connectors.zoom.rtms.RtmsAudioSource`` — live Zoom participant audio (M2)
+* ``connectors.zoom_web.ingest.PageAudioSource`` — Zoom meeting audio, tapped out of
+  the page's playout graph
+* ``connectors.teams_web.ingest.PageAudioSource`` — the same, for Teams
+* ``connectors.google_meet.audio_capture.MeetAudioSource`` — Meet audio over the
+  Chromium bridge
 * ``tests.fakes.ReplayAudioSource`` — a recorded PCM file, so the whole pipeline
   can be exercised with no live meeting (M2)
 

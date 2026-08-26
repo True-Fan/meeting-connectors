@@ -6,7 +6,7 @@ and video out over its own socket. Either can fail and recover without the other
 which is why ``ZoomMeetingSession`` holds two separately-supervised legs.
 
 Teams has one: a single ``LocalMediaSession`` bound to a single Graph call carries both
-directions, so ``TeamsSidecarLink`` owns it and both legs report its health.
+directions, so one object owns it and both legs report its health.
 
 Google Meet is like Teams in that respect and more so. **One browser tab is the
 participant.** The inbound tap and the outbound synthetic devices are the same page, in the
@@ -366,7 +366,7 @@ class ChromiumBridge:
         # Injectable so the entire Meet pipeline can be exercised against an in-process
         # fake page — no Chromium, no Google account, no meeting. That is what makes this
         # connector developable and testable on the machines we actually have, and it is
-        # the same move ``TeamsSidecarLink`` makes with its ``client_factory``.
+        # the same move the removed Teams sidecar link made with its ``client_factory``.
         self._driver_factory = driver_factory or PlaywrightDriver
         self._selectors = selectors or DEFAULT_SELECTORS
         # Left unbuilt when not injected. ``profile_dir`` is optional — an unconfigured
@@ -421,7 +421,7 @@ class ChromiumBridge:
         unsigned-in profile, a missing Chromium, an invalid meeting code, or a host who
         denies entry then fails ``POST /sessions`` with a precise reason, instead of
         returning 202 and leaving an operator to discover from a health endpoint that the
-        avatar never arrived. The same choice ``TeamsSidecarLink.start`` makes.
+        avatar never arrived. The same choice the removed Teams sidecar link made.
 
         Raises:
             MeetConfigurationError: the connector is not configured.
@@ -964,7 +964,7 @@ class ChromiumBridge:
         ``_read_loop`` on a browser that was never launched — which would block forever on a
         channel with nothing behind it and leave the reconnect budget permanently unspent,
         so the leg would sit unhealthy without ever being declared failed. Same shape as
-        ``TeamsSidecarLink._rejoin`` and ``MeetingPublisher.reconnect``, deliberately.
+        the two removed sidecar connectors' reconnect paths, deliberately.
 
         Returns:
             True once rejoined, False when the budget is spent or the failure is fatal.

@@ -17,7 +17,7 @@ adding it would be inventing ambiguity in order to resolve it.
 pair of edges: Zoom says the floor has moved to somebody and never says that anybody
 stopped. So the previous turn is closed here, when the next one opens — and a turn stays
 open until either somebody else takes the floor or ``release`` is called, which is what
-the session does when RTMS detaches. Everything else follows from that one asymmetry.
+the session does when the page goes away. Everything else follows from that asymmetry.
 
 **Three things are kept from the Meet tracker deliberately.** The hold window, because
 speech has gaps at every clause boundary and an answer that flickers to "nobody" between
@@ -28,7 +28,7 @@ has been speaking" answers with the same name forty times. And the rule that
 reads it on the frame that triggers a barge-in.
 
 Everything here is synchronous, total and non-blocking: ``observe`` is called from the
-RTMS pump, which is the loop that also carries the meeting's audio.
+page read loop, which also carries the avatar's voice into the page.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from src.connectors.zoom.rtms.observations import SpeakerEvent
+from src.connectors.zoom_web.observations import SpeakerEvent
 from src.infrastructure.logging import get_logger
 from src.services.media.clock import MediaClock
 
@@ -44,9 +44,10 @@ logger = get_logger(__name__)
 
 COMPONENT_NAME = "zoom_web_active_speaker"
 
-SOURCE_RTMS = "rtms"
+SOURCE_PAGE = "page"
 """How every turn here is observed. A single value, where the Meet tracker has two, and
-that is the point: there is one signal and it is Zoom's own."""
+that is the point: there is one signal and the page is what carries it. Matches
+``teams_web``'s constant, because it is the identical DOM-derived signal."""
 
 ANONYMOUS = "Someone"
 """What an unattributed speaker is called. Rare on this connector — Zoom names the
@@ -293,7 +294,7 @@ class ZoomSpeakerTracker:
 
         Returns True when this changed who the tracker believes is speaking. False covers
         our own account and an event naming the person already on the floor — neither is
-        an error, and neither may reach the RTMS pump as an exception.
+        an error, and neither may reach the page read loop as an exception.
         """
         try:
             return self._observe(event)
@@ -349,7 +350,7 @@ class ZoomSpeakerTracker:
             identity=identity,
             display_name=name or None,
             user_id=event.user_id,
-            source=SOURCE_RTMS,
+            source=SOURCE_PAGE,
             started_us=now_us,
             started_at=datetime.now(UTC),
             inferred=inferred,
@@ -408,7 +409,7 @@ class ZoomSpeakerTracker:
     def release(self) -> None:
         """Close whatever turn is open, keeping the history.
 
-        Called when RTMS detaches or the session stops: no further event for that turn
+        Called when the page goes away or the session stops: no further event for that turn
         will ever arrive, so it would otherwise be "speaking" forever — and a barge-in
         after a reconnect must not be attributed to whoever was talking before it.
         """

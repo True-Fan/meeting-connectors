@@ -2,14 +2,16 @@
 
 Implementations:
 
-* ``connectors.zoom.publisher.MeetingPublisher`` — Zoom Meeting SDK via the C++
-  sidecar (M5)
+* ``connectors.zoom_web.egress.ZoomWebMediaSink`` — a synthetic microphone and camera
+  injected into the page
+* ``connectors.teams_web.egress.TeamsWebMediaSink`` — the same, for Teams
+* ``connectors.google_meet.egress.ChromiumMediaSink`` — the same, over the Meet bridge
 * ``services.media.sinks.FileSink`` — writes a playable file (M4)
 * ``services.media.sinks.NullSink`` — counts and timestamps, discards payload (M4)
 
 ``FileSink`` is why this port exists *today*: it lets M4 prove that decoding, the
-media clock, and A/V sync are correct — with watchable output — before any Zoom SDK
-build, C++ toolchain, or account entitlement is involved.
+media clock, and A/V sync are correct — with watchable output — before a browser,
+a profile, or a live meeting is involved.
 """
 
 from __future__ import annotations

@@ -96,16 +96,16 @@ DEFAULT_HAND_SELECTORS = ZoomHandSelectors()
 
 @dataclass(frozen=True, slots=True)
 class ZoomObserverSelectors:
-    """CSS selectors for the observers that stand in for RTMS under browser ingest.
+    """CSS selectors for the observers that read the meeting off the page.
 
-    **Only read when ``ingest_mode`` is ``browser``.** An RTMS deployment gets who joined,
-    who is speaking, what was said and what was typed from Zoom's own event streams, with a
-    name on each and no markup involved — so none of this runs, and a Zoom release renaming
-    every class below costs that deployment nothing.
+    **This is the honest cost of not requiring an RTMS-enabled account.** The connector once
+    got who joined, who is speaking, what was said and what was typed from Zoom's own event
+    streams, with a name on each and no markup involved; that required the meeting to be
+    hosted on an account a deployment usually does not control, so it is read from the DOM
+    instead and a Zoom release can rename every class below.
 
-    That asymmetry is the honest cost of not requiring an RTMS-enabled account, and it is
-    concentrated here on purpose: these are the fields to edit when a Zoom update makes the
-    avatar go quiet, and they are data rather than code for exactly that reason.
+    That cost is concentrated here on purpose: these are the fields to edit when a Zoom
+    update makes the avatar go quiet, and they are data rather than code for that reason.
 
     Ordering is most-specific first, and the page uses **the first list that matches
     anything** rather than the union — a generic fallback like ``[role='listitem']`` would
@@ -294,8 +294,8 @@ class ZoomObserverSelectors:
 
     **Clicking this is visible to everybody in the meeting**, which is why
     ``captions_auto_enable`` defaults to off and this is only consulted when it is on. It is
-    also the only way browser ingest can answer "what did they say" at all: RTMS transcribed
-    per participant with nobody's consent to obtain, and there is no equivalent here."""
+    also the only way this connector can answer "what did they say" at all: there is no
+    invisible per-participant transcription available to it."""
 
     caption_item: tuple[str, ...] = (
         ".live-transcript-subtitle__item",

@@ -80,11 +80,11 @@ independently:
 | | Zoom (`zoom_web`) | Teams (`teams_web`) | Google Meet (`google_meet`) |
 |---|---|---|---|
 | How the avatar gets in | Ordinary browser participant (Playwright) | Ordinary browser participant (Playwright) | Ordinary browser participant (Playwright) |
-| Ingest | Tapped from the page (or RTMS, for a meeting the bot's own account hosts) | Tapped from the page | Tapped from the WebRTC peer connection |
+| Ingest | Tapped from the page | Tapped from the page | Tapped from the WebRTC peer connection |
 | Needs from the meeting owner | Nothing — joins like a guest | Nothing — joins like a guest | A Google account signed in once, in advance |
 | Where the "credential" lives | A Chromium profile with a mic selected | A Chromium profile (optional) | A Chromium profile (**required**) |
 | Runs on | Same container as the bridge | Same container | Same container |
-| Status | ✅ built and unit-tested; selectors unverified against a live meeting in `browser` mode | ⚠️ built and unit-tested; selectors not yet verified against a live meeting | Roadmap only in the original design, **now the connector most exercised in practice** (see `docs/README-gateway.md` in the avatar-agent repo) |
+| Status | ✅ built and unit-tested; selectors unverified against a live meeting | ⚠️ built and unit-tested; selectors not yet verified against a live meeting | Roadmap only in the original design, **now the connector most exercised in practice** (see `docs/README-gateway.md` in the avatar-agent repo) |
 
 **All three join the same way: as an ordinary participant in a real, headless browser tab.**
 None needs anything granted by whoever owns the meeting — no special account entitlement, no
@@ -155,14 +155,15 @@ without sharing a base class, arrived at independently and only converged on lat
   bound to ambient context so no call site threads them through by hand, and stamped on every
   media frame so the two can never drift apart mid-session.
 - **A connector is registered only when its configuration says it's wanted.** A deployment
-  with no `MC_TEAMS__*` values is Zoom-only and carries no Teams code path in its running
-  process; a broken optional connector's config is logged and skipped, never a boot failure.
+  with `MC_TEAMS_WEB__ENABLED` unset carries no Teams code path in its running process; a
+  broken optional connector's config is logged and skipped, never a boot failure.
 - **Enforced import boundaries.** `domain/` depends on nothing; `protocols/` depends only on
-  `domain/`; `api/`, `services/`, `avatar/` never import a connector; the two Zoom/Teams wire
-  formats never leave their own connector package; connectors never import each other. These
-  are asserted by an architecture test, not just convention.
+  `domain/`; `api/`, `services/`, `avatar/` never import a connector; each connector's page
+  wire format never leaves its own package. These are asserted by an architecture test, not
+  just convention. (One deliberate exception, recorded as debt: `zoom_web` and `teams_web`
+  import Chromium's driver and launch-plan builder from `google_meet`.)
 - **Nothing here is untestable without the real platforms.** Every external dependency — the
-  avatar agent itself, Zoom's RTMS handshake, even a browser — has an in-repo fake or stub
+  avatar agent itself, the page channel, even a browser — has an in-repo fake or stub
   that speaks the real wire protocol, so the bridge's own logic is verified before (or
   entirely without) any of the real platforms being reachable.
 

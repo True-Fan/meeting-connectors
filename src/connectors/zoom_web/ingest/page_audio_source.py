@@ -3,11 +3,11 @@
 A view, not an owner, exactly like ``MeetAudioSource``: ``ZoomWebSession`` owns the browser
 and the page channel, and this exists so that ``MediaRouter`` — shared, platform-blind,
 already shipped for Zoom, Teams and Meet — can consume browser-tapped Zoom audio through the
-identical port it consumes RTMS audio through.
+identical port every other connector's ingest satisfies.
 
-**What it is not.** ``RtmsAudioSource`` is a large object: its own WebSocket, handshake,
-keep-alive and reconnect loop, because RTMS genuinely is an independent integration that can
-fail and heal without the browser noticing. This is thin, because ingest and egress here are
+**Why it is thin.** The RTMS source this replaced was a large object: its own WebSocket,
+handshake, keep-alive and reconnect loop, because RTMS genuinely was an independent
+integration that could fail and heal without the browser noticing. Here ingest and egress are
 the *same page channel* — the socket the avatar's voice travels out on is the socket the
 meeting's audio travels in on. Giving this its own lifecycle would mean inventing an
 independence it does not have, and health would then be telling the operator something
@@ -15,18 +15,18 @@ untrue.
 
 **One mixed stream, no attribution.** The tap sits at Zoom's playout, which is where the
 meeting has already been mixed down to what a human would hear, so every frame arrives with
-``participant=None``. That is a real loss against RTMS's per-participant mode and it is not
+``participant=None``. That is a real loss against a per-participant stream and it is not
 recoverable here at any price — the individual streams do not exist by that point in the
 graph. Who is talking comes from the DOM instead (``EVENT_SPEAKER``), on a separate path,
 which is the same division of labour the Google Meet connector has always used.
 
-**The avatar's own voice is not in it**, and that is the one place this is *better* than
-RTMS. RTMS delivers the meeting's mix including the avatar, which is why that leg needs
-``EchoGuard`` in strict mode and a long hangover, and why it cannot detect barge-in from
-audio at all (doc 008 §4). Zoom does not play a participant their own microphone, and the
-synthetic microphone is built in a separate ``AudioContext`` that never connects to a
-destination — so nothing the avatar says reaches this tap. The gate can run as a backstop
-instead of as the only defence, and energy-based barge-in works here.
+**The avatar's own voice is not in it**, and that is the one place this is *better* than the
+RTMS leg it replaced. That leg delivered the meeting's mix including the avatar, which is why
+it needed ``EchoGuard`` in strict mode and a long hangover, and why it could not detect
+barge-in from audio at all (doc 008 §4). Zoom does not play a participant their own
+microphone, and the synthetic microphone is built in a separate ``AudioContext`` that never
+connects to a destination — so nothing the avatar says reaches this tap. The gate runs as a
+backstop instead of as the only defence, and energy-based barge-in works here.
 """
 
 from __future__ import annotations

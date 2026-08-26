@@ -118,11 +118,9 @@ class SessionSupervisor:
         """True once a leg has been unhealthy past the grace window.
 
         Exempt while still ``JOINING``: a leg reporting ``UNKNOWN`` there means it
-        has not attempted its first attach yet — for RTMS ingest that is normal
-        while a session waits on ``meeting.rtms_started`` (doc 003 §3.1), and that
-        wait has its own, longer timeout (``RtmsAudioSource``'s
-        ``attach_wait_timeout_s``). This grace window is for a leg that *was* up
-        and went bad, not for the ordinary time a first attach takes. Once a leg
+        has not attempted its first attach yet, which is normal while a browser is
+        still working through a join form. This grace window is for a leg that *was*
+        up and went bad, not for the ordinary time a first attach takes. Once a leg
         actually fails to attach it reports ``UNHEALTHY``, not ``UNKNOWN``, which
         moves the session out of ``JOINING`` (``domain.session.derive_state``) and
         back under this clock.

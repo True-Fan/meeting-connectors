@@ -28,7 +28,7 @@ This is the *other participants'* speech, attributed — which is exactly the pa
 agent cannot attribute itself. Where the two disagree on wording, the agent's transcript
 is the one to trust for what was said; this one is authoritative about **who** said it.
 
-Everything here is synchronous, total and non-blocking: ``offer`` is called from the RTMS
+Everything here is synchronous, total and non-blocking: ``offer`` is called from the page
 pump, which is the loop that also carries the meeting's audio.
 """
 
@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from time import perf_counter_ns
 
-from src.connectors.zoom.rtms.observations import TranscriptLine as RtmsTranscriptLine
+from src.connectors.zoom_web.observations import TranscriptLine as PageTranscriptLine
 from src.domain.meeting import ChatMessage
 from src.infrastructure.logging import get_logger
 
@@ -218,7 +218,7 @@ class ZoomTranscript:
 
     # -- inputs ------------------------------------------------------------
 
-    def offer(self, line: RtmsTranscriptLine) -> bool:
+    def offer(self, line: PageTranscriptLine) -> bool:
         """Accept one transcribed line. Never blocks, never raises."""
         try:
             return self._offer(line)
@@ -226,7 +226,7 @@ class ZoomTranscript:
             logger.warning("zoom_transcript.offer_failed", error=str(exc))
             return False
 
-    def _offer(self, line: RtmsTranscriptLine) -> bool:
+    def _offer(self, line: PageTranscriptLine) -> bool:
         text = _clean_text(line.text)
         if not text:
             return False

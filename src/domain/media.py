@@ -1,8 +1,8 @@
 """Canonical media model.
 
-This is the anti-corruption boundary made concrete. Zoom RTMS wire types
-(``msg_type``, base64 envelopes, ``rtms_stream_id``) are translated into these
-models inside ``connectors/zoom/rtms/mapping.py`` and never travel further. Every
+This is the anti-corruption boundary made concrete. Each connector's wire types — a
+page frame header, a bridge envelope, a base64 payload — are translated into these
+models inside that connector's own mapping code and never travel further. Every
 consumer downstream — router, decoder, pacer, publisher — speaks only this module,
 which is what makes them testable without RTMS.
 

@@ -1,7 +1,8 @@
 """Teams-web connector exceptions.
 
-Separate from ``connectors/teams/exceptions`` even though both reach Teams: that one fails
-at a Graph call, a tenant consent and a .NET sidecar, this one at a browser and a DOM.
+A separate hierarchy from the other connectors', for the reason theirs are separate from
+each other: everything here fails at a browser and a DOM, and the recovery for a Teams
+join form is not the recovery for a Zoom one.
 
 The split that earns its keep is **recoverable versus fatal**, because it decides whether
 the reconnect budget is spent or the session fails now.

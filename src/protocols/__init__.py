@@ -3,19 +3,19 @@
 The scope-down rule from doc 003 §0 still governs: *a protocol earns its place only
 if a second implementation exists in this repository today.*
 
-Four ports were earned by the Zoom build itself. Two more were earned when the Teams
-connector arrived and supplied the second implementation the rule demands — see
-``connector.py`` for why they were correctly absent before that.
+Every port below has at least two implementations across the three connectors, which is
+what keeps them earned. The set was established when a second connector arrived — see
+``connector.py`` for why the last two were correctly absent before that.
 
 =============================  ===================================  ==============================
 Port                           Production implementation            Second implementation
 =============================  ===================================  ==============================
-``AudioSource``                ``RtmsAudioSource``                  ``TeamsAudioSource`` · replay
+``AudioSource``                ``PageAudioSource`` (zoom_web)       ``MeetAudioSource`` · replay
 ``AvatarTransport``            ``WebSocketAvatarTransport``         ``FakeAvatarTransport``
 ``MediaDecoder``               ``FfmpegDecoder``                    ``FakeDecoder``
-``MediaSink``                  ``MeetingPublisher`` (Zoom)          ``TeamsMediaSink`` · file/null
-``ConnectorSession``           ``ZoomMeetingSession``               ``TeamsMeetingSession``
-``ConnectorSessionFactory``    ``ZoomSessionFactory``               ``TeamsSessionFactory``
+``MediaSink``                  ``ZoomWebMediaSink``                 ``TeamsWebMediaSink`` · file
+``ConnectorSession``           ``ZoomWebSession``                   ``TeamsWebSession``
+``ConnectorSessionFactory``    ``ZoomWebSessionFactory``            ``TeamsWebSessionFactory``
 =============================  ===================================  ==============================
 
 Depends only on ``src.domain``. Enforced by ``tests/architecture/test_layering.py``.

@@ -1,10 +1,8 @@
 """Zoom-web connector exceptions.
 
-Separate from ``connectors/zoom/exceptions`` even though both reach Zoom: this one
-fails at a browser and a DOM, that one at an RTMS handshake and a native sidecar.
-
 The split that earns its keep is **recoverable versus fatal**, because it decides
-whether the reconnect budget is spent or the session fails now.
+whether the reconnect budget is spent or the session fails now. Everything here fails
+at a browser and a DOM, which is the only way this connector reaches Zoom.
 """
 
 from __future__ import annotations

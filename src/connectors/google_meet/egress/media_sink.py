@@ -5,7 +5,7 @@ reason: ``ChromiumBridge`` owns the one browser tab that carries both directions
 class adds is composition — it fans a paced stream out to the two device adapters and
 presents them to the shared ``Pacer`` as a single sink.
 
-**This deliberately shares nothing with Zoom's ``MeetingPublisher`` or Teams'
+**This deliberately shares nothing with the other connectors' sinks or the removed
 ``TeamsMediaSink``.** The runtimes differ (Chromium via Playwright, versus a C++ Meeting SDK
 sidecar, versus .NET app-hosted media on Windows), the transports differ (a loopback
 WebSocket, versus a Unix socket, versus TLS across a host boundary), the credentials differ

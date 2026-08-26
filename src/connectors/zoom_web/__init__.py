@@ -1,9 +1,11 @@
-"""Zoom, joined with a browser instead of the Meeting SDK.
+"""Zoom, joined with a browser.
 
-**Why this exists alongside ``connectors/zoom``.** That connector publishes through a
-native C++ sidecar built against the Meeting SDK for Linux — a licensed download,
-gated behind an entitlement, buildable only on Linux, and currently a stub. This one
-joins the same meetings with Chromium, which needs none of that.
+**The one Zoom connector.** There was a second — a native C++ sidecar built against the
+Meeting SDK for Linux, publishing media, with Zoom's RTMS API for ingest. It has been
+removed: the SDK is a licensed download gated behind an entitlement and buildable only on
+Linux, and RTMS requires the meeting to be hosted on an account with RTMS enabled for the
+app, which a deployment cannot arrange for meetings other people book. This connector joins
+the same meetings with Chromium and needs neither.
 
 **The split between the two halves is measured, not chosen** (``scripts`` probes,
 against live meetings):
@@ -17,8 +19,12 @@ against live meetings):
   transmitted, even when it is the only device the page can see.
 * A device-level microphone **is** transmitted, audibly.
 
-So the avatar speaks through a virtual microphone, and hears through **RTMS** —
-Zoom's own API, already implemented in ``connectors/zoom/rtms``, which carries the
-audio and the speaker's name. Each direction uses the mechanism Zoom actually
-supports, and only the publish half needs anything from the host.
+So the avatar speaks through a virtual microphone, and hears by tapping Zoom's own
+**playout** graph — where every transport has to converge, whether Zoom decodes over
+WebRTC or in WebAssembly off a WebSocket. See ``js/inject.js`` for why the tap is placed
+there rather than on the peer connection, and ``ingest/`` for what it collects.
+
+Everything else the avatar knows about the meeting — the roster, the active speaker, the
+chat, the captions, a raised hand — is read off the page and crosses into Python as this
+connector's own observation types (``observations.py``).
 """

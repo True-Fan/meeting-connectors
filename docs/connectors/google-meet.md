@@ -3,8 +3,7 @@
 ## Why this connector looks the way it does
 
 Google publishes no server-side way to send media into a Meet conference — its Meet Media
-API is receive-only, and says so explicitly — and there is no Meet equivalent of Zoom's
-Meeting SDK or Teams' Graph app-hosted media. So the avatar cannot be a server-side
+API is receive-only, and says so explicitly. So the avatar cannot be a server-side
 integration here; it has to be a **client** — a real, signed-in Chromium browser, joining
 like a person. That single fact shapes everything below: the "credential" is a browser
 profile on disk rather than an API key, and the rest of the connector's settings are browser
@@ -153,7 +152,7 @@ specific run sequence used to verify it end to end (also reproduced in
 - **Avatar joins but the room hears nothing / the avatar hears nothing** — check
   `tools/meet_inspect.py`'s selector report first; Meet's DOM changes over time and this
   connector degrades to silence on a missed selector rather than raising.
-- **Headless + no speakers**: `MC_MEDIA__ECHO_GATE_HANGOVER_MS` doesn't need to be raised here
-  the way it does on RTMS-mode Zoom-web — the tap is structurally echo-free. If barge-in feels
+- **Headless + no speakers**: `MC_MEDIA__ECHO_GATE_HANGOVER_MS` doesn't need to be raised
+  here — the tap is structurally echo-free, as it is on Zoom-web. If barge-in feels
   unresponsive in a fully headless deployment, set it to `0` so interruption relies entirely
   on the agent's own handling rather than the gate.

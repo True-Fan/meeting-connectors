@@ -6,25 +6,25 @@ repository today.* With one connector, ``MeetingService`` held a duck-typed
 ``session_factory: object`` and ``SessionSupervisor`` a ``zoom_session: object`` —
 honest about there being nothing to abstract over.
 
-Teams is that second implementation, so the shape those two modules were already
-calling is now written down:
+A second connector supplied that implementation, so the shape those two modules were
+already calling is now written down. Three satisfy it today:
 
 ===============================  ==============================================
 Implementation                    Package
 ===============================  ==============================================
-``ZoomMeetingSession``            ``connectors.zoom.session``
-``TeamsMeetingSession``           ``connectors.teams.session``
+``ZoomWebSession``                ``connectors.zoom_web.session``
+``TeamsWebSession``               ``connectors.teams_web.session``
+``GoogleMeetSession``             ``connectors.google_meet.session``
 ===============================  ==============================================
 
-Both are ``Protocol``s, so they are **structural**: ``ZoomMeetingSession`` and
-``ZoomSessionFactory`` satisfy them today without a single edit to the Zoom
-connector. That is the point — the abstraction is written against the code that
-already exists rather than the code being bent to fit it.
+Both are ``Protocol``s, so they are **structural**: each session and factory satisfies
+them without a single edit to its connector. That is the point — the abstraction is
+written against the code that already exists rather than the code being bent to fit it.
 
 The factory is deliberately *not* asked to declare its own platform. Registration
-supplies the key (``ConnectorRegistry.register(platform, factory)``), which keeps
-``ZoomSessionFactory`` untouched and keeps the platform mapping in one readable
-place: ``containers.py``.
+supplies the key (``ConnectorRegistry.register(platform, factory)``), which keeps each
+factory untouched and keeps the platform mapping in one readable place:
+``containers.py``.
 """
 
 from __future__ import annotations

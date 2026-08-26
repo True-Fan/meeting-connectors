@@ -1,6 +1,6 @@
 """Platform-agnostic media sinks.
 
-Deliberately **not** inside ``connectors/zoom/`` (doc 002 §1.2 D5): these are
+Deliberately **not** inside any connector (doc 002 §1.2 D5): these are
 general-purpose destinations, and trapping them in the Zoom package would mean tests
 and non-Zoom use had to import a connector to get a test double.
 """
