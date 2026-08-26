@@ -16,10 +16,11 @@ video, and all three now show that video in the meeting, via a synthetic camera 
 the same way on every connector. None of them talks to LiveKit at all — LiveKit lives one hop
 further away, inside the avatar agent itself.**
 
-**Zoom's and Teams' camera path is newer than Google Meet's and its "turn the camera on"
-click has not been confirmed against a live meeting** — see the note under §2. If the
-avatar is heard but not seen on one of those two, that is the first thing to check
-(`video_published` vs `video_dropped` in `GET /sessions/{id}` health).
+**Zoom's and Teams' camera path is newer than Google Meet's, and has since been confirmed
+end-to-end in live meetings on both** — the camera-on click, the canvas track, and the wire
+protocol all verified working (see the note under §2). What still has to be running
+separately for the avatar's actual face to appear, on all three connectors and not just the
+new two, is **the avatar agent itself** — see §2's note on `video_published` vs idle frames.
 
 ## The picture
 
@@ -70,15 +71,26 @@ video-streaming sites use to send video a few seconds at a time). What the conne
 | Connector | Avatar's **voice** heard in the meeting? | Avatar's **video** seen in the meeting? |
 |---|---|---|
 | **Google Meet** (`google_meet`) | ✅ Yes | ✅ Yes — a synthetic camera track (canvas + `captureStream`) behind a patched `getUserMedia`, in production the longest of the three |
-| **Zoom** (`zoom_web`) | ✅ Yes | ✅ Yes — same mechanism, plus a click on Zoom's own "Start Video" control; **the selector for that control is an unverified best guess**, not yet confirmed in a live meeting |
-| **Teams** (`teams_web`) | ✅ Yes | ✅ Yes — same mechanism, plus a click on Teams' own "Turn camera on" control; **same caveat as Zoom** |
+| **Zoom** (`zoom_web`) | ✅ Yes | ✅ Yes — same mechanism, plus a click on Zoom's own "Start Video" control; **confirmed in a live meeting** — the camera turns on and the tile carries a real published video track |
+| **Teams** (`teams_web`) | ✅ Yes | ✅ Yes — same mechanism, plus a click on Teams' own "Turn camera on" control; **confirmed in a live meeting**, same as Zoom |
 
-**Practical takeaway**: you should now **see** the avatar on all three platforms. If Zoom or
-Teams shows the avatar's tile with no video, check `GET /sessions/{id}` — a `video_dropped`
-count that only ever climbs (never `video_published`) points at a camera-on selector that
-didn't match this Zoom/Teams build's DOM; `video_published` climbing with nothing visible
-points at Zoom's camera needing the same profile-persisted device-selection workaround its
-microphone did (see `zoom_web/js/inject.js`).
+**Practical takeaway**: you will **see** the avatar's tile carrying real video on all three
+platforms — confirmed, not just wired up. What you see rendered on that tile still depends on
+the avatar agent being reachable, same as it always has for audio:
+
+- **Avatar agent unreachable** (`router.avatar_unreachable` in the logs, or
+  `avatar.control_dropped reason=not connected`): the tile shows a flat grey rectangle. That
+  is not a broken camera — it's `Pacer`'s `IdleFrameSource` publishing a solid placeholder
+  frame (`make_solid_i420`) because there is nothing real to show, the same fallback that
+  covers gaps between the avatar's utterances during a normal session. `video_published` in
+  `GET /sessions/{id}` climbs the whole time; it's counting the idle frames as much as real
+  ones — a climbing counter here means the *pipeline* is fine, not that the *avatar* is
+  connected. Check `MC_AVATAR__URL` and that the avatar agent's gateway is actually listening
+  on it ([RUNBOOK.md §1](RUNBOOK.md#1-the-avatar-agent-external)).
+- **Camera never turns on at all** (Zoom's tile has no video track, or Teams reports the
+  camera off): `video_dropped` climbs instead of `video_published`, meaning the camera-on
+  selector didn't land for that specific meeting/build — see the connector's `meeting/join.py`
+  for the current selector list.
 
 ## 3. Does any of this publish into a LiveKit room?
 

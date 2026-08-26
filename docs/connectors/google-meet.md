@@ -60,17 +60,21 @@ field's docstring explains a real trade-off, not a hypothetical one.
 
 ## Setup
 
-### 1. Install the browser extra
+### 1. Install the browser binary
+
+`pip install -e .` (or `poetry install`) at the repo root already pulls in the `playwright`
+package — it's a hard dependency now, shared with `zoom_web` and `teams_web`, which drive the
+same Chromium automation. What that install does **not** do is fetch the browser itself:
 
 ```bash
-poetry install --extras google-meet
-# or, without Poetry:
-.venv/bin/pip install playwright && .venv/bin/playwright install chromium
+.venv/bin/playwright install chromium
+# or, with Poetry:
+poetry run playwright install chromium
 ```
 
-Optional on purpose — a Zoom- or Teams-only deployment shouldn't need a ~150MB browser it
-will never launch. Importing it lazily means a missing install fails with a clear error at
-session start, not an `ImportError` at boot.
+`connectors/google_meet/automation/driver.py` still imports Playwright lazily and raises
+`PlaywrightUnavailableError` naming this exact command, so a missing browser binary fails
+with a clear error at session start rather than an `ImportError` at boot.
 
 ### 2. Sign in, once, interactively
 

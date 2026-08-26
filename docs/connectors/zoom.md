@@ -57,6 +57,22 @@ that path.
 
 ## Setup
 
+### 0. The browser binary
+
+`pip install -e .` at the repo root already pulls in the `playwright` package — this
+connector is Playwright-driven, same as [Google Meet](google-meet.md). What it does not do is
+fetch the browser itself, which is a separate, one-time step:
+
+```bash
+.venv/bin/playwright install chromium
+```
+
+Skip this and the first session fails with "chromium is not installed for playwright" rather
+than joining. See [google-meet.md § Setup](google-meet.md#1-install-the-browser-binary) for
+why this is a separate step from installing the package.
+
+### 1. The persistent profile
+
 ```bash
 .venv/bin/python scripts/zoom_web_login.py --profile ~/.mc/zoom-web-profile
 ```

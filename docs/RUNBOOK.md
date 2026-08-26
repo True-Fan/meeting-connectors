@@ -86,6 +86,32 @@ one meeting by hand with `curl` — see §4.
 
 ## 3. The bridge (this repo) — always last
 
+**First time only — install this repo's own dependencies:**
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -e .
+playwright install chromium
+```
+
+`pip install -e .` reads `pyproject.toml` and pulls in everything every connector needs —
+`playwright` and `httpx` included, both hard dependencies as of this repo's video-parity
+change (previously `playwright` was gated behind a now-stale `google-meet`-only extra, and
+`httpx` sat in the dev group despite `connectors/zoom/api/rtms_trigger.py` importing it at
+runtime; a plain install used to come up short on both and need `pip install playwright` /
+`pip install httpx` by hand — that gap is closed).
+
+`playwright install chromium` is separate on purpose and cannot be folded into the line
+above: the `playwright` *package* is Python glue, and the browser binary it drives is a
+~150 MB download `pip` does not fetch. Skipping this step is the one failure
+`PlaywrightUnavailableError` doesn't catch cleanly — you'll see "chromium is not installed
+for playwright" the first time any of `google_meet`, `zoom_web`, or `teams_web` tries to
+launch a browser (`connectors/google_meet/automation/driver.py`).
+
+With Poetry instead: `poetry install && poetry run playwright install chromium`.
+
+**Then, every time:**
+
 ```bash
 .venv/bin/uvicorn src.main:app --port 8000
 # or, with Poetry:
