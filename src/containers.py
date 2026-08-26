@@ -134,7 +134,7 @@ class Container(containers.DeclarativeContainer):
     # Three blocks, structurally identical and sharing nothing. None of them has a
     # credential provider, because none of them has an API credential: each joins with a
     # browser, so the nearest thing to a credential is a profile on disk. See
-    # connectors/google_meet/capabilities.py for why that is the only way in on Meet, and
+    # docs/connectors/google-meet.md for why that is the only way in on Meet, and
     # each connector's __init__.py for the measurements behind the other two.
 
     google_meet_config = providers.Singleton(GoogleMeetConnectorConfig.from_settings, settings)

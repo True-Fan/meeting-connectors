@@ -344,7 +344,7 @@ class GoogleMeetSessionFactory:
         self._config = config
         self._metrics = metrics
         # Overrides mirror ``ZoomSessionFactory``'s and ``TeamsSessionFactory``'s: they let
-        # the whole pipeline run into a ``FileSink`` for verification, and let tests
+        # the whole pipeline run into a file-writing sink for verification, and let tests
         # substitute fakes, without a second code path. ``driver_factory`` additionally
         # allows an in-process fake page — which is how this connector is testable with no
         # Chromium, no Google account, and no meeting.

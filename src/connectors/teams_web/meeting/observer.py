@@ -127,7 +127,7 @@ class TeamsMeetingObserver:
     # -- the observation types, for anything that produces them directly ----
     #
     # Nothing in this connector calls these from the wire today — the page's events land on
-    # ``on_page_event`` and are translated below. They are the ``MeetingObserver`` protocol
+    # ``on_page_event`` and are translated below. They are the observation-consumer
     # surface, and ``on_chat`` in particular is called by ``_on_chat`` so that the ordering
     # rule it encodes is written down exactly once.
 

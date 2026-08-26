@@ -58,7 +58,7 @@ class GoogleMeetSettings(BaseModel):
     credentials, because both platforms ship a server-side SDK that can publish media into
     a conference. Google does not: its only real-time media API is receive-only and states
     so explicitly, and there is no Meet equivalent of a Meeting SDK. The full evidence is
-    in ``connectors/google_meet/capabilities.py``.
+    in ``docs/connectors/google-meet.md``.
 
     So the avatar has to be a *client* — a real browser, signed into a real Google account,
     joining like a person. That makes the credential a **browser profile on disk** rather

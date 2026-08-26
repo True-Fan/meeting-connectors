@@ -271,9 +271,12 @@ has no coherent backpressure story.
   the echo gate can stay open (i.e. where the avatar's own voice is structurally absent from
   what's tapped). Adaptive noise floor, minimum duration, hysteresis, release window — not a
   real VAD, just a threshold plus arithmetic to avoid clipping the room's silence.
-- **`FileSink` / `NullSink`** — `FileSink` muxes raw output into a playable file, which is how
-  decode/clock/av-sync correctness was proven **before any platform integration existed**.
-  `NullSink` counts and discards, for load testing and as the default in unit tests.
+- **Verification sinks (removed)** — there were two, `FileSink` (muxed raw output into a
+  playable file) and `NullSink` (counted and discarded). They were how decode/clock/av-sync
+  correctness was proven **before any platform integration existed**, and they were the
+  original justification for the `MediaSink` port. Neither was ever wired into a running
+  path, so both were deleted as dead code; the port is now earned by the three connectors'
+  own sinks. Worth writing again the day a verification run needs one.
 
 ### Barge-in unification
 
@@ -383,7 +386,7 @@ what lets each connector be built and verified before its real infrastructure ex
 
 | Real thing | Stand-in |
 |---|---|
-| Streaming Avatar Agent | `FakeAvatarTransport` (in-process); `FileSink`/`NullSink` on the publish side make output watchable/countable without any platform integration |
+| Streaming Avatar Agent | `FakeAvatarTransport` (in-process). `MediaSink` is a `Protocol`, so a test double on the publish side makes output countable without any platform integration |
 | A real browser | `BrowserDriver` is a `Protocol`; tests substitute a fake driver, so join/selector/observer logic is exercised without Playwright installed |
 | Page channel | The loopback WebSocket server is injectable; the codec is tested against in-memory frames |
 

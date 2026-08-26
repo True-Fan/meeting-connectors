@@ -6,12 +6,13 @@ Implementations:
   injected into the page
 * ``connectors.teams_web.egress.TeamsWebMediaSink`` — the same, for Teams
 * ``connectors.google_meet.egress.ChromiumMediaSink`` — the same, over the Meet bridge
-* ``services.media.sinks.FileSink`` — writes a playable file (M4)
-* ``services.media.sinks.NullSink`` — counts and timestamps, discards payload (M4)
 
-``FileSink`` is why this port exists *today*: it lets M4 prove that decoding, the
-media clock, and A/V sync are correct — with watchable output — before a browser,
-a profile, or a live meeting is involved.
+Three implementations, one per connector, which is what keeps this port earned. There were
+once two more — a ``FileSink`` that muxed the pipeline's output into a playable file and a
+``NullSink`` that counted and discarded — and they were the original justification for the
+port: they let M4 prove decoding, the media clock and A/V sync were correct, with watchable
+output, before any live meeting was involved. Neither was ever wired into a running path, so
+both have been removed; a verification sink is worth writing again the day it is needed.
 """
 
 from __future__ import annotations

@@ -28,12 +28,3 @@ class ZoomWebAdmissionError(ZoomWebError):
         super().__init__(f"zoom refused admission: {reason}")
         self.reason = reason
 
-
-class VirtualMicUnavailableError(ZoomWebError):
-    """No virtual microphone to publish through.
-
-    Fatal and deliberately loud. Zoom publishes from a *device*; an injected track is
-    consumed and never transmitted, which was measured rather than assumed. So
-    without the device the avatar joins, reports healthy, and is silent — the exact
-    failure this exception exists to make impossible.
-    """

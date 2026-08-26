@@ -13,8 +13,8 @@ explicitly receive-only:
 
 There is no Meet equivalent of a Meeting SDK, and no ``SpaceConfig`` field, add-on API,
 or REST method that accepts inbound media. The full evidence, with citations and launch
-stages, is in ``capabilities.py`` — it is recorded in code because it is the premise
-the entire design rests on, and a future contributor who does not know it will
+stages, is in ``docs/connectors/google-meet.md`` — it is written down because it is the
+premise the entire design rests on, and a future contributor who does not know it will
 reasonably ask why this connector runs a browser.
 
 So the avatar cannot be a *server* on Meet. It has to be a **client**: a real Chromium
@@ -37,7 +37,6 @@ through the ordinary ``getUserMedia`` path. That is what this package builds.
 
 Package layout, and what each part is allowed to know:
 
-* ``capabilities.py``   — the official-API findings that justify the browser. Data.
 * ``config.py``         — a flattened, connector-local view of ``Settings``.
 * ``browser/``          — Chromium launch flags and the persistent profile on disk.
 * ``automation/``       — Playwright lifecycle, the page, and the Meet DOM selectors.

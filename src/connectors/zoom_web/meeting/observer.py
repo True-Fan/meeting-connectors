@@ -113,7 +113,7 @@ class ZoomMeetingObserver:
         self._missing_since: dict[str, int] = {}
         self._leave_grace_us = max(int(leave_grace_s * 1_000_000), 0)
 
-    # -- MeetingObserver ---------------------------------------------------
+    # -- observation consumers ---------------------------------------------
 
     def on_participant(self, event: ParticipantEvent) -> None:
         """Somebody joined or left.

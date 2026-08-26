@@ -33,7 +33,7 @@ locale so the assumption is enforced rather than hoped for.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 LOCALE_NOTE = (
     "Terminal-state detection matches English text, so the browser locale is pinned to "
@@ -383,13 +383,3 @@ DEFAULT_SELECTORS = MeetSelectors()
 Meet UI change can be patched by constructing a different ``MeetSelectors`` and passing
 it to the driver — no fork, no release."""
 
-
-@dataclass(frozen=True, slots=True)
-class SelectorCandidates:
-    """A named group of selector candidates, for error messages worth reading."""
-
-    label: str
-    candidates: tuple[str, ...] = field(default_factory=tuple)
-
-    def describe(self) -> str:
-        return f"{self.label} (tried: {', '.join(self.candidates) or 'nothing'})"

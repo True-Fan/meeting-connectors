@@ -36,7 +36,7 @@ class MeetingPlatform(StrEnum):
     GOOGLE_MEET = "google_meet"
     """Google Meet, joined with a browser. Google ships no way to publish media into a
     conference, so a browser is the only way in — see
-    ``connectors/google_meet/capabilities.py`` for the evidence."""
+    ``docs/connectors/google-meet.md`` for the evidence, quoted from Google's own reference."""
 
     ZOOM_WEB = "zoom_web"
     """Zoom, joined with a browser.

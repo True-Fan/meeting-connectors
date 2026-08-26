@@ -28,9 +28,6 @@ method that raises drops the socket.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
-
-from src.domain.meeting import ChatMessage
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,33 +95,3 @@ class TranscriptLine:
     display_name: str | None
     text: str
     at_us: int = 0
-
-
-@runtime_checkable
-class MeetingObserver(Protocol):
-    """Where everything that is not audio goes.
-
-    Four methods, all synchronous, all obliged to return rather than raise — see the module
-    docstring for why that is a requirement of the page read loop and not a preference.
-
-    Declared as a protocol even though this connector has exactly one implementation, for
-    one narrow reason: ``ZoomMeetingObserver`` and ``TeamsMeetingObserver`` are separately
-    written against separately owned types, and stating the shape is what makes it obvious
-    that the *ledgers* are the part worth comparing between them.
-    """
-
-    def on_participant(self, event: ParticipantEvent) -> None:
-        """Somebody joined or left."""
-        ...
-
-    def on_speaker(self, event: SpeakerEvent) -> None:
-        """The floor changed hands."""
-        ...
-
-    def on_transcript(self, line: TranscriptLine) -> None:
-        """Zoom captioned a line of speech."""
-        ...
-
-    def on_chat(self, message: ChatMessage) -> None:
-        """Somebody typed in the meeting chat."""
-        ...

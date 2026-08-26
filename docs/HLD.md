@@ -68,7 +68,7 @@ goes (see [RUNBOOK.md](RUNBOOK.md#the-avatar-agent-external)).
 **Why three separate services instead of one.** Each has a reason to fail, deploy, and scale
 independently:
 - The bridge needs no AI credentials and no calendar access — it can be stood up and tested
-  with zero knowledge of the agent behind it (`FileSink`/`NullSink` and fakes for every
+  with zero knowledge of the agent behind it (in-repo fakes for every
   external dependency make this literal — see [LLD § testing seams](LLD.md#12-testing-seams)).
 - The orchestrator needs no meeting-platform credentials at all — it only reads a calendar
   and an inbox, and could be pointed at a different bridge entirely.

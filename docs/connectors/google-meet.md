@@ -2,14 +2,35 @@
 
 ## Why this connector looks the way it does
 
-Google publishes no server-side way to send media into a Meet conference — its Meet Media
-API is receive-only, and says so explicitly. So the avatar cannot be a server-side
-integration here; it has to be a **client** — a real, signed-in Chromium browser, joining
-like a person. That single fact shapes everything below: the "credential" is a browser
-profile on disk rather than an API key, and the rest of the connector's settings are browser
-lifecycle rather than API parameters (`src/connectors/google_meet/capabilities.py` records
-the evidence for this, deliberately, so nobody "fixes" the architecture later without
-re-deleting it).
+Google publishes no server-side way to send media into a Meet conference. So the avatar
+cannot be a server-side integration here; it has to be a **client** — a real, signed-in
+Chromium browser, joining like a person. That single fact shapes everything below: the
+"credential" is a browser profile on disk rather than an API key, and the rest of the
+connector's settings are browser lifecycle rather than API parameters.
+
+**The evidence, verbatim from the [Meet Media API C++ reference](https://developers.google.com/workspace/meet/media-api/reference/cpp/namespace/meet):**
+
+> All conference media streams are "receive-only". Currently, the Meet Media API does not
+> support sending of media from `MediaApiClientInterface` into a conference.
+
+That sentence covers media generically, so it rules out both custom video and custom
+microphone audio. Corroborating detail from the same review:
+
+- At the protocol level the client offers `a=recvonly` and Meet answers `a=sendonly` — there
+  is no transceiver direction that could carry our media.
+- The client-to-server request union is session control, video *assignment* (a receive
+  preference), and stats. No media-send message type exists.
+- Neither the Meet REST API's `SpaceConfig` nor the Meet add-ons SDK accepts inbound media:
+  the add-on type definitions contain no `MediaStream`, track, or capture API at all.
+- The Media API's fuller access tier is gated behind the Workspace Developer Preview
+  Program, which requires enrolment of the Cloud project, the OAuth principal, **and every
+  participant in the conference** — an external guest joining would break the session.
+
+Findings current as of the August 2026 documentation review recorded in
+`docs/design/007-google-meet-connector-architecture.md`. This lived in a
+`capabilities.py` module that encoded it as data; that module was never consulted at
+runtime — the architecture already encodes the conclusion — so it has been removed and
+the evidence kept here, where a reader will actually find it.
 
 ## Architecture
 
