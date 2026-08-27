@@ -18,7 +18,7 @@ from src.connectors.zoom_web.page.protocol import encode_audio, encode_video
 from src.connectors.zoom_web.page.server import PageAudioServer
 from src.domain.health import ComponentHealth, ComponentState
 from src.domain.media import AudioFrame, VideoFormat, VideoFrame
-from src.domain.meeting import MeetingContext, ParticipantRef
+from src.domain.meeting import MeetingContext
 from src.infrastructure.logging import get_logger
 
 logger = get_logger(__name__)
@@ -107,10 +107,3 @@ class ZoomWebMediaSink:
             name=COMPONENT_NAME, state=ComponentState.HEALTHY, detail=detail
         )
 
-    def own_participant(self) -> ParticipantRef | None:
-        """Unknown, and structurally so.
-
-        The browser does not tell us our own Zoom participant id, so ``EchoGuard``
-        falls back to its speaking gate — the case that gate exists for.
-        """
-        return None

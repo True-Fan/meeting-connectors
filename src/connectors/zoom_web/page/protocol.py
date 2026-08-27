@@ -106,6 +106,12 @@ the same reason.
 The page decides nothing about whether to interrupt. It reports who, and Python decides —
 see ``connectors/zoom_web/meeting/hand_raise.py``."""
 
+EVENT_HAND_LOWER = "handLower"
+"""A hand that was up is no longer up. ``{type, id}``.
+
+Paired with ``EVENT_HAND_RAISE`` so the observer can forget a hand it is holding, which is
+what stops a lowered-then-raised hand being swallowed by the cooldown."""
+
 EVENT_PAGE = "pageEvent"
 """Diagnostics: what the observer armed with, what it can see, whether it found anything.
 

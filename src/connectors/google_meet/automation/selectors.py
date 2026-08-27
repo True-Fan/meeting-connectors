@@ -27,7 +27,7 @@ also happens to contain the media path.
 
 Language note: ``text`` fields are matched case-insensitively against the page's rendered
 text, so they only work when the profile's Google account is set to English.
-``LOCALE_NOTE`` records the consequence, and ``browser/launcher.py`` pins the browser
+The comment below records the consequence, and ``browser/launcher.py`` pins the browser
 locale so the assumption is enforced rather than hoped for.
 """
 
@@ -35,12 +35,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-LOCALE_NOTE = (
-    "Terminal-state detection matches English text, so the browser locale is pinned to "
-    "en-US in browser/launcher.py. A profile whose Google account renders Meet in another "
-    "language would still join and carry media, but 'denied' and 'ejected' would be "
-    "misread as 'still joining' and the session would retry instead of failing."
-)
+# **Locale is load-bearing.** Terminal-state detection matches English text, so the browser
+# locale is pinned to en-US in browser/launcher.py. A profile whose Google account renders
+# Meet in another language would still join and carry media, but "denied" and "ejected" would
+# be misread as "still joining" and the session would retry instead of failing.
 
 
 @dataclass(frozen=True, slots=True)

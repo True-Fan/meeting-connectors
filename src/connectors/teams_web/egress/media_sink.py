@@ -18,7 +18,7 @@ from src.connectors.teams_web.page.protocol import encode_audio, encode_video
 from src.connectors.teams_web.page.server import PageAudioServer
 from src.domain.health import ComponentHealth, ComponentState
 from src.domain.media import AudioFrame, VideoFormat, VideoFrame
-from src.domain.meeting import MeetingContext, ParticipantRef
+from src.domain.meeting import MeetingContext
 from src.infrastructure.logging import get_logger
 
 logger = get_logger(__name__)
@@ -120,12 +120,3 @@ class TeamsWebMediaSink:
             name=COMPONENT_NAME, state=ComponentState.HEALTHY, detail=detail
         )
 
-    def own_participant(self) -> ParticipantRef | None:
-        """Unknown, and structurally so.
-
-        The browser does not tell us our own Teams participant id — the Graph connector's
-        sidecar does, which is why ``EchoGuard`` can filter by identity there. Here it falls back
-        to its speaking gate, and the gate is a backstop rather than the only defence because
-        the avatar's voice is structurally absent from the tapped audio.
-        """
-        return None

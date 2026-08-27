@@ -32,6 +32,15 @@ from src.connectors.zoom_web.observations import (
     SpeakerEvent,
     TranscriptLine,
 )
+from src.connectors.zoom_web.page.protocol import (
+    EVENT_CAPTION,
+    EVENT_CHAT,
+    EVENT_HAND_LOWER,
+    EVENT_HAND_RAISE,
+    EVENT_PAGE,
+    EVENT_ROSTER,
+    EVENT_SPEAKER,
+)
 from src.domain.meeting import ChatMessage
 from src.infrastructure.logging import get_logger
 from src.services.media.clock import MediaClock
@@ -148,25 +157,25 @@ class ZoomMeetingObserver:
         """
         try:
             kind = str(event.get("type") or "")
-            if kind == "handRaise":
+            if kind == EVENT_HAND_RAISE:
                 self._on_hand(dict(event))
                 return
-            if kind == "handLower":
+            if kind == EVENT_HAND_LOWER:
                 self._hands_up.discard(str(event.get("id") or ""))
                 return
-            if kind == "roster":
+            if kind == EVENT_ROSTER:
                 self._on_roster(event)
                 return
-            if kind == "speaker":
+            if kind == EVENT_SPEAKER:
                 self._on_speaker(event)
                 return
-            if kind == "caption":
+            if kind == EVENT_CAPTION:
                 self._on_caption(event)
                 return
-            if kind == "chat":
+            if kind == EVENT_CHAT:
                 self._on_chat(event)
                 return
-            if kind == "pageEvent":
+            if kind == EVENT_PAGE:
                 logger.info(
                     "zoom_web.page_event",
                     name=event.get("name"),

@@ -432,7 +432,7 @@ class GoogleMeetSettings(BaseModel):
     ``hand_raise_mute_ms`` and ``hand_raise_prompt`` therefore govern this too — one handover,
     two ways in. Requires the echo gate to be open, which it is on this connector: a shut gate
     drops the interrupting voice along with the echo, and there is nothing for it to catch
-    here anyway (``connectors/google_meet/egress/media_sink.own_participant``).
+    here anyway: the WebRTC tap is inbound-only, so the avatar's own audio never enters it.
 
     Turn it off for a meeting where the avatar should hold the floor through noise — a
     presentation into a room with an open microphone — and a raised hand still interrupts."""

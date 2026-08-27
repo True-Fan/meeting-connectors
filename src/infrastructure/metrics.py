@@ -178,7 +178,6 @@ class MetricsSnapshot:
 
     histograms: Mapping[tuple[MetricName, _Labels], HistogramSnapshot]
     counters: Mapping[tuple[MetricName, _Labels], int]
-    session_ids: tuple[SessionId, ...] = ()
 
 
 class MetricsCollector:
@@ -273,7 +272,6 @@ class MetricsCollector:
         return MetricsSnapshot(
             histograms={k: v.snapshot() for k, v in self._histograms.items()},
             counters=dict(self._counters),
-            session_ids=tuple(self._sessions),
         )
 
     def session_snapshot(self, session_id: SessionId) -> MetricsSnapshot | None:
@@ -294,5 +292,4 @@ class MetricsCollector:
             counters={
                 (name, labels + tag): value for (name, labels), value in session.counters.items()
             },
-            session_ids=(session_id,),
         )

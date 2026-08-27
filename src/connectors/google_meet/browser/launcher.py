@@ -69,38 +69,37 @@ failing exactly as before with nothing in the argument list looking wrong.
 ``tests/unit/test_google_meet_browser.py`` asserts the switch appears exactly once.
 
 * ``LocalNetworkAccessChecks`` — the flag without which the connector cannot work at all;
-  see ``LOCAL_NETWORK_ACCESS_NOTE``.
+  see the comment block below.
 * ``CalculateNativeWinOcclusion`` — stops Chromium deciding a headless window is occluded and
   throttling its compositor."""
 
-LOCAL_NETWORK_ACCESS_NOTE = """Why LocalNetworkAccessChecks is disabled.
-
-Chromium's **Local Network Access** checks block a page on a public origin from opening a
-connection to a loopback address. ``meet.google.com`` is a public origin and the page bridge
-listens on ``127.0.0.1``, so every attempt is refused with
-``ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS`` and the injected script never reaches Python —
-no audio in, no media out, and the only symptom is a page that silently never connects.
-
-Verified empirically rather than assumed: with the flag absent the WebSocket fails from both
-``about:blank`` and a simulated ``https://meet.google.com`` origin, and with it present both
-succeed. ``BlockInsecurePrivateNetworkRequests``, the older Private Network Access flag, has no
-effect — the feature was renamed, so the obvious flag is the wrong one.
-
-**What this gives up, and what still protects the bridge.** The check exists to stop a hostile
-public page from reaching services on the user's own machine. Disabling it is acceptable here
-for reasons specific to this deployment, and would not be in a user's browser:
-
-* the browser is ours, headless, in a container, and visits exactly one site;
-* the bridge is bound to loopback, so nothing off-host can reach it regardless;
-* the URL carries a per-session ``secrets.token_urlsafe`` token compared with
-  ``compare_digest``, so even a co-resident process cannot attach (``websocket/server.py``);
-* nothing on that wire is a credential — the Google session lives in the browser profile.
-
-It is nonetheless a browser hardening feature being switched off, and the trend is toward
-tightening it further. ``docs/design/007`` §6 records the fallback if the flag is ever removed:
-move the channel onto Playwright's own CDP transport, which costs base64 framing and a
-throughput ceiling but needs no network permission at all."""
-
+# Why LocalNetworkAccessChecks is disabled.
+#
+# Chromium's **Local Network Access** checks block a page on a public origin from opening a
+# connection to a loopback address. ``meet.google.com`` is a public origin and the page bridge
+# listens on ``127.0.0.1``, so every attempt is refused with
+# ``ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS`` and the injected script never reaches Python —
+# no audio in, no media out, and the only symptom is a page that silently never connects.
+#
+# Verified empirically rather than assumed: with the flag absent the WebSocket fails from both
+# ``about:blank`` and a simulated ``https://meet.google.com`` origin, and with it present both
+# succeed. ``BlockInsecurePrivateNetworkRequests``, the older Private Network Access flag, has no
+# effect — the feature was renamed, so the obvious flag is the wrong one.
+#
+# **What this gives up, and what still protects the bridge.** The check exists to stop a hostile
+# public page from reaching services on the user's own machine. Disabling it is acceptable here
+# for reasons specific to this deployment, and would not be in a user's browser:
+#
+# * the browser is ours, headless, in a container, and visits exactly one site;
+# * the bridge is bound to loopback, so nothing off-host can reach it regardless;
+# * the URL carries a per-session ``secrets.token_urlsafe`` token compared with
+#   ``compare_digest``, so even a co-resident process cannot attach (``websocket/server.py``);
+# * nothing on that wire is a credential — the Google session lives in the browser profile.
+#
+# It is nonetheless a browser hardening feature being switched off, and the trend is toward
+# tightening it further. ``docs/design/007`` §6 records the fallback if the flag is ever removed:
+# move the channel onto Playwright's own CDP transport, which costs base64 framing and a
+# throughput ceiling but needs no network permission at all.
 AUTOMATION_ARGS: tuple[str, ...] = (
     "--disable-blink-features=AutomationControlled",
     "--no-first-run",

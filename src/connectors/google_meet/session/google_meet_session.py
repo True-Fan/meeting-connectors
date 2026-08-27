@@ -20,7 +20,7 @@ branch:**
   gate in strict mode. That is the guard's documented fallback, reached by configuration.
   It is also the *only* echo defence needed here, because the WebRTC tap is inbound-only —
   the avatar's own audio cannot enter it. The gate covers the acoustic path on a host with
-  speakers, not a software loop. See ``egress/media_sink.own_participant``.
+  speakers, not a software loop.
 * ``leg_states()`` returns one state twice. One browser tab is the participant, so there is
   no state in which Meet ingest works while Meet egress does not. Teams reports the same
   shape for the same reason; Zoom's two legs genuinely differ.
@@ -398,14 +398,13 @@ class GoogleMeetSessionFactory:
             # avatar interruptible. The gate cannot tell the avatar's echo from a person
             # talking over it, so a shut gate suppresses the interruption too — and here there
             # is no echo for it to catch: the WebRTC tap is inbound-only, so the avatar's own
-            # audio never enters it (``egress/media_sink.own_participant``).
+            # audio never enters it.
             gate_enabled=False,
             metrics=self._metrics,
         )
-        # Deliberately no ``set_own_participant`` and no listener, where Zoom sets it from the
-        # publisher and Teams subscribes to the roster. There is no identity to set: the
-        # avatar's audio never enters the tap, so the identity filter would have nothing to
-        # match and arming it would only invite a false suppression.
+        # No identity filter, and there is no longer one to arm: a browser is never told its
+        # own participant id, so ``EchoGuard`` relies on the speaking gate alone. The avatar's
+        # audio never enters the tap anyway, so there would be nothing to match.
 
         avatar = AvatarClient(
             transport=WebSocketAvatarTransport(

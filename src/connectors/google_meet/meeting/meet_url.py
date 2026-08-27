@@ -74,7 +74,6 @@ class MeetJoinTarget:
     meeting_code: str | None
     """``None`` for a nickname or short link, which only Google can resolve."""
 
-    is_lookup: bool = False
 
     def __str__(self) -> str:
         return self.meeting_code or self.url
@@ -126,7 +125,7 @@ def parse_meet_url(url: str) -> MeetJoinTarget:
         rebuilt = f"https://{host}{path}"
         if parsed.query:
             rebuilt = f"{rebuilt}?{parsed.query}"
-        return MeetJoinTarget(url=rebuilt, meeting_code=None, is_lookup=True)
+        return MeetJoinTarget(url=rebuilt, meeting_code=None)
 
     code = normalise_meeting_code(path.strip("/"))
     if code is None:

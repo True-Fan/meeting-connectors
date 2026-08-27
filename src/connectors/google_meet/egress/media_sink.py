@@ -14,9 +14,9 @@ the far end wants differs (``WebCodecs.VideoFrame`` I420, versus SDK-native I420
 NV12). What all three genuinely have in common is the ``MediaSink`` port — which is precisely
 the thing that is shared, and the whole point of the boundary.
 
-**On ``own_participant``.** It returns ``None``, always, and that is correct rather than
-unfinished. See the method docstring: echo is structurally impossible on this connector, so
-there is no identity for ``EchoGuard`` to filter against and none is needed.
+**No participant identity is published.** A browser is never told its own participant id,
+so there is nothing for ``EchoGuard`` to filter against — and nothing is needed: echo is
+structurally impossible on this connector, because the WebRTC tap is inbound-only.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from src.connectors.google_meet.virtual_camera.adapter import VirtualCameraAdapt
 from src.connectors.google_meet.virtual_microphone.adapter import VirtualMicrophoneAdapter
 from src.domain.health import ComponentHealth
 from src.domain.media import AudioFrame, VideoFrame
-from src.domain.meeting import MeetingContext, ParticipantRef
+from src.domain.meeting import MeetingContext
 from src.infrastructure.logging import get_logger
 
 logger = get_logger(__name__)
@@ -93,26 +93,6 @@ class ChromiumMediaSink:
         if bridge_health.detail:
             detail = f"{bridge_health.detail}; {detail}"
         return ComponentHealth(name=COMPONENT_NAME, state=bridge_health.state, detail=detail)
-
-    def own_participant(self) -> ParticipantRef | None:
-        """Always ``None`` — echo suppression by identity is moot on this connector.
-
-        On Zoom this returns the publisher's user id and on Teams the roster's self entry,
-        because both platforms mix the bot's own audio back into the stream it receives, and
-        ``EchoGuard`` needs the identity to drop it.
-
-        Here the loop cannot close. ``js/bridge.js`` taps audio from
-        ``RTCPeerConnection``'s ``track`` event, which fires for *inbound* transceivers only,
-        so the avatar's outbound microphone track is not merely filtered out — it never
-        enters the capture graph. There is nothing to identify.
-
-        The remaining risk is acoustic rather than software: a host with real speakers and a
-        real microphone could carry the avatar's voice back in. ``EchoGuard``'s speaking gate
-        covers that, and ``session/google_meet_session.py`` configures it with
-        ``per_participant_audio=False`` so the gate runs in strict mode — the correct and
-        documented fallback for a mixed stream with no attribution.
-        """
-        return None
 
     @property
     def dropped_video(self) -> int:

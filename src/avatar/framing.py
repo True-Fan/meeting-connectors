@@ -35,7 +35,6 @@ BOX_FTYP = b"ftyp"
 BOX_MOOV = b"moov"
 BOX_MOOF = b"moof"
 BOX_MDAT = b"mdat"
-BOX_STYP = b"styp"
 
 _INIT_BOXES = frozenset({BOX_FTYP, BOX_MOOV, b"free", b"skip", b"styp", b"sidx"})
 
@@ -109,7 +108,6 @@ class Fmp4Framer:
     _init_done: bool = False
     _seen_ftyp: bool = False
     _seq: int = 0
-    _pending_bytes: int = 0
     _boxes_seen: int = 0
 
     @property

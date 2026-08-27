@@ -21,7 +21,7 @@ from typing import Protocol, runtime_checkable
 
 from src.domain.health import ComponentHealth
 from src.domain.media import AudioFrame, VideoFrame
-from src.domain.meeting import MeetingContext, ParticipantRef
+from src.domain.meeting import MeetingContext
 
 
 @runtime_checkable
@@ -48,12 +48,3 @@ class MediaSink(Protocol):
         """Current health. Called by the supervisor; must not block."""
         ...
 
-    def own_participant(self) -> ParticipantRef | None:
-        """The identity this sink publishes as, once known.
-
-        ``EchoGuard`` needs it to recognise the avatar's own audio arriving back
-        through ingest. ``None`` until the sink has joined and learned it — which
-        is exactly why the echo gate exists as a second defence layer rather than
-        relying on identity alone (doc 003 §3.3).
-        """
-        ...

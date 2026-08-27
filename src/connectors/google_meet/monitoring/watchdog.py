@@ -73,8 +73,6 @@ class WatchdogVerdict:
 
     state: ComponentState
     detail: str | None = None
-    silent_for_s: float = 0.0
-    others_present: int = 0
 
 
 class MediaWatchdog:
@@ -241,7 +239,6 @@ class MediaWatchdog:
                 state=ComponentState.DEGRADED,
                 detail="the avatar's audio is on no outbound sender, so it cannot be "
                 "heard: Meet never requested a microphone and exposed no audio sender",
-                others_present=len(self._bridge.roster.others),
             )
 
         frames = int(getattr(self._source, "frames_received", 0))
@@ -250,7 +247,6 @@ class MediaWatchdog:
             self._last_progress_at = now
             return WatchdogVerdict(
                 state=ComponentState.HEALTHY,
-                others_present=len(self._bridge.roster.others),
             )
 
         started = self._last_progress_at
@@ -271,14 +267,11 @@ class MediaWatchdog:
             return WatchdogVerdict(
                 state=ComponentState.HEALTHY,
                 detail="alone in the meeting",
-                silent_for_s=silent_for,
             )
 
         if silent_for < self._grace_s:
             return WatchdogVerdict(
                 state=ComponentState.HEALTHY,
-                silent_for_s=silent_for,
-                others_present=others,
             )
 
         detail = (
@@ -294,8 +287,6 @@ class MediaWatchdog:
         return WatchdogVerdict(
             state=ComponentState.DEGRADED,
             detail=detail,
-            silent_for_s=silent_for,
-            others_present=others,
         )
 
     # -- observation -------------------------------------------------------

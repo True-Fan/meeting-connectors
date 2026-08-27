@@ -43,8 +43,6 @@ class EchoGuard:
         "_hangover_us",
         "_last_publish_pts_us",
         "_metrics",
-        "_own_user_id",
-        "_per_participant",
         "_strict",
         "_suppressed",
     )
@@ -57,11 +55,9 @@ class EchoGuard:
         gate_enabled: bool = True,
         metrics: MetricsCollector | None = None,
     ) -> None:
-        self._per_participant = per_participant_audio
         self._hangover_us = max(hangover_ms, 0) * 1_000
         self._gate_enabled = gate_enabled
         self._metrics = metrics
-        self._own_user_id: int | None = None
         self._last_publish_pts_us: int | None = None
         self._suppressed = 0
 
@@ -85,10 +81,6 @@ class EchoGuard:
     def suppressed(self) -> int:
         """Lifetime count of frames withheld from the avatar."""
         return self._suppressed
-
-    @property
-    def own_user_id(self) -> int | None:
-        return self._own_user_id
 
     @property
     def is_strict(self) -> bool:
@@ -122,13 +114,13 @@ class EchoGuard:
         """Decide whether ``frame`` reaches the avatar."""
         reason: str | None = None
 
-        if (
-            self._own_user_id is not None
-            and frame.participant is not None
-            and frame.participant.user_id == self._own_user_id
-        ):
-            reason = "own_participant"
-        elif self.is_gate_open(now_us):
+        # **Identity filtering used to sit here** and has been removed: it compared the
+        # frame's participant against the id the sink published as, and no sink can supply
+        # one any more (``MediaSink.own_participant`` is gone, because every connector joins
+        # with a browser and a browser is never told its own participant id). The branch was
+        # therefore unreachable. The speaking gate is the whole defence — see the class
+        # docstring for why that is sufficient where the avatar's audio cannot loop back.
+        if self.is_gate_open(now_us):
             reason = "speaking_gate"
 
         if reason is None:
