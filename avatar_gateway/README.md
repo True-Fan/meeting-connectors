@@ -13,6 +13,10 @@ Zoom/Teams/Meet  ⇄  meeting-connectors  ⇄  avatar_gateway  ⇄  LiveKit room
 translation, and it lives on this side of the boundary so the bridge stays platform- and
 AI-agnostic — same reason as always.
 
+**Bringing up the whole stack from nothing?** See [`RUNBOOK.md`](RUNBOOK.md) — every command,
+in order, dependencies included, ending with a real Google Meet/Zoom/Teams session. This page
+covers what this one piece is and how it differs from the old gateway.
+
 ## What changed from the old gateway
 
 This is adapted from the Streaming Avatar Agent's own `avatar_gateway.py`
@@ -102,6 +106,19 @@ agent→meet 696KiB in 371 frames, 1.5s audible / 8.5s silent · fMP4 out 113KiB
 | `agent→meet` at zero | agent-worker is in the room but mute | agent-worker's STT/LLM/TTS keys and logs |
 | No "agent is in the room" log within `GATEWAY_AGENT_JOIN_TIMEOUT_S` (default 30s) | Init accepted the session but no AGENT participant joined | `curl localhost:8080/readyz`, then agent-worker's own logs — a worker can stay registered with WH while its LiveKit signalling connection is dead |
 | `could not start an agent-worker session` at handshake time | Init/WH refused the session outright | the exception text names the HTTP status; check the demo tenant/credentials and that `AGENT_ID` is seeded |
+| Agent joins the room and it's deleted again within ~1s, every time | agent-worker's own `[PIPELINE] refusing job ...` — the assigned agent's config names a model/tool/credential this worker build doesn't have | agent-worker's logs name the exact field; this is a config problem, not a gateway one |
+
+**Fixed, worth knowing about:** this gateway used to join the room (with a `room_create=True`
+grant) *before* asking Init to start the agent session. Occasionally agent-worker's own
+room-existence check would run before it could see the room this gateway had just created, so
+it fell through to its own `create_room(metadata=...)` on a room that already (silently)
+existed — and LiveKit ignores the metadata on an already-existing room. The job then connected
+to a room with **empty** metadata, couldn't resolve `agent_id`, and refused instantly — which
+looked exactly like the row above, but wasn't fixable from agent-worker's config at all. `run()`
+now always starts the agent session (which makes agent-worker create the room) before this
+gateway joins it — see `_token()`'s and `_setup_agent_and_room()`'s docstrings in `gateway.py`.
+The placeholder still starts flowing to the bridge immediately regardless (`_pump_muxer`,
+`_pump_video`, `_pump_room_to_meet` don't wait on this), so this fix cost no latency.
 
 ## What's out of scope here
 

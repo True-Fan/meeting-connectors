@@ -706,6 +706,20 @@ class BridgeSession:
         ``_start_agent_session`` — this gateway is, as far as Init is concerned, a customer
         joining with its own microphone, exactly like ``devtools/local_session.py``'s
         ``customer_token``.
+
+        Deliberately **no** ``room_create`` grant. agent-worker's own
+        ``LiveKitSessionController._get_or_prepare_room`` is a check-then-act:
+        ``list_rooms`` then, if none was found, ``create_room(metadata=...)``. If this
+        gateway's own ``room.connect()`` implicitly creates the room first — which
+        ``room_create=True`` would do, since ``run()`` used to join before asking Init for a
+        session — agent-worker's ``list_rooms`` can lose that race, fall through to
+        ``create_room`` on a room that already (silently) exists, and LiveKit hands back
+        that already-existing room's metadata unchanged: **empty**. The job then connects to
+        a room with no ``agent_id`` in it and refuses — instantly, silently, and only
+        sometimes, which is exactly what made it look like a Meet-specific flake rather than
+        an ordering bug. ``run()`` now always calls ``_start_agent_session()`` before
+        ``_join_room()`` so agent-worker is guaranteed to create the room, with its metadata
+        intact, before this gateway's join could ever race it.
         """
         return (
             api.AccessToken(self._config.livekit_api_key, self._config.livekit_api_secret)
@@ -715,7 +729,6 @@ class BridgeSession:
                 api.VideoGrants(
                     room_join=True,
                     room=self._room_name,
-                    room_create=True,
                     can_publish=True,
                     can_subscribe=True,
                 )
@@ -724,8 +737,8 @@ class BridgeSession:
         )
 
     async def _join_room(self) -> None:
+        """Join the room agent-worker has already created (see ``run()`` / ``_token()``)."""
         cfg = self._config
-        self._room_name = cfg.fixed_room or f"{cfg.room_prefix}{self._session_id}"
 
         # Handlers are registered before connecting so an agent already sitting in a reused
         # fixed room is picked up from the initial participant snapshot rather than missed.
@@ -750,13 +763,14 @@ class BridgeSession:
 
     async def _start_agent_session(self) -> None:
         """Ask Initialisation for a session, so Worker Handling assigns agent-worker into
-        this room.
+        this room — before this gateway itself joins it (see ``_token()`` for why the order
+        matters).
 
         Replaces the old gateway's ``lk.agent_dispatch.create_dispatch(agent_name=...)`` —
         agent-worker is never dispatched by name, it only takes a job when WH assigns one,
         and only Init can ask WH for that. This is exactly what
         ``agent-worker/devtools/local_session.py`` does by hand; the gateway does it here
-        with the room it has already joined and the token it already minted.
+        with the room name it has already resolved and a token minted for that room.
         """
         cfg = self._config
         try:
@@ -1175,43 +1189,77 @@ class BridgeSession:
 
     # -- lifecycle ---------------------------------------------------------------------
 
+    async def _setup_agent_and_room(self) -> None:
+        """Agent-worker creates the room (with its assignment metadata) before this gateway
+        ever joins it — see ``_token()``'s docstring for the race that ordering avoids."""
+        await self._start_agent_session()
+        await self._join_room()
+
     async def run(self) -> None:
         await self._handshake()
-        await self._join_room()
+        cfg = self._config
+        self._room_name = cfg.fixed_room or f"{cfg.room_prefix}{self._session_id}"
         if self._muxer is not None:
             await self._muxer.start()
-        await self._start_agent_session()
 
         # First-completed rather than a TaskGroup, and the distinction is not stylistic. A
         # TaskGroup waits for *every* task, and `_pump_muxer`/`_pump_video` are infinite
         # tickers that never return on their own — so a bridge that closed the socket
-        # **cleanly** left the
-        # group waiting forever on it. `websockets` ends its iterator without raising on a
-        # normal close, so nothing cancelled the siblings, and the session leaked: room
-        # still joined, ffmpeg still running, agent still sitting in the room. Observed
-        # exactly that way — one session still logging stats fifteen minutes after its
-        # bridge had gone.
+        # **cleanly** left the group waiting forever on it. `websockets` ends its iterator
+        # without raising on a normal close, so nothing cancelled the siblings, and the
+        # session leaked: room still joined, ffmpeg still running, agent still sitting in
+        # the room. Observed exactly that way — one session still logging stats fifteen
+        # minutes after its bridge had gone.
         #
-        # Any pump finishing means the session is over, which is precisely FIRST_COMPLETED.
-        pumps = [
-            asyncio.create_task(self._pump_meet_to_room(), name="meet-to-room"),
+        # These three don't need the room or the agent, and starting them immediately keeps
+        # the placeholder (silence + a static frame) flowing to the bridge from the first
+        # instant — a black screen the whole time _setup_agent_and_room is in flight (Init
+        # waiting on WH capacity can take real seconds) would be a worse regression than the
+        # ordering fix above is a win. `_pump_meet_to_room` is the one exception: it needs
+        # `self._source`, which only exists once `_join_room` has run, so it — and the
+        # "agent never joined" watcher, which only makes sense once an agent could plausibly
+        # have joined — are added once setup finishes, below.
+        pending: set[asyncio.Task[None]] = {
             asyncio.create_task(self._pump_muxer(), name="muxer-pump"),
             asyncio.create_task(self._pump_video(), name="video-pump"),
             asyncio.create_task(self._pump_room_to_meet(), name="room-to-meet"),
-        ]
+            asyncio.create_task(self._setup_agent_and_room(), name="setup"),
+        }
         watchers = [
-            asyncio.create_task(self._warn_if_agent_never_joins(), name="agent-watch"),
             asyncio.create_task(self._log_stats(), name="stats"),
         ]
+        setup_task = next(t for t in pending if t.get_name() == "setup")
+
         try:
-            done, pending = await asyncio.wait(pumps, return_when=asyncio.FIRST_COMPLETED)
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            # Re-raise a genuine failure so the caller logs it; a pump that simply returned
-            # (the bridge hung up) ends the session quietly.
-            for task in done:
-                task.result()
+            while True:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                if setup_task in done:
+                    try:
+                        setup_task.result()
+                    except Exception:
+                        for task in pending:
+                            task.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+                        raise
+                    pending.add(
+                        asyncio.create_task(self._pump_meet_to_room(), name="meet-to-room")
+                    )
+                    watchers.append(
+                        asyncio.create_task(
+                            self._warn_if_agent_never_joins(), name="agent-watch"
+                        )
+                    )
+                    continue
+
+                # Any other pump finishing means the session is over.
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                # Re-raise a genuine failure so the caller logs it; a pump that simply
+                # returned (the bridge hung up) ends the session quietly.
+                for task in done:
+                    task.result()
+                break
         finally:
             for task in watchers:
                 task.cancel()
