@@ -1,0 +1,18 @@
+[project]
+name = "avatar-gateway"
+version = "0.1.0"
+description = "Translates meeting-connectors' PCM/fMP4 avatar protocol into a LiveKit room, and starts agent-worker's session via realtime-product's Initialisation service."
+requires-python = ">=3.11"
+dependencies = [
+    "livekit==1.1.14",
+    "livekit-api==1.2.0",
+    "websockets==15.0.1",
+    "python-dotenv==1.2.2",
+    "httpx>=0.27",
+    "numpy>=1.26",
+]
+
+# Two scripts (gateway.py, init_client.py), not an importable package — nothing here
+# needs building or installing itself, only its dependencies.
+[tool.uv]
+package = false

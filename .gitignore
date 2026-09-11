@@ -16,6 +16,10 @@ coverage.xml
 .env.local
 *.log
 
+# avatar_gateway is its own deployable (own venv, own .env) — see avatar_gateway/README.md.
+avatar_gateway/.env
+avatar_gateway/.venv/
+
 # sidecar build artifacts (M5)
 src/connectors/zoom/publisher/sidecar/build/
 *.so
