@@ -664,14 +664,25 @@ class TeamsWebJoiner:
         Never raises and a failure here is not fatal to the session: it means the avatar is
         heard but not seen, which is exactly what ``video_dropped``/``video_published`` in
         ``TeamsWebMediaSink.health()`` stays able to distinguish from a working publish.
+
+        **Always logs, on every path, including the first attempt.** See zoom_web's
+        identical method for why logging only on ``attempt`` truthy — silent on a first-try
+        "success" — hides the one case most worth seeing: a selector list matching nothing
+        looks exactly like a camera that was already on, and only a log on both paths tells
+        them apart.
         """
         for attempt in range(attempts):
             still_off = await self._driver.wait_for_any(
                 self._selectors.camera_on_button, timeout_s=0.5
             )
             if still_off is None:
-                if attempt:
-                    logger.info("teams_web.camera_on", attempts=attempt + 1)
+                logger.info(
+                    "teams_web.camera_on",
+                    attempts=attempt + 1,
+                    note="no matching control found"
+                    if attempt == 0
+                    else "control cleared after a click",
+                )
                 return True
             await self._driver.click_first(self._selectors.camera_on_button)
             await asyncio.sleep(0.5)

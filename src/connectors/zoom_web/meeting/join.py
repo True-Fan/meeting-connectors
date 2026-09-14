@@ -105,15 +105,36 @@ class ZoomWebSelectors:
         "button:has-text('Unmute')",
     )
     camera_on_button: tuple[str, ...] = (
-        # **Unverified against a live meeting — best-effort, same status every selector
-        # list in this file started at.** Zoom labels this control by what a click *does*,
-        # the same convention ``unmute_button`` relies on, so "Start Video" showing means
-        # the camera is off now. Never match "Stop Video" here: that would turn it back off.
+        # **Confirmed live to matter: this whole list matched nothing, silently, every
+        # session, for as long as it existed.** The toolbar's *visible* caption under
+        # this control is the static word "Video" — never "Start Video" — unlike the mic
+        # button, whose caption really does read "Mute"/"Unmute". A `:has-text(...)`
+        # selector against rendered text can therefore never match here, and if the
+        # `aria-label` wording also differs from the desktop-client phrasing this file
+        # assumed, every attribute selector below misses too — which is exactly the
+        # silent-failure shape ``ensure_camera_on`` was found in: no error, no log,
+        # ``still_off is None`` on the very first check (nothing matched, read as
+        # "already on"), camera never actually toggled. See that method's own fix for
+        # why a first-attempt "success" is now always logged instead of swallowed.
+        #
+        # Broadened with the phrasing Zoom's *web* client (as opposed to its desktop
+        # app) is documented to use elsewhere ("start my video" / "stop my video"),
+        # plus id/data-testid and icon-class fallbacks, on top of the original guesses.
+        # Still not confirmed against this build's live DOM — screen access alone (no
+        # Accessibility/automation permission) was not enough to read the button's real
+        # `aria-label` — so treat this as a wider net, not a verified fix.
         "button[aria-label='Start Video']",
         "button[aria-label*='start video' i]",
+        "button[aria-label*='start my video' i]",
         "[role='button'][aria-label*='start video' i]",
+        "[role='button'][aria-label*='start my video' i]",
         "button:has-text('Start Video')",
+        "#video",
+        "button#video",
+        "[data-testid='video-btn']",
+        "[data-testid*='video' i][data-testid*='start' i]",
         ".footer-button__video-icon[aria-label*='start' i]",
+        ".footer-button-base__video-icon[aria-label*='start' i]",
     )
     leave_button: tuple[str, ...] = (
         "button[aria-label='Leave']",
@@ -391,14 +412,30 @@ class ZoomWebJoiner:
         Never raises and a failure here is not fatal to the session: it means the avatar is
         heard but not seen, which is exactly what ``video_dropped``/``video_published`` in
         ``ZoomWebMediaSink.health()`` stays able to distinguish from a working publish.
+
+        **Always logs, on every path, including the first attempt.** It used to log only
+        when ``attempt`` was truthy — success on the very first check, before anything was
+        ever clicked, produced no line at all. That is not a harmless omission: "control
+        absent" is inherently ambiguous between "the camera really is already on" and "the
+        selector list matched nothing, on a build whose DOM nobody has verified it against"
+        — and with no log either way, that ambiguity was invisible. Found by its total
+        absence from a night of real sessions whose video never actually appeared: zero
+        ``camera_on`` and zero ``camera_still_off`` lines between them, from a method that
+        runs unconditionally every session. A wrong selector list is now at least a visible
+        wrong selector list.
         """
         for attempt in range(attempts):
             still_off = await self._driver.wait_for_any(
                 self._selectors.camera_on_button, timeout_s=0.5
             )
             if still_off is None:
-                if attempt:
-                    logger.info("zoom_web.camera_on", attempts=attempt + 1)
+                logger.info(
+                    "zoom_web.camera_on",
+                    attempts=attempt + 1,
+                    note="no matching control found"
+                    if attempt == 0
+                    else "control cleared after a click",
+                )
                 return True
             await self._driver.click_first(self._selectors.camera_on_button)
             await asyncio.sleep(0.5)

@@ -356,6 +356,43 @@ class HandshakeError(Exception):
     """The bridge's hello was absent, malformed, or incompatible."""
 
 
+class MuxerStalledError(Exception):
+    """A write into ffmpeg's stdin or video FIFO did not complete within
+    ``MUXER_WRITE_TIMEOUT_S``.
+
+    Found live, against a real Anam avatar: a hiccup in the avatar's video track
+    (LiveKit's own engine logs ``native video stream queue overflow`` right before
+    it) can leave ffmpeg's video input starved. Because ``-movflags
+    +frag_keyframe`` interleaves audio and video into one fragmented stream,
+    ffmpeg then stops draining its *audio* stdin too — so the muxer's audio leg
+    blocks on a video problem, silently, forever, with no timeout anywhere to
+    catch it. That is not hypothetical: it reproduced identically three times in a
+    row, each time taking the whole gateway process down hard enough that even
+    ``kill -9`` did not return it (a genuinely wedged native write), and the
+    bridge's own WebSocket read then blocked in turn, pegging *that* process too.
+
+    The old dispatch-by-name gateway (``/Users/dev/work/test/avatar_gateway.py``)
+    never hit this because its video is synthesized entirely inside ffmpeg
+    (``-f lavfi -i color=...``) — nothing external ever feeds it, so nothing
+    external can ever stall it. This gateway cannot do that once real avatar video
+    is involved, so instead every write that could block on ffmpeg is bounded: a
+    stall becomes a clean, *session-scoped* failure (this session ends, the
+    process does not) rather than a process-wide, unrecoverable hang."""
+
+
+MUXER_WRITE_TIMEOUT_S = 3.0
+"""How long a single write into ffmpeg may take before it counts as stalled.
+
+Generous relative to the 20ms audio tick and 100ms video tick — a few slow
+ticks under normal jitter must not trip this — but short enough that a real
+stall ends the session in seconds, not indefinitely. The write itself may not
+actually be cancellable (a blocking OS-level write in a thread keeps running
+after this coroutine gives up on it — see ``write_video``), so the timeout does
+not guarantee the stuck resource is reclaimed; it guarantees the *pump loop*
+stops waiting on it and the session can be torn down instead of hanging with it.
+"""
+
+
 # ---------------------------------------------------------------------------------------
 # fMP4 muxing
 # ---------------------------------------------------------------------------------------
@@ -468,28 +505,57 @@ class Fmp4Muxer:
         logger.info("muxer started (pid=%s)", self._process.pid)
 
     async def write(self, pcm: bytes) -> None:
-        """Write one slice of the continuous audio timeline."""
+        """Write one slice of the continuous audio timeline.
+
+        Raises ``MuxerStalledError`` if ffmpeg does not drain stdin within
+        ``MUXER_WRITE_TIMEOUT_S`` — see that error's docstring for why an
+        unbounded ``drain()`` here is exactly what let a stuck video leg take
+        the whole session (and, cascading from there, the bridge) down with it.
+        """
         process = self._process
         if process is None or process.stdin is None:
             return
         try:
             process.stdin.write(pcm)
-            await process.stdin.drain()
+            await asyncio.wait_for(process.stdin.drain(), timeout=MUXER_WRITE_TIMEOUT_S)
             self._bytes_in += len(pcm)
         except (BrokenPipeError, ConnectionResetError):
             logger.warning("muxer stdin closed; ffmpeg has exited")
             self._process = None
+        except TimeoutError:
+            raise MuxerStalledError(
+                f"audio write to ffmpeg stdin did not drain within {MUXER_WRITE_TIMEOUT_S}s"
+            ) from None
 
     async def write_video(self, frame: bytes) -> None:
-        """Write one frame of the continuous video timeline — real or placeholder."""
+        """Write one frame of the continuous video timeline — real or placeholder.
+
+        Raises ``MuxerStalledError`` if the write does not complete within
+        ``MUXER_WRITE_TIMEOUT_S``. ``os.write`` to a FIFO is a genuine blocking OS
+        call, run in a thread precisely so it cannot freeze the event loop by
+        itself — but if ffmpeg has stopped reading, that thread hangs forever
+        regardless, and giving up on *this coroutine* is what lets the pump loop
+        (and the session) recover instead of waiting on a thread that may never
+        return. The thread itself is abandoned, not cancelled — there is no safe
+        way to interrupt a blocking syscall — which is a small, one-time leak per
+        stall and strictly better than the alternative observed live: the whole
+        process wedged into an uninterruptible sleep that not even ``kill -9``
+        could clear.
+        """
         fd = self._video_fd
         if fd is None:
             return
         try:
-            await asyncio.to_thread(os.write, fd, frame)
+            await asyncio.wait_for(
+                asyncio.to_thread(os.write, fd, frame), timeout=MUXER_WRITE_TIMEOUT_S
+            )
         except OSError:
             logger.warning("video fifo closed; ffmpeg has exited")
             self._video_fd = None
+        except TimeoutError:
+            raise MuxerStalledError(
+                f"video write to ffmpeg's FIFO did not complete within {MUXER_WRITE_TIMEOUT_S}s"
+            ) from None
 
     async def read(self) -> bytes:
         """Read whatever fMP4 bytes are available. Empty bytes means end of stream.
@@ -527,7 +593,20 @@ class Fmp4Muxer:
                     await asyncio.wait_for(process.wait(), timeout=5.0)
                 except TimeoutError:
                     process.kill()
-                    await process.wait()
+                    # Bounded even after SIGKILL: every stall observed live was
+                    # this gateway's own write wedging, never ffmpeg refusing to
+                    # die, but an unbounded wait here would let teardown itself
+                    # hang if that ever stopped being true. A leaked process
+                    # (reaped by init on this one's exit) beats aclose() never
+                    # returning and stranding the room, the Init session, and
+                    # this task forever.
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=5.0)
+                    except TimeoutError:
+                        logger.error(
+                            "ffmpeg (pid=%s) did not exit after SIGKILL; abandoning it",
+                            process.pid,
+                        )
 
         fifo_dir, self._video_fifo_dir = self._video_fifo_dir, None
         if fifo_dir is not None:
@@ -1414,6 +1493,13 @@ class Gateway:
                 max_size=None,
                 ping_interval=20.0,
                 ping_timeout=20.0,
+                # This socket carries the avatar's fMP4 — already H.264-encoded, so
+                # deflating it again buys nothing and costs real CPU. Confirmed live:
+                # the bridge's matching page-server socket (meeting-connectors'
+                # src/connectors/zoom_web/page/server.py) sampled at 98% of its
+                # process's CPU inside zlib.deflate once real avatar video was
+                # flowing through it — the same default applies here.
+                compression=None,
             )
             await server.__aenter__()
         except OSError as exc:

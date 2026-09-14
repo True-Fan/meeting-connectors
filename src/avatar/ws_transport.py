@@ -117,6 +117,11 @@ class WebSocketAvatarTransport:
                 max_size=None,  # fMP4 fragments may be large; the framer bounds them
                 ping_interval=20.0,
                 ping_timeout=20.0,
+                # fMP4 video is already H.264-encoded — no benefit from deflating,
+                # and a real CPU cost under ``websockets``' default permessage-deflate.
+                # See zoom_web's page server for the live 98%-CPU-in-zlib sample that
+                # found this class of bug system-wide.
+                compression=None,
             )
         except (WebSocketException, OSError, TimeoutError) as exc:
             self._fail(f"connect failed: {exc}")

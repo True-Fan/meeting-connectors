@@ -58,9 +58,44 @@ AUDIO_CHUNK_MS = 20
 """Audio read granularity. Matches the RTMS ingest cadence, so both directions of the
 pipeline speak in the same size unit."""
 
+RUNAWAY_SAMPLE_FRAMES = 200
+"""How many frames to average over before judging the rate. Large enough that a normal
+network burst — ffmpeg catching up on buffered input after a jitter spike — never trips
+this; a burst is brief, and 200 frames span several real seconds even at video rates."""
+
+RUNAWAY_RATE_MULTIPLE = 20
+"""How far above the format's own rate counts as impossible rather than merely fast.
+
+**Why this exists**: ``_build_command`` intentionally runs ffmpeg with
+``-fflags +nobuffer+discardcorrupt -probesize 32 -analyzeduration 0`` for minimum
+latency — the same flags that make it maximally forgiving of a malformed stream.
+Observed live: when the avatar's own process was killed mid-fragment (a gateway-side
+stall, see ``MuxerStalledError`` in ``avatar_gateway/gateway.py``), the truncated tail
+this decoder had already buffered was enough for ffmpeg to start emitting frames far
+faster than the format's fps/sample-rate could ever produce from a genuine stream —
+and because ``video()``/``audio()`` had no upper bound on how fast they were willing
+to read and yield, neither did the router loop consuming them, nor the pacer queue
+absorbing whatever the router handed it. The whole session pegged the CPU spinning
+on garbage, with no exception anywhere to end it — and cascaded from there, seen live,
+into the bridge process itself becoming unresponsive.
+
+20x is deliberately generous — real ffmpeg output for these formats never approaches
+even a fraction of that — so this only fires on the physically-impossible case, never
+on a legitimate burst."""
+
 
 class FfmpegDecoderError(Exception):
     """The decoder could not be started or died unexpectedly."""
+
+
+class DecoderRunawayError(FfmpegDecoderError):
+    """ffmpeg is producing frames far faster than the format could genuinely allow.
+
+    Not a recoverable condition by waiting — see ``RUNAWAY_RATE_MULTIPLE`` for why it
+    only ever fires on garbage input, which does not become good input by reading more
+    of it. The caller should let this end the session (or invoke
+    ``DecodePipeline.restart`` if resuming without new avatar bytes is valid for the
+    call site), the same as any other decoder death — never retried in place."""
 
 
 class FfmpegDecoder:
@@ -71,6 +106,8 @@ class FfmpegDecoder:
         "_audio_frames",
         "_audio_reader",
         "_audio_transport",
+        "_audio_window_frames",
+        "_audio_window_started_us",
         "_clock",
         "_ctx",
         "_detail",
@@ -81,6 +118,8 @@ class FfmpegDecoder:
         "_stderr_task",
         "_video_format",
         "_video_frames",
+        "_video_window_frames",
+        "_video_window_started_us",
     )
 
     def __init__(
@@ -108,6 +147,10 @@ class FfmpegDecoder:
         self._detail: str | None = None
         self._video_frames = 0
         self._audio_frames = 0
+        self._video_window_frames = 0
+        self._video_window_started_us = 0
+        self._audio_window_frames = 0
+        self._audio_window_started_us = 0
 
     # -- MediaDecoder ------------------------------------------------------
 
@@ -239,6 +282,7 @@ class FfmpegDecoder:
                 is_keyframe=True,
             )
             self._video_frames += 1
+            self._check_video_not_runaway()
             if self._metrics is not None:
                 self._metrics.observe(
                     MetricName.DECODE_US,
@@ -270,9 +314,54 @@ class FfmpegDecoder:
 
     def _audio_frame(self, pcm: bytes) -> AudioFrame:
         self._audio_frames += 1
+        self._check_audio_not_runaway()
         return AudioFrame(
             pcm=pcm, pts_us=self._clock.now_us(), format=self._audio_format, ctx=self._ctx
         )
+
+    def _check_video_not_runaway(self) -> None:
+        """Raise if the last ``RUNAWAY_SAMPLE_FRAMES`` video frames arrived impossibly
+        fast. See ``RUNAWAY_RATE_MULTIPLE`` for why this only ever fires on garbage."""
+        if self._video_window_frames == 0:
+            self._video_window_started_us = self._clock.now_us()
+        self._video_window_frames += 1
+        if self._video_window_frames < RUNAWAY_SAMPLE_FRAMES:
+            return
+
+        elapsed_s = (self._clock.now_us() - self._video_window_started_us) / 1_000_000
+        expected_s = RUNAWAY_SAMPLE_FRAMES / self._video_format.fps
+        self._video_window_frames = 0
+        if elapsed_s < expected_s / RUNAWAY_RATE_MULTIPLE:
+            self._state = ComponentState.UNHEALTHY
+            self._detail = f"runaway: {RUNAWAY_SAMPLE_FRAMES} video frames in {elapsed_s:.3f}s"
+            raise DecoderRunawayError(
+                f"ffmpeg emitted {RUNAWAY_SAMPLE_FRAMES} video frames in {elapsed_s:.3f}s — "
+                f"more than {RUNAWAY_RATE_MULTIPLE}x what {self._video_format.fps}fps allows; "
+                "treating the input as corrupt rather than publishing it"
+            )
+
+    def _check_audio_not_runaway(self) -> None:
+        """Raise if the last ``RUNAWAY_SAMPLE_FRAMES`` audio chunks arrived impossibly
+        fast. Each chunk is a fixed ``AUDIO_CHUNK_MS`` slice by construction (``audio()``
+        always reads exactly ``chunk_bytes``), so the expected duration does not depend
+        on the format's sample rate — only on how many chunks and how long each one is."""
+        if self._audio_window_frames == 0:
+            self._audio_window_started_us = self._clock.now_us()
+        self._audio_window_frames += 1
+        if self._audio_window_frames < RUNAWAY_SAMPLE_FRAMES:
+            return
+
+        elapsed_s = (self._clock.now_us() - self._audio_window_started_us) / 1_000_000
+        expected_s = RUNAWAY_SAMPLE_FRAMES * AUDIO_CHUNK_MS / 1_000
+        self._audio_window_frames = 0
+        if elapsed_s < expected_s / RUNAWAY_RATE_MULTIPLE:
+            self._state = ComponentState.UNHEALTHY
+            self._detail = f"runaway: {RUNAWAY_SAMPLE_FRAMES} audio chunks in {elapsed_s:.3f}s"
+            raise DecoderRunawayError(
+                f"ffmpeg emitted {RUNAWAY_SAMPLE_FRAMES} audio chunks in {elapsed_s:.3f}s — "
+                f"more than {RUNAWAY_RATE_MULTIPLE}x what {AUDIO_CHUNK_MS}ms chunks allow; "
+                "treating the input as corrupt rather than publishing it"
+            )
 
     async def stop(self) -> None:
         """Terminate ffmpeg and release resources. Idempotent, and never blocks forever.

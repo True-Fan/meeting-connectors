@@ -150,7 +150,21 @@ class PageAudioServer:
         if self._server is not None:
             return
         self._server = await serve(
-            self._handle, self._host, 0, process_request=self._authenticate
+            self._handle,
+            self._host,
+            0,
+            process_request=self._authenticate,
+            # This socket carries the avatar's real audio and video frames to the
+            # page, tens of times a second at real video's bitrate — media that is
+            # already dense and gains nothing from deflating. Left on its default,
+            # ``websockets``' permessage-deflate compressed every frame anyway, and
+            # sampled live at 98% of the process's CPU in ``zlib.deflate`` alone: a
+            # single stuck core reading everything else in the event loop, which is
+            # what actually broke Zoom sessions with real avatar video (this class
+            # of bug — a needless-but-defaulted cost paid on every real-video frame —
+            # is themed identically to why the gateway now bounds ``Fmp4Muxer``'s
+            # writes; see its ``MuxerStalledError``).
+            compression=None,
         )
         sockets = getattr(self._server, "sockets", None) or []
         if sockets:

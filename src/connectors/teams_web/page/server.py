@@ -149,7 +149,16 @@ class PageAudioServer:
         if self._server is not None:
             return
         self._server = await serve(
-            self._handle, self._host, 0, process_request=self._authenticate
+            self._handle,
+            self._host,
+            0,
+            process_request=self._authenticate,
+            # Same socket shape as zoom_web's page server, same fix: this carries
+            # dense audio/video frames that gain nothing from compression and pay
+            # real CPU for it under ``websockets``' default permessage-deflate — see
+            # ``zoom_web/page/server.py``'s ``start()`` for the live 98%-CPU sample
+            # that found it.
+            compression=None,
         )
         sockets = getattr(self._server, "sockets", None) or []
         if sockets:

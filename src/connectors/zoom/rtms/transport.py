@@ -68,6 +68,11 @@ class WebSocketTransport:
                 # (msg_type 12/13), so protocol-level pings would be redundant
                 # traffic that can also race the application watchdog.
                 ping_interval=None,
+                # Media frames over this socket, same as every other media
+                # WebSocket in this codebase — no benefit from deflating, and a
+                # real CPU cost under load. See zoom_web's page server for the
+                # live 98%-CPU-in-zlib sample that found this class of bug.
+                compression=None,
             )
         except (WebSocketException, OSError, TimeoutError) as exc:
             raise RtmsConnectionError(f"cannot connect to {url}: {exc}") from exc

@@ -130,6 +130,10 @@ class PageBridgeServer:
                 # pings racing with it produced spurious closes under load. One liveness
                 # mechanism, at the layer that can act on it.
                 ping_interval=None,
+                # This socket carries the avatar's audio/video frames to the page —
+                # dense media, no benefit from deflating. See zoom_web's page server
+                # for the live 98%-CPU-in-zlib sample that found this class of bug.
+                compression=None,
             )
         except (OSError, WebSocketException) as exc:
             raise BridgeUnavailableError(
