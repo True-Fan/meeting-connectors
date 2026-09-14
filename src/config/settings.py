@@ -612,6 +612,28 @@ class AvatarSettings(BaseModel):
     """Bounded outbound queue, ~500 ms at 20 ms frames. Overflow drops oldest and
     counts it — it must never block the ingest reader (doc 003 §7.2)."""
 
+    chunk_queue_size: int = Field(default=10, ge=1)
+    """Bounded inbound queue of fMP4 fragments from the avatar, in units of
+    ``GATEWAY_FRAGMENT_MS`` (100ms by default) — so 10 is ~1s of buffer.
+
+    **Confirmed live as the dominant contributor to end-to-end latency**, at its old
+    default of 64: once the decode pipeline falls even briefly behind real-time (a GC
+    pause, a CPU spike, a network hiccup), nothing here ever catches back up — this
+    queue absorbs the backlog instead of shedding it, and every fragment after that
+    is delayed by exactly how far behind the queue got. At 64 that ceiling was 6.4s of
+    silently-accumulating latency, on top of whatever the AI pipeline itself takes, and
+    it never recovers within a session: the gap can only grow.
+
+    ``OverflowPolicy.DROP_NEWEST`` on this queue (see ``WebSocketAvatarTransport``)
+    means a full queue discards the *freshest* incoming fragment and keeps playing out
+    the stale backlog — never drop-oldest, because middle-of-stream fragments are not
+    proven safe to skip in the demuxer this decodes with. So this size is the entire
+    lever for bounding worst-case latency: smaller caps the backlog sooner (favouring
+    freshness once a session is genuinely behind) at the cost of shedding more under
+    real jitter. 10 (~1s) matches the same order of magnitude as the pacer's own
+    ``MC_MEDIA__AUDIO_QUEUE_SIZE`` (10 × 20ms) and ``MC_MEDIA__VIDEO_QUEUE_SIZE`` (3) —
+    both already tuned for healthy jitter, not multi-second recovery."""
+
 
 class ZoomWebSettings(BaseModel):
     """Zoom joined with a browser, publishing through a virtual microphone.

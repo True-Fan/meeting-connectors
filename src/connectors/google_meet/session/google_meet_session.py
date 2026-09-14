@@ -413,6 +413,7 @@ class GoogleMeetSessionFactory:
                 ctx=ctx,
                 clock=clock,
                 send_queue_size=config.avatar_send_queue_size,
+                chunk_queue_size=config.avatar_chunk_queue_size,
                 open_timeout_s=config.avatar_connect_timeout_s,
                 metrics=self._metrics,
             ),

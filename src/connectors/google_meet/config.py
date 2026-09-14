@@ -116,6 +116,7 @@ class GoogleMeetConnectorConfig:
     avatar_url: str
     avatar_connect_timeout_s: float
     avatar_send_queue_size: int
+    avatar_chunk_queue_size: int
     avatar_reconnect_initial_delay_s: float
     avatar_reconnect_max_delay_s: float
     avatar_reconnect_max_attempts: int
@@ -371,6 +372,7 @@ class GoogleMeetConnectorConfig:
             avatar_url=settings.avatar.url,
             avatar_connect_timeout_s=settings.avatar.connect_timeout_s,
             avatar_send_queue_size=settings.avatar.send_queue_size,
+            avatar_chunk_queue_size=settings.avatar.chunk_queue_size,
             avatar_reconnect_initial_delay_s=settings.avatar.reconnect_initial_delay_s,
             avatar_reconnect_max_delay_s=settings.avatar.reconnect_max_delay_s,
             avatar_reconnect_max_attempts=settings.avatar.reconnect_max_attempts,

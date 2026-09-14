@@ -33,9 +33,6 @@ from src.services.media.queues import BoundedFrameQueue, OverflowPolicy
 
 logger = get_logger(__name__)
 
-VIDEO_LATE_TOLERANCE_US = 40_000
-"""One frame period at 25 fps. Beyond this a frame is stale and dropped."""
-
 AUDIO_LATE_TOLERANCE_US = 100_000
 """How far the audio *schedule* may slip before it is rebased on the clock.
 
@@ -344,19 +341,41 @@ class Pacer:
     # -- queue draining ----------------------------------------------------
 
     def _take_video(self) -> VideoFrame | None:
-        """Take the freshest video frame that is not already stale."""
+        """Take the freshest video frame, discarding whatever it has already superseded.
+
+        **Used to judge staleness by ``frame.pts_us`` against ``VIDEO_LATE_TOLERANCE_US``
+        — the same flaw ``_take_audio``'s docstring documents and fixed for audio.**
+        ``FfmpegDecoder`` stamps ``pts_us`` with ``clock.now_us()`` at the moment of
+        *decode*, not a stream-relative presentation time, and decode is bursty by that
+        same docstring's own live observation (ffmpeg pausing ~0.5s and catching up at
+        1.05x). Frames decoded in the same burst share a decode-time timestamp that is
+        already "stale" against a one-frame-period (40ms) tolerance the instant ordinary
+        scheduling jitter puts even a single pacer tick between decode and drain —
+        whether or not anything actually fresher superseded them. Confirmed live: 2125
+        of ~2500 decoded frames discarded as "stale" in one session, an ~85% loss that
+        reads as a near-frozen, badly compressed avatar even though the underlying video
+        was neither.
+
+        The fix drops the decode-time clock and uses the one signal that is actually
+        true: whether a fresher frame is *already queued behind this one*. Video really
+        is "only the freshest is worth showing" (unlike audio, a sequence of
+        alternatives rather than a continuum) — but that only needs comparing frames to
+        each other, never to a clock neither side of this queue agrees on.
+        """
         muted = self.is_muted
-        while (frame := self._video_queue.get_nowait()) is not None:
+        frame: VideoFrame | None = None
+        while (candidate := self._video_queue.get_nowait()) is not None:
             if muted:
                 # Video as well as audio, so an interrupted avatar visibly returns to
                 # listening rather than mouthing a sentence nobody can hear.
                 self._count_drop("video", "interrupted")
                 continue
-            if self._clock.is_late(frame.pts_us, tolerance_us=VIDEO_LATE_TOLERANCE_US):
+            if frame is not None:
+                # `frame` was queued before `candidate` and is superseded by it —
+                # genuinely stale, no clock required to know that.
                 self._count_drop("video", "stale")
-                continue
-            return frame
-        return None
+            frame = candidate
+        return frame
 
     def _take_audio(self) -> AudioFrame | None:
         """The next chunk to publish, trimming silence when a backlog has built up.

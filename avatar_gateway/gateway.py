@@ -283,11 +283,27 @@ class Config:
     # sees one fixed format regardless of which TTS voice or provider is in use.
     agent_audio_rate_hz: int = 48_000
 
-    # Placeholder video geometry. Small and cheap on purpose — the bridge rescales to
-    # MC_GOOGLE_MEET__VIDEO_* before publishing, and this stream carries no information.
+    # Video geometry — shared by the placeholder *and* any real avatar video
+    # (``_pump_video`` scales real frames onto this same fixed size before muxing).
+    # The small, cheap defaults below predate real avatar video: they were sized
+    # only for the placeholder box, which "carries no information" so nothing was
+    # lost rescaling it. Real avatar video (Anam etc.) arrives around 1152x768 to
+    # 1280x720, and the bridge's own decoder upscales whatever it receives back up
+    # to its own MC_MEDIA__VIDEO_WIDTH/HEIGHT (1280x720@25 by default) before
+    # publishing — so at the small defaults, every real session was silently
+    # downscaled here and then upscaled again downstream, which never recovers
+    # detail and reads as visibly blurry video in the meeting. Set
+    # GATEWAY_VIDEO_WIDTH/HEIGHT/FPS to match the bridge's own target (see its
+    # MC_MEDIA__VIDEO_* settings) to remove that wasted round trip.
     video_width: int = 320
     video_height: int = 180
     video_fps: int = 10
+    video_bitrate_kbps: int = 2000
+    """Was hardcoded at 200 — fine for a 320x180 placeholder box, visibly blocky
+    once real avatar video is flowing at anything close to 720p. 2000 (2 Mbps) is a
+    reasonable talking-head-at-720p25 default for libx264's ultrafast/zerolatency
+    preset; raise it further if the network budget allows and quality still isn't
+    where it should be."""
     video_color: str = "0x202124"
     video_image: str | None = None
 
@@ -333,6 +349,7 @@ class Config:
             video_width=int(os.getenv("GATEWAY_VIDEO_WIDTH", "320")),
             video_height=int(os.getenv("GATEWAY_VIDEO_HEIGHT", "180")),
             video_fps=int(os.getenv("GATEWAY_VIDEO_FPS", "10")),
+            video_bitrate_kbps=int(os.getenv("GATEWAY_VIDEO_BITRATE_KBPS", "2000")),
             video_color=os.getenv("GATEWAY_VIDEO_COLOR", "0x202124"),
             video_image=os.getenv("GATEWAY_VIDEO_IMAGE") or None,
             fragment_ms=int(os.getenv("GATEWAY_FRAGMENT_MS", "100")),
@@ -462,7 +479,7 @@ class Fmp4Muxer:
             "-tune", "zerolatency",
             "-pix_fmt", "yuv420p",
             "-g", str(max(cfg.video_fps * 2, 2)),
-            "-b:v", "200k",
+            "-b:v", f"{cfg.video_bitrate_kbps}k",
             "-c:a", "aac",
             "-b:a", "96k",
             # Exactly the flags the framer and FfmpegDecoder need. `default_base_moof`
