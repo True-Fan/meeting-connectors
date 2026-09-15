@@ -48,6 +48,17 @@ _AUTH_PATHS: tuple[str, ...] = (
     "Default/Preferences",
     "Default/Secure Preferences",
     "Local State",
+    # Web storage, and the reason a clone could land on Google's *account chooser* while
+    # ``meet_signin.py --check`` reported the template as signed in. That check runs against
+    # the template itself (``clone_per_session=False``), so it never exercised a clone — and
+    # cookies alone are not the whole of a Google web session. The account chooser is
+    # precisely the page Google serves when it can see a session but cannot tell which
+    # account to resume, which is state that lives here rather than in ``Cookies``.
+    "Default/Local Storage",
+    "Default/Session Storage",
+    "Default/WebStorage",
+    "Default/Accounts",
+    "Default/IndexedDB",
 )
 """What has to be copied for the working profile to be signed in.
 
@@ -175,7 +186,12 @@ class ProfileManager:
                 continue
             target = working / relative
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
+            if source.is_dir():
+                # Chromium's web storage is a directory of LevelDB files; copy2 would raise
+                # on it. dirs_exist_ok because a working profile may be reseeded.
+                shutil.copytree(source, target, dirs_exist_ok=True)
+            else:
+                shutil.copy2(source, target)
             copied += 1
         return copied
 

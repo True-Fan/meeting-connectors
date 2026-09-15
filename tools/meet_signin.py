@@ -41,7 +41,59 @@ from src.connectors.google_meet.config import GoogleMeetConnectorConfig
 from src.domain.media import VideoFormat
 
 SIGN_IN_URL = "https://accounts.google.com/"
+MEET_URL = "https://meet.google.com/"
 POLL_SECONDS = 3.0
+
+
+async def _warm_meet(driver, *, interactive: bool, timeout_s: float = 300.0) -> bool:
+    """Visit Meet so Google mints this profile's Meet service cookie.
+
+    **Signing in to Google is not the same as being signed in to Meet, and that gap is what
+    sent every session to the account chooser.** Google issues a per-service ``OSID`` on
+    first visit to each product, via a redirect through ``accounts.google.com`` — the
+    ``osid=1`` in that chooser URL is exactly this handshake. A profile signed in only at
+    ``accounts.google.com`` has ``OSID`` for whatever it happened to visit (``myaccount``,
+    typically) and nothing for ``meet.google.com``, so every later run starts by trying to
+    mint one, unattended, and stalls on the chooser.
+
+    Doing it here, once, with a human present, leaves the cookie in the template for every
+    clone to inherit.
+    """
+    try:
+        await driver.goto(MEET_URL, timeout_s=60.0)
+        await asyncio.sleep(POLL_SECONDS)
+        landed = driver.current_url()
+    except Exception as exc:
+        print(f"  !  could not reach Meet to mint its cookie: {exc}")
+        return False
+
+    if "accounts.google.com" not in landed:
+        print(f"  meet    : OK ({landed})")
+        return True
+
+    # Google is asking which account to use. It will not choose for us — with several
+    # accounts ever used in this profile there is no unambiguous default, which is why an
+    # unattended run can never get past this page and why it must be cleared once, by hand.
+    if not interactive:
+        print(f"\n  x Meet bounced to the account chooser: {landed}")
+        print("    Run this tool WITHOUT --check and pick the account in the window.\n")
+        return False
+
+    print("\n  Google is asking which account to use for Meet.")
+    print("  >> Pick the avatar's account in the open window. Waiting...\n")
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(POLL_SECONDS)
+        if not driver.is_alive():
+            print("\n  x the browser was closed before Meet was reached.\n")
+            return False
+        landed = driver.current_url()
+        if "accounts.google.com" not in landed and "meet.google.com" in landed:
+            print(f"  meet    : OK ({landed})")
+            return True
+        print(f"    ...still on {landed[:70]}")
+    print(f"\n  x timed out after {timeout_s:.0f}s on the account chooser.\n")
+    return False
 
 
 async def run(*, check_only: bool, timeout_s: float) -> int:
@@ -83,7 +135,12 @@ async def run(*, check_only: bool, timeout_s: float) -> int:
         status = await verify_signed_in(driver, timeout_s=60.0)
         if status.signed_in:
             print(f"  account : {status.account_hint or 'signed in'}")
-            print("\n  OK - this profile is already signed in. Nothing to do.\n")
+            # Signed in to Google, but Meet's own cookie may still be missing — that is the
+            # state this tool used to call "nothing to do" while every session hit the
+            # chooser. Always warm it.
+            if not await _warm_meet(driver, interactive=not check_only):
+                return 1
+            print("\n  OK - this profile is signed in to Google and to Meet.\n")
             return 0
 
         if check_only:
@@ -108,6 +165,8 @@ async def run(*, check_only: bool, timeout_s: float) -> int:
                 return 1
             status = await verify_signed_in(driver, timeout_s=30.0)
             if status.signed_in:
+                if not await _warm_meet(driver, interactive=True):
+                    return 1
                 print(f"\n  OK - signed in as {status.account_hint or 'the chosen account'}")
                 print(f"    session saved to {template.resolve()}")
                 print("    every later run inherits it; you should not need this tool")
