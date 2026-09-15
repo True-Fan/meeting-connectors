@@ -196,13 +196,21 @@ class PageAudioServer:
         Never raises. A send that fails is a page that went away, which the session
         notices through health rather than through an exception on the pacer's path.
         """
-        if not self._clients:
+        clients = tuple(self._clients)
+        if not clients:
             return
-        for client in tuple(self._clients):
-            try:
-                await client.send(payload)
-            except (WebSocketException, RuntimeError):
+        # Concurrently, not one awaited send after another — see the same change in
+        # teams_web's page server: every video frame is a full raw I420 buffer, and
+        # serialising the sends multiplied that cost by the attached-frame count on the
+        # pacer's 20 ms real-time critical path.
+        results = await asyncio.gather(
+            *(client.send(payload) for client in clients), return_exceptions=True
+        )
+        for client, result in zip(clients, results):
+            if isinstance(result, (WebSocketException, RuntimeError)):
                 self._clients.discard(client)
+            elif isinstance(result, BaseException):
+                raise result
 
     async def stop(self) -> None:
         """Close the socket and release the port. Idempotent."""

@@ -41,7 +41,7 @@ from src.protocols.hand_raise_source import HandRaiseSource
 from src.services.media.clock import MediaClock
 from src.services.media.decode_pipeline import DecodePipeline
 from src.services.media.echo_guard import EchoGuard
-from src.services.media.pacer import Pacer
+from src.services.media.pacer import Pacer, _is_audible
 from src.services.media.speech_detector import SpeechDetector
 
 logger = get_logger(__name__)
@@ -77,6 +77,7 @@ class MediaRouter:
         "_hands_forwarded",
         "_metrics",
         "_pacer",
+        "_response_audible",
         "_source",
         "_speaker_provider",
         "_speech",
@@ -136,6 +137,7 @@ class MediaRouter:
         self._suppressed = 0
         self._chat_forwarded = 0
         self._hands_forwarded = 0
+        self._response_audible = False
 
     @property
     def stats(self) -> dict[str, int]:
@@ -522,6 +524,13 @@ class MediaRouter:
     async def _route_audio(self) -> None:
         await self._decode.wait_started()
         async for frame in self._decode.decoder.audio():
+            audible = _is_audible(frame.pcm)
+            if audible and not self._response_audible:
+                # Earliest point the connector can see a reply: straight out of ffmpeg,
+                # before the pacer queues it. Delta back to the gateway's line is
+                # socket+decode; delta forward to pacer.response_audible is the queue.
+                logger.info("router.response_decoded", **frame.ctx.as_log_fields())
+            self._response_audible = audible
             self._pacer.submit_audio(frame)
             if self._metrics is not None:
                 self._metrics.observe(

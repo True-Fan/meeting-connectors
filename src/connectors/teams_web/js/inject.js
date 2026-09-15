@@ -766,6 +766,18 @@
       pc.addEventListener('track', (event) => {
         try {
           if (!event.track || event.track.kind !== 'audio') return;
+          // Minimise Chromium's receive jitter buffer (NetEQ) on the meeting's audio. What we
+          // tap has already been through it, so whatever it holds is added to every turn before
+          // the agent even hears the question. A hint, not a guarantee: Chrome clamps it to what
+          // the network allows and raises it again under real loss.
+          try {
+            if (event.receiver) {
+              event.receiver.jitterBufferTarget = 0;
+              event.receiver.playoutDelayHint = 0;
+            }
+          } catch (err) {
+            /* older Chromium: the property is absent, nothing to tune */
+          }
           const stream = (event.streams && event.streams[0]) || new MediaStream([event.track]);
           tapStream(stream, 'rtc');
         } catch (err) {

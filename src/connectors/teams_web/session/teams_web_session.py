@@ -104,6 +104,14 @@ _PAGE_PROBE = """() => {
     reconnectPending: s.reconnectTimer !== null,
     connectError: s.connectError,
     playoutFrames: s.frames,
+    playoutBufferedMs: s.playoutStats && s.context
+      ? Math.round((s.playoutStats.buffered / s.context.sampleRate) * 1000) : null,
+    playoutUnderruns: s.playoutStats ? s.playoutStats.underruns : null,
+    playoutDropped: s.playoutStats ? s.playoutStats.dropped : null,
+    rtcInboundJitterMs: s.rtcStats ? s.rtcStats.inboundJitterMs : null,
+    rtcOutboundRttMs: s.rtcStats ? s.rtcStats.outboundRttMs : null,
+    rtcOutboundJitterMs: s.rtcStats ? s.rtcStats.outboundJitterMs : null,
+    rtcOutboundLost: s.rtcStats ? s.rtcStats.outboundLost : null,
     captureSources: s.captureSources,
     captureFrames: s.captureFrames,
     micTrack: !!s.micTrack,
@@ -139,6 +147,9 @@ _MAX_CONSOLE_LINES = 20
 _WS_OPEN = 1
 """``WebSocket.OPEN``. Anything else means the avatar's audio has nowhere to go and no page
 observation can be reported — including the ones that would say so."""
+
+_PROBE_LOOP_INTERVAL_S = 10.0
+"""How often ``_probe_loop`` re-reads the page once the session is live."""
 
 _PROBE_ATTEMPTS = 6
 _PROBE_INTERVAL_S = 1.0
@@ -176,6 +187,7 @@ class TeamsWebSession:
         "_session",
         "_source",
         "_speakers",
+        "_probe_task",
         "_task",
         "_temp_profile",
         "_transcript",
@@ -220,6 +232,7 @@ class TeamsWebSession:
         self._announcer = announcer
         self._joined = False
         self._task: asyncio.Task[None] | None = None
+        self._probe_task: asyncio.Task[None] | None = None
         self._temp_profile: str | None = None
         self._console_lines = 0
 
@@ -342,6 +355,7 @@ class TeamsWebSession:
 
         await self._source.start()
         self._task = asyncio.create_task(self._router.run(), name="media-router")
+        self._probe_task = asyncio.create_task(self._probe_loop(), name="page-probe")
 
         # After the router, because the announcer has nothing to send until the avatar client
         # has completed its handshake — its first push happens one settle interval later, by
@@ -358,6 +372,12 @@ class TeamsWebSession:
         # Before the router, so it cannot try to send on a transport that is being closed.
         if self._announcer is not None:
             await self._announcer.stop()
+
+        probe_task, self._probe_task = self._probe_task, None
+        if probe_task is not None:
+            probe_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await probe_task
 
         task, self._task = self._task, None
         if task is not None:
@@ -459,6 +479,18 @@ class TeamsWebSession:
         except Exception:  # pragma: no cover - defensive
             pass
 
+    async def _probe_loop(self) -> None:
+        """Re-read the page's counters on a timer.
+
+        The join-time probe runs before the avatar leg is connected, so every playout and
+        transport figure in it is structurally zero. The numbers that matter only exist once
+        media is flowing.
+        """
+        while True:
+            await asyncio.sleep(_PROBE_LOOP_INTERVAL_S)
+            with suppress(Exception):
+                await self._probe_page()
+
     async def _probe_page(self) -> None:
         """Ask the page what state the injected script is actually in. Never raises.
 
@@ -539,6 +571,15 @@ class TeamsWebSession:
             capture_sources=probe.get("captureSources"),
             capture_frames=probe.get("captureFrames"),
             playout_frames=probe.get("playoutFrames"),
+            playout_buffered_ms=probe.get("playoutBufferedMs"),
+            playout_underruns=probe.get("playoutUnderruns"),
+            playout_dropped=probe.get("playoutDropped"),
+            # Teams' own transport, straight from the browser — the legs no other
+            # instrument in this system can reach.
+            rtc_inbound_jitter_ms=probe.get("rtcInboundJitterMs"),
+            rtc_outbound_rtt_ms=probe.get("rtcOutboundRttMs"),
+            rtc_outbound_jitter_ms=probe.get("rtcOutboundJitterMs"),
+            rtc_outbound_lost=probe.get("rtcOutboundLost"),
         )
 
     def _page_bootstrap(self) -> str:

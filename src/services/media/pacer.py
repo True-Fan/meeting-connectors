@@ -491,6 +491,16 @@ class Pacer:
         # Silence cannot echo, so there is nothing to defend against while publishing it.
         # That makes energy the correct trigger rather than mere frame arrival.
         audible = not is_idle and _is_audible(frame.pcm)
+        if audible and not self._speaking:
+            # Latency probe, paired with avatar_gateway's "agent started speaking" line. Both
+            # processes share a clock, so the wall-clock delta between the two is everything
+            # the connector adds: socket, decode, these queues, and the page's playout ring.
+            logger.info(
+                "pacer.response_audible",
+                audio_backlog=self._audio_queue.qsize(),
+                video_backlog=self._video_queue.qsize(),
+                **self._ctx.as_log_fields(),
+            )
         self._speaking = audible
         if audible and self._echo_guard is not None:
             self._echo_guard.note_publishing(self._clock.now_us())

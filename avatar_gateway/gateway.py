@@ -145,6 +145,52 @@ subscribed. So the gateway sends this the instant an AGENT participant joins (se
 ``_on_participant_connected``), rather than leaving every session to pay the feature's own
 20s default timeout in silence before it greets anyway."""
 
+MIC_GATE_HOLD_S = 0.2
+"""How long the meeting's audio keeps flowing into the room after the last audible frame.
+
+**Why the inbound track is gated at all.** What arrives here is a tap of the whole meeting
+mix: continuous, never digitally silent, and carrying whatever room tone the participant's
+microphone picks up. The agent's STT endpointer decides a turn is over by observing silence,
+and low-level room tone is not silence — so it waits, and every reply pays for it. A browser
+joining the same room does not have this problem, because WebRTC's own VAD/DTX means the
+agent sees true gaps between utterances; measured against that baseline this tap was costing
+1.5-2s per turn.
+
+So non-speech is replaced with **digital zeros** rather than dropped. The track stays
+continuous at exactly real time — no gaps for the encoder or the room to interpret, nothing
+downstream sees a stream that stops and starts — only the *content* between utterances
+becomes true silence, which is what the endpointer is waiting for.
+
+Matched to ``SpeechDetector.RELEASE_MS`` in the bridge: longer than the pauses inside a
+sentence, shorter than the pause after one. The frame that carries a word's onset is itself
+audible, so it passes whole — the gate can only ever zero audio that was already below the
+floor."""
+
+CAPTURE_QUEUE_FRAMES = 10
+"""Inbound meeting frames (20 ms each) that may wait to be pushed into the room.
+
+**The bound is the whole point, and its absence was worth four seconds.**
+``rtc.AudioSource.capture_frame`` is rate-limited to real time by design — it returns when
+its buffer has room, not when the write lands. Awaiting it directly from the socket reader
+made the reader real-time too, and a reader that can never run *faster* than real time can
+never drain a backlog: one burst at startup, or one stall, became a standing queue that
+persisted for the rest of the session. Every inbound frame — and every chat message behind it
+on the same socket — inherited that delay. Measured live at 4.3s and 4.7s between the bridge
+putting a chat line on the wire and this process taking it off.
+
+So the reader now only enqueues, and this is the ceiling on how far behind the room can get:
+200 ms, after which the oldest frame is dropped. Shedding is correct here and mirrors what
+the bridge's own ``Pacer`` does in the other direction — stale meeting audio is worth less
+than a prompt answer, and the agent's STT would rather miss 20 ms than hear everything four
+seconds late."""
+
+REPLY_GAP_TICKS = 50
+"""Silent ticks (20 ms each) that must precede a rising edge for it to count as a new reply.
+
+The agent's speech dips below the floor between words, so without this the latency probe
+fires a dozen times per sentence, each one measuring from the same stale reference and
+reporting a larger number than the last."""
+
 SILENCE_FLOOR = 512
 """Peak ``|sample|`` at or above which audio counts as sound, on int16's 32767 scale. Matches
 the bridge's ``Pacer.SILENCE_FLOOR``, so both sides of the socket agree on what silence is."""
@@ -707,6 +753,19 @@ class BridgeSession:
         self._room_name = ""
         self._init_session: InitSession | None = None
         self._agent_pcm = bytearray()
+        # Response-latency probe. Measured here because this process is the one boundary all
+        # three connectors share: everything upstream of it is agent-worker + Anam, everything
+        # downstream is the connector. `_last_user_audible_at` is stamped from the meeting
+        # audio arriving over the bridge socket; `_agent_was_audible` latches the agent's
+        # speech so the gap is logged once per reply rather than fifty times a second.
+        self._last_user_audible_at: float | None = None
+        self._agent_was_audible = False
+        self._silent_run = 0
+        # Whether meeting audio is currently passing into the room — see MIC_GATE_HOLD_S.
+        self._mic_gate_open = False
+        self._capture_queue: asyncio.Queue[rtc.AudioFrame] = asyncio.Queue(
+            maxsize=CAPTURE_QUEUE_FRAMES
+        )
         # Latest frame only — a live feed has no backlog worth keeping, and holding one is
         # what keeps this from ever building latency the way a queue would. None until (and
         # unless) an avatar backend actually publishes video; _pump_video falls back to the
@@ -1023,20 +1082,36 @@ class BridgeSession:
             samples = len(message) // (BYTES_PER_SAMPLE * INPUT_CHANNELS)
             if samples == 0:
                 continue
+
+            # Speech gate — see MIC_GATE_HOLD_S. Held open for a moment after the last
+            # audible frame so the quiet tail of a word is never zeroed mid-utterance.
+            now = time.monotonic()
+            if _is_audible(message):
+                self._last_user_audible_at = now
+                self._mic_gate_open = True
+            elif self._mic_gate_open and (
+                self._last_user_audible_at is None
+                or now - self._last_user_audible_at > MIC_GATE_HOLD_S
+            ):
+                self._mic_gate_open = False
+            payload = message if self._mic_gate_open else bytes(len(message))
+
             frame = rtc.AudioFrame(
-                data=message,
+                data=payload,
                 sample_rate=INPUT_SAMPLE_RATE_HZ,
                 num_channels=INPUT_CHANNELS,
                 samples_per_channel=samples,
             )
+            # Enqueue; never await the room from here — see CAPTURE_QUEUE_FRAMES. Dropping
+            # the oldest bounds the delay instead of letting it accumulate silently.
             try:
-                # Bounded rather than unbounded: blocking here would stop reading the
-                # socket, and the bridge's send queue would then drop meeting audio for a
-                # reason it could not diagnose.
-                await asyncio.wait_for(source.capture_frame(frame), timeout=1.0)
-            except TimeoutError:
-                self.stats.dropped_capture += 1
-                continue
+                self._capture_queue.put_nowait(frame)
+            except asyncio.QueueFull:
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    self._capture_queue.get_nowait()
+                    self.stats.dropped_capture += 1
+                with contextlib.suppress(asyncio.QueueFull):
+                    self._capture_queue.put_nowait(frame)
             self.stats.pcm_frames_in += 1
             self.stats.pcm_bytes_in += len(message)
 
@@ -1193,10 +1268,31 @@ class BridgeSession:
             else:
                 chunk = silence
 
-            if _is_audible(chunk):
+            audible = _is_audible(chunk)
+            if audible:
                 self.stats.audible_ticks += 1
             else:
                 self.stats.silent_ticks += 1
+
+            # Rising edge of the agent's speech: log how long it has been since the meeting
+            # last made a sound. That gap is agent-worker + Anam + LiveKit only — it contains
+            # nothing from the connector, so comparing it against the latency a human hears in
+            # the meeting splits the budget in two with one number.
+            if (
+                audible
+                and not self._agent_was_audible
+                and self._silent_run >= REPLY_GAP_TICKS
+                and self._last_user_audible_at is not None
+            ):
+                logger.info(
+                    "latency: agent started speaking %.2fs after the meeting last made "
+                    "a sound (session=%s) — this gap excludes the connector entirely",
+                    time.monotonic() - self._last_user_audible_at,
+                    self._session_id,
+                )
+            self._silent_run = 0 if audible else self._silent_run + 1
+            self._agent_was_audible = audible
+
             await muxer.write(chunk)
 
     async def _pump_video(self) -> None:
@@ -1234,6 +1330,23 @@ class BridgeSession:
                 data = muxer.placeholder_frame
                 self.stats.placeholder_video_ticks += 1
             await muxer.write_video(data)
+
+    async def _pump_capture_to_room(self) -> None:
+        """Drain the inbound queue into the room, at whatever rate LiveKit accepts.
+
+        Split out of ``_pump_meet_to_room`` so that this — the only genuinely rate-limited
+        step on the inbound leg — cannot throttle the socket reader, and the control frames
+        sharing that socket, behind it.
+        """
+        while True:
+            frame = await self._capture_queue.get()
+            source = self._source
+            if source is None:
+                continue
+            try:
+                await asyncio.wait_for(source.capture_frame(frame), timeout=1.0)
+            except TimeoutError:
+                self.stats.dropped_capture += 1
 
     async def _pump_room_to_meet(self) -> None:
         """Muxed fMP4 → the bridge. The output side."""
@@ -1339,6 +1452,11 @@ class BridgeSession:
                         raise
                     pending.add(
                         asyncio.create_task(self._pump_meet_to_room(), name="meet-to-room")
+                    )
+                    pending.add(
+                        asyncio.create_task(
+                            self._pump_capture_to_room(), name="capture-to-room"
+                        )
                     )
                     watchers.append(
                         asyncio.create_task(
