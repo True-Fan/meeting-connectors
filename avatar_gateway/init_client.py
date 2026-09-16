@@ -111,33 +111,68 @@ class InitClient:
         }
         session = await self._post_session(payload, bearer)
 
-        status = session.get("status")
-        if status == "waiting":
-            logger.info(
-                "session %s is waiting (%s) — polling",
-                session.get("session_id"),
-                session.get("reason"),
-            )
-            polling_url = session["polling_url"]
-            for _ in range(WAITING_POLL_ATTEMPTS):
-                await asyncio.sleep(WAITING_POLL_INTERVAL_S)
-                response = await self._http.get(
-                    polling_url, headers={"Authorization": f"Bearer {bearer}"}
+        # **The server has reserved a session by this point, and it costs the tenant a
+        # slice of its concurrency cap whether or not it ever becomes ready.** So the
+        # reservation is tracked from here — the moment it exists — rather than from the
+        # point everything below it has succeeded.
+        reserved = self._reservation(session)
+
+        try:
+            status = session.get("status")
+            if status == "waiting":
+                logger.info(
+                    "session %s is waiting (%s) — polling",
+                    session.get("session_id"),
+                    session.get("reason"),
                 )
-                if response.status_code < 400:
-                    session = response.json()
-                    status = session.get("status")
-                    if status != "waiting":
-                        break
+                polling_url = session["polling_url"]
+                for _ in range(WAITING_POLL_ATTEMPTS):
+                    await asyncio.sleep(WAITING_POLL_INTERVAL_S)
+                    response = await self._http.get(
+                        polling_url, headers={"Authorization": f"Bearer {bearer}"}
+                    )
+                    if response.status_code < 400:
+                        session = response.json()
+                        status = session.get("status")
+                        if status != "waiting":
+                            break
 
-        if status != "ready":
-            raise InitError(
-                f"session {session.get('session_id')} is {status!r} "
-                f"({session.get('reason')}) — is agent-worker running and registered "
-                f"with Worker Handling? (curl localhost:8080/readyz)"
-            )
+            if status != "ready":
+                raise InitError(
+                    f"session {session.get('session_id')} is {status!r} "
+                    f"({session.get('reason')}) — is agent-worker running and registered "
+                    f"with Worker Handling? (curl localhost:8080/readyz)"
+                )
+        except BaseException:
+            # **A reservation nobody ends occupies the cap for good.** A ``ready`` one
+            # especially: the cap is a count of ready sessions, so a handful of abandoned
+            # handshakes wedges the tenant permanently and every later join comes back as
+            # ``waiting (concurrent_session_limit)`` — including the joins that would
+            # otherwise have succeeded. Measured exactly that: five ready sessions against
+            # a cap of five, every subsequent join blocked, and no recovery short of
+            # ending them by hand.
+            #
+            # Each failure used to leak one, which made a transient shortage of workers
+            # permanent. Releasing here is what keeps a failed handshake a failed
+            # handshake rather than the end of the tenant's capacity.
+            if reserved is not None:
+                await self.end_session(reserved, reason="handshake_failed")
+            raise
 
-        session_id = session["session_id"]
+        if reserved is None:  # pragma: no cover - a ready session always carries an id
+            raise InitError(f"session is ready but carried no session_id: {session}")
+        return reserved
+
+    def _reservation(self, session: dict) -> InitSession | None:
+        """The handle needed to release a session, or ``None`` if there is nothing to
+        release.
+
+        Separated out because it is wanted *before* the session is known to be usable:
+        the failure path needs exactly the same handle the success path returns.
+        """
+        session_id = session.get("session_id")
+        if not session_id:
+            return None
         return InitSession(
             session_id=session_id,
             end_url=f"{self._base_url}/v1/sessions/{session_id}/end",
