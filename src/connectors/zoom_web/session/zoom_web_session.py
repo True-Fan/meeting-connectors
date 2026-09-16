@@ -63,6 +63,7 @@ from src.connectors.google_meet.automation.driver import (
     PlaywrightDriver,
 )
 from src.connectors.google_meet.browser.launcher import build_launch_plan
+from src.connectors.google_meet.browser.profile import ProfileLease, ProfileManager
 from src.connectors.zoom.api.rtms_trigger import RtmsTrigger
 from src.connectors.zoom.rtms.audio_source import RtmsAudioSource
 from src.connectors.zoom.rtms.observations import MeetingObserver
@@ -121,7 +122,9 @@ class ZoomWebSession:
         "_interrupts",
         "_joined",
         "_joiner",
+        "_lease",
         "_page_server",
+        "_profiles",
         "_publisher",
         "_router",
         "_session",
@@ -177,6 +180,8 @@ class ZoomWebSession:
         self._task: asyncio.Task[None] | None = None
         self._trigger_task: asyncio.Task[None] | None = None
         self._temp_profile: str | None = None
+        self._profiles: ProfileManager | None = None
+        self._lease: ProfileLease | None = None
 
     @property
     def session(self) -> SessionContext:
@@ -215,19 +220,85 @@ class ZoomWebSession:
         A join failure propagates: a session that never got into the meeting must
         fail creation rather than sit there reporting health.
         """
-        # **A persistent profile is what makes the injected microphone work.**
-        # Chromium stores the per-origin device choice in ``Default/Preferences``.
-        # With a throwaway profile Zoom has no microphone selected, so its capture
-        # pipeline never starts and it publishes nothing whatever ``getUserMedia``
-        # returns — measured, and the reason an earlier device-based design existed.
-        # A profile where a microphone has been chosen once makes Zoom request that
-        # ``deviceId``, which the page patch then answers.
-        if self._config.profile_dir is not None:
-            user_data_dir = self._config.profile_dir
-        else:
-            self._temp_profile = tempfile.mkdtemp(prefix="mc-zoom-web-")
-            user_data_dir = Path(self._temp_profile)
+        user_data_dir = self._acquire_profile()
+        try:
+            await self._start(user_data_dir)
+        except BaseException:
+            # The working profile belongs to this session alone, so a start that never
+            # completed takes it with it — but only after the browser holding it open is
+            # closed. Removing a live Chromium's user-data directory underneath it is a
+            # worse outcome than leaking a directory.
+            await self._abandon_profile()
+            raise
 
+    def _acquire_profile(self) -> Path:
+        """The Chromium user-data directory this session will run on.
+
+        **A persistent profile is what makes the injected microphone work.** Chromium
+        stores the per-origin device choice in ``Default/Preferences``. With a throwaway
+        profile Zoom has no microphone selected, so its capture pipeline never starts and
+        it publishes nothing whatever ``getUserMedia`` returns — measured, and the reason
+        an earlier device-based design existed. A profile where a microphone has been
+        chosen once makes Zoom request that ``deviceId``, which the page patch then
+        answers.
+
+        **What this does not do is hand that profile to the meeting.** A Chromium profile
+        is a single-writer resource: point two browsers at one directory and the second
+        either refuses to start or corrupts the first, which here means losing the very
+        device selection the profile exists to carry. Running two Zoom meetings in one
+        process — the whole point of a single container hosting several sessions — made
+        that a question of when rather than whether. So the configured directory is a
+        *template*, and each session gets a copy seeded from it by ``ProfileManager``,
+        exactly as the Meet connector has always done (``browser/profile.py``). The
+        microphone selection rides along in ``Default/Preferences``, which is part of the
+        seeded set; nothing written during a meeting flows back.
+
+        Falls back to a throwaway directory when nothing is configured — unchanged, and
+        still the signed-out, no-microphone-selected case the docstring above describes.
+        """
+        if self._config.profile_dir is None:
+            self._temp_profile = tempfile.mkdtemp(prefix="mc-zoom-web-")
+            return Path(self._temp_profile)
+
+        self._profiles = ProfileManager(template=self._config.profile_dir)
+        self._lease = self._profiles.acquire(self._session.session_id)
+        logger.info(
+            "zoom_web.profile_leased",
+            template=str(self._config.profile_dir),
+            working=str(self._lease.path),
+        )
+        return self._lease.path
+
+    def _release_profile(self) -> None:
+        """Discard this session's working profile. Idempotent, and never raises.
+
+        The template is never a candidate: ``ProfileManager.release`` returns early for a
+        lease it handed out as the template itself, and the throwaway branch only ever
+        removes a directory this session created.
+        """
+        lease, self._lease = self._lease, None
+        profiles, self._profiles = self._profiles, None
+        if lease is not None and profiles is not None:
+            profiles.release(lease)
+
+        temp, self._temp_profile = self._temp_profile, None
+        if temp is not None:
+            shutil.rmtree(temp, ignore_errors=True)
+
+    async def _abandon_profile(self) -> None:
+        """Close the browser, then drop the profile. For failed starts only.
+
+        ``stop()`` is not called for a session that never started — ``MeetingService``
+        fails it and drops it — so without this the working profile would outlive every
+        aborted join, and ``sessions/`` would fill with the debris of meetings that never
+        happened.
+        """
+        with suppress(Exception):
+            await self._driver.stop()
+        self._release_profile()
+
+    async def _start(self, user_data_dir: Path) -> None:
+        """The start sequence proper, once a profile directory is in hand."""
         plan = build_launch_plan(
             user_data_dir=user_data_dir,
             headless=self._config.headless,
@@ -391,10 +462,8 @@ class ZoomWebSession:
             await self._driver.stop()
         logger.info("zoom_web.session_stopped")
 
-        # Only ever a directory this session created.
-        temp, self._temp_profile = self._temp_profile, None
-        if temp is not None:
-            shutil.rmtree(temp, ignore_errors=True)
+        # Only ever a directory this session was given for itself — never the template.
+        self._release_profile()
 
     def _page_bootstrap(self) -> str:
         """The injection script with its configuration prepended.
