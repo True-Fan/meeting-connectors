@@ -49,6 +49,7 @@ from src.connectors.google_meet.automation.driver import (
     PlaywrightDriver,
 )
 from src.connectors.google_meet.browser.launcher import build_launch_plan
+from src.connectors.google_meet.browser.profile import ProfileLease, ProfileManager
 from src.connectors.teams_web.automation.selectors import (
     DEFAULT_HAND_SELECTORS,
     DEFAULT_OBSERVER_SELECTORS,
@@ -181,7 +182,9 @@ class TeamsWebSession:
         "_interrupts",
         "_joined",
         "_joiner",
+        "_lease",
         "_page_server",
+        "_profiles",
         "_publisher",
         "_router",
         "_session",
@@ -234,6 +237,8 @@ class TeamsWebSession:
         self._task: asyncio.Task[None] | None = None
         self._probe_task: asyncio.Task[None] | None = None
         self._temp_profile: str | None = None
+        self._profiles: ProfileManager | None = None
+        self._lease: ProfileLease | None = None
         self._console_lines = 0
 
     @property
@@ -273,17 +278,77 @@ class TeamsWebSession:
         A join failure propagates: a session that never got into the meeting must fail creation
         rather than sit there reporting health.
         """
-        # A persistent profile is optional on this connector, unlike on Zoom-web where it is
-        # what makes the microphone work at all. It is worth having — a signed-in profile joins
-        # as a tenant user rather than an anonymous guest, which some organisers require and
-        # which usually skips the lobby — so it is honoured when configured and a throwaway
-        # directory is used when it is not.
-        if self._config.profile_dir is not None:
-            user_data_dir = self._config.profile_dir
-        else:
-            self._temp_profile = tempfile.mkdtemp(prefix="mc-teams-web-")
-            user_data_dir = Path(self._temp_profile)
+        user_data_dir = self._acquire_profile()
+        try:
+            await self._start(user_data_dir)
+        except BaseException:
+            # The working profile belongs to this session alone, so a start that never
+            # completed takes it with it — but only after the browser holding it open is
+            # closed. Removing a live Chromium's user-data directory underneath it is a worse
+            # outcome than leaking a directory.
+            await self._abandon_profile()
+            raise
 
+    def _acquire_profile(self) -> Path:
+        """The Chromium user-data directory this session will run on.
+
+        A persistent profile is optional on this connector, unlike on Zoom-web where it is what
+        makes the microphone work at all. It is worth having — a signed-in profile joins as a
+        tenant user rather than an anonymous guest, which some organisers require and which
+        usually skips the lobby — so it is honoured when configured and a throwaway directory is
+        used when it is not.
+
+        **What is new is that the configured directory is a template rather than the thing the
+        meeting runs on.** A Chromium profile is a single-writer resource: two browsers pointed
+        at one directory means the second refuses to start or corrupts the first's session, so
+        sharing it capped this connector at one concurrent meeting per profile. Each session now
+        gets a copy seeded by ``ProfileManager`` — the same mechanism the Meet connector has
+        always used (``browser/profile.py``) — which carries the Teams sign-in, the granted
+        device permission and the "use the web app" preference across, and lets several meetings
+        run side by side in one process. Nothing a meeting writes flows back to the template.
+        """
+        if self._config.profile_dir is None:
+            self._temp_profile = tempfile.mkdtemp(prefix="mc-teams-web-")
+            return Path(self._temp_profile)
+
+        self._profiles = ProfileManager(template=self._config.profile_dir)
+        self._lease = self._profiles.acquire(self._session.session_id)
+        logger.info(
+            "teams_web.profile_leased",
+            template=str(self._config.profile_dir),
+            working=str(self._lease.path),
+        )
+        return self._lease.path
+
+    def _release_profile(self) -> None:
+        """Discard this session's working profile. Idempotent, and never raises.
+
+        The template is never a candidate: ``ProfileManager.release`` returns early for a lease
+        it handed out as the template itself, and the throwaway branch only ever removes a
+        directory this session created.
+        """
+        lease, self._lease = self._lease, None
+        profiles, self._profiles = self._profiles, None
+        if lease is not None and profiles is not None:
+            profiles.release(lease)
+
+        temp, self._temp_profile = self._temp_profile, None
+        if temp is not None:
+            shutil.rmtree(temp, ignore_errors=True)
+
+    async def _abandon_profile(self) -> None:
+        """Close the browser, then drop the profile. For failed starts only.
+
+        ``stop()`` is not called for a session that never started — ``MeetingService`` fails it
+        and drops it — so without this the working profile would outlive every aborted join, and
+        ``sessions/`` would fill with the debris of meetings that never happened.
+        """
+        with suppress(Exception):
+            await self._driver.stop()
+        self._release_profile()
+
+    async def _start(self, user_data_dir: Path) -> None:
+        """The start sequence proper, once a profile directory is in hand."""
         plan = build_launch_plan(
             user_data_dir=user_data_dir,
             headless=self._config.headless,
@@ -440,10 +505,8 @@ class TeamsWebSession:
             await self._driver.stop()
         logger.info("teams_web.session_stopped")
 
-        # Only ever a directory this session created.
-        temp, self._temp_profile = self._temp_profile, None
-        if temp is not None:
-            shutil.rmtree(temp, ignore_errors=True)
+        # Only ever a directory this session was given for itself — never the template.
+        self._release_profile()
 
     def _on_page_console(self, kind: str, text: str) -> None:
         """One console line from the page. Never raises, never floods.

@@ -1,0 +1,39 @@
+# **.env is deliberately absent from the image.** It carries live Zoom credentials, and an
+# image layer is not a secret store — it is pushed to a registry and readable by anyone who
+# can pull it. docker-compose.yml reads it from the host at run time instead (`env_file`),
+# so the values reach the process without being baked in.
+.env
+.env.*
+avatar_gateway/.env
+
+# The Chromium profiles are credentials too, and the container's live in a volume.
+.meet/
+.mc/
+
+.git/
+.gitignore
+.venv/
+venv/
+**/.venv/
+**/__pycache__/
+**/*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Separate deployables with their own images.
+avatar_gateway/
+calendar-orchestrator/
+
+docs/
+tests/
+run/
+out/
+*.log
+.DS_Store
+.idea/
+.vscode/
+.claude/
