@@ -1,0 +1,94 @@
+# Two services over one image and one volume.
+#
+#   docker compose build
+#   docker compose run --rm --service-ports login    # sign in, once, by hand
+#   docker compose up serve
+#
+# The profiles created by `login` are what `serve` joins meetings with, which is the
+# whole reason they share `mc-profiles`.
+
+name: meeting-connectors
+
+# Settings both services need identically. Split out because a profile signed in under
+# one set of Chromium flags and launched under another is the kind of difference that
+# surfaces as an unexplained join failure rather than as a config error.
+x-common: &common
+  env_file:
+    - .env
+  volumes:
+    - mc-profiles:/var/lib/mc
+  # Docker's default /dev/shm is 64MB. A renderer carrying video exhausts it and dies with
+  # a bare "target closed" — no stack, no hint that memory was the problem.
+  shm_size: 2gb
+  environment: &common-env
+    # Where the templates live, and therefore where `sessions/` is created beside them.
+    MC_GOOGLE_MEET__PROFILE_DIR: /var/lib/mc/meet-profile
+    MC_ZOOM_WEB__PROFILE_DIR: /var/lib/mc/zoom-web-profile
+    MC_TEAMS_WEB__PROFILE_DIR: /var/lib/mc/teams-web-profile
+    # The avatar gateway runs on the host in local development. `localhost` inside the
+    # container is the container.
+    MC_AVATAR__URL: ws://host.docker.internal:8300/stream
+  extra_hosts:
+    # Free on Docker Desktop; needed explicitly on Linux.
+    - "host.docker.internal:host-gateway"
+
+services:
+  # ---------------------------------------------------------------- serve
+  serve:
+    <<: *common
+    # **A tag per target.** Both services used one `image:` in the shared block, so each
+    # build overwrote the other and `up serve` ran whichever target happened to build last
+    # — the login image, display stack and all. They are different images and must be
+    # named as such.
+    image: meeting-connectors:serve
+    build:
+      context: .
+      target: serve
+    environment:
+      <<: *common-env
+      # **Overridden here rather than in .env on purpose.** .env is a developer's file and
+      # keeps whatever they need locally; a container has no display, so a headed launch
+      # fails outright. Compose `environment` wins over `env_file`, so this holds
+      # regardless of what .env says.
+      MC_GOOGLE_MEET__HEADLESS: "true"
+      MC_ZOOM_WEB__HEADLESS: "true"
+      MC_TEAMS_WEB__HEADLESS: "true"
+      # Chromium's own sandbox needs privileges this container does not have. Zoom and
+      # Teams read a dedicated setting; Meet has none, so its flags go through
+      # extra_browser_args — which the launcher appends last, after its built-ins.
+      MC_ZOOM_WEB__NO_SANDBOX: "true"
+      MC_TEAMS_WEB__NO_SANDBOX: "true"
+      MC_GOOGLE_MEET__EXTRA_BROWSER_ARGS: '["--no-sandbox","--disable-setuid-sandbox"]'
+    ports:
+      # Host 8001 to match the port this service is run on locally.
+      - "8001:8000"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- login
+  login:
+    <<: *common
+    image: meeting-connectors:login
+    build:
+      context: .
+      target: login
+    environment:
+      <<: *common-env
+      # Headed: the entire point is that a human can see and complete the sign-in,
+      # including whatever second factor or device check the provider decides to present.
+      MC_GOOGLE_MEET__HEADLESS: "false"
+      MC_ZOOM_WEB__HEADLESS: "false"
+      MC_TEAMS_WEB__HEADLESS: "false"
+      MC_ZOOM_WEB__NO_SANDBOX: "true"
+      MC_TEAMS_WEB__NO_SANDBOX: "true"
+      MC_GOOGLE_MEET__EXTRA_BROWSER_ARGS: '["--no-sandbox","--disable-setuid-sandbox"]'
+    ports:
+      # **Loopback only.** x11vnc runs without a password, and what is on the other end is
+      # a browser signed in to the avatar's Google, Zoom and Teams accounts.
+      - "127.0.0.1:7900:7900"
+    stdin_open: true
+    tty: true
+
+volumes:
+  # Named, not a bind mount: the contents are a live credential and belong in Docker's
+  # own storage rather than in the working tree, where the wrong `git clean` reaches them.
+  mc-profiles:
