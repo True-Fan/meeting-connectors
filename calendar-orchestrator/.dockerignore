@@ -1,0 +1,16 @@
+# The OAuth client secret and the minted token both live under credentials/, and the .env
+# carries the calendar configuration. All three arrive at run time via compose — a volume
+# for the credentials, env_file for the rest — never in an image layer.
+.env
+.env.*
+credentials/
+state/
+
+.venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.log
+tests/
+Dockerfile
+.dockerignore

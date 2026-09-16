@@ -37,6 +37,43 @@ start_display() {
     websockify --web=/usr/share/novnc "${NOVNC_PORT}" "localhost:${VNC_PORT}" >/dev/null 2>&1 &
 }
 
+start_audio() {
+    # **Both modes need this, for different halves of the same problem.** At sign-in Zoom
+    # needs a microphone it can offer in its device menu; at join time it needs the device
+    # that its stored preference names to still exist. A null sink with a source remapped
+    # off its monitor supplies one without a sound card, without privileges, and with a
+    # stable name across both images.
+    mkdir -p "${XDG_RUNTIME_DIR:-/tmp/pulse}"
+
+    if ! pulseaudio --check 2>/dev/null; then
+        echo "==> starting pulseaudio"
+        # --exit-idle-time=-1 because nothing is connected at startup and Pulse would
+        # otherwise shut down before the browser ever asks for a device.
+        pulseaudio --start --exit-idle-time=-1 --disallow-exit 2>/dev/null || {
+            echo "!! pulseaudio failed to start - Zoom will have no microphone to select" >&2
+            return 0
+        }
+    fi
+
+    # Idempotent: loading these twice would present duplicate devices in Zoom's menu,
+    # which is its own kind of confusing.
+    if ! pactl list short sinks 2>/dev/null | grep -q VirtualOutput; then
+        pactl load-module module-null-sink \
+            sink_name=VirtualOutput \
+            sink_properties=device.description=VirtualOutput >/dev/null
+    fi
+    if ! pactl list short sources 2>/dev/null | grep -q VirtualMic; then
+        # A remapped source rather than the raw monitor: Chromium lists monitors
+        # separately and Zoom does not always treat one as a usable capture device.
+        pactl load-module module-remap-source \
+            source_name=VirtualMic \
+            master=VirtualOutput.monitor \
+            source_properties=device.description=VirtualMic >/dev/null
+    fi
+
+    echo "==> audio: $(pactl list short sources 2>/dev/null | wc -l | tr -d ' ') source(s) available"
+}
+
 login_banner() {
     cat <<'BANNER'
 
@@ -58,6 +95,15 @@ login_banner() {
 
 BANNER
 }
+
+# **Every mode, including the `*)` passthrough.** It was originally called only from
+# `serve` and `login`, which left an ad-hoc `docker compose run serve python ...` — the
+# shape every diagnostic takes — with no microphone at all, and a Chromium with no audio
+# input is the one failure this image cannot detect on its own: getUserMedia simply
+# rejects, and the connector reports a page that never attached. start_audio is idempotent,
+# so a second invocation inside a running container is a no-op rather than a duplicate
+# device in Zoom's menu.
+start_audio
 
 case "${1:-serve}" in
     serve)

@@ -1,18 +1,24 @@
-# Two services over one image and one volume.
+# The whole stack: the connectors service, the avatar gateway, an interactive provisioning
+# shell, and the calendar orchestrator.
 #
 #   docker compose build
-#   docker compose run --rm --service-ports login    # sign in, once, by hand
-#   docker compose up serve
+#   docker compose run --rm --service-ports login   # sign in, once, by hand
+#   docker compose up                               # serve + gateway
+#   docker compose --profile orchestrator up        # ...and the calendar poller
 #
-# The profiles created by `login` are what `serve` joins meetings with, which is the
-# whole reason they share `mc-profiles`.
+# The profiles created by `login` are what `serve` joins meetings with, which is the whole
+# reason those two share `mc-profiles`.
+#
+# **What is still on the host.** realtime-product's services — Initialisation (8000),
+# Worker Handling (8100), agent-worker (8080) — are separate repositories and are reached
+# at host.docker.internal. Nothing here starts them.
 
 name: meeting-connectors
 
-# Settings both services need identically. Split out because a profile signed in under
-# one set of Chromium flags and launched under another is the kind of difference that
-# surfaces as an unexplained join failure rather than as a config error.
-x-common: &common
+# Settings the two connector containers need identically. Split out because a profile
+# signed in under one set of Chromium flags and launched under another is the kind of
+# difference that surfaces as an unexplained join failure rather than as a config error.
+x-connector: &connector
   env_file:
     - .env
   volumes:
@@ -20,14 +26,21 @@ x-common: &common
   # Docker's default /dev/shm is 64MB. A renderer carrying video exhausts it and dies with
   # a bare "target closed" — no stack, no hint that memory was the problem.
   shm_size: 2gb
-  environment: &common-env
+  environment: &connector-env
     # Where the templates live, and therefore where `sessions/` is created beside them.
     MC_GOOGLE_MEET__PROFILE_DIR: /var/lib/mc/meet-profile
     MC_ZOOM_WEB__PROFILE_DIR: /var/lib/mc/zoom-web-profile
     MC_TEAMS_WEB__PROFILE_DIR: /var/lib/mc/teams-web-profile
-    # The avatar gateway runs on the host in local development. `localhost` inside the
-    # container is the container.
-    MC_AVATAR__URL: ws://host.docker.internal:8300/stream
+    # The gateway is a service on this network now, not a process on the laptop. To go back
+    # to a host-run gateway instead, override this with
+    # ws://host.docker.internal:8300/stream.
+    MC_AVATAR__URL: ws://gateway:8300/stream
+    # Chromium's own sandbox needs privileges this container does not have. Zoom and Teams
+    # read a dedicated setting; Meet has none, so its flags go through extra_browser_args —
+    # which the launcher appends last, after its built-ins.
+    MC_ZOOM_WEB__NO_SANDBOX: "true"
+    MC_TEAMS_WEB__NO_SANDBOX: "true"
+    MC_GOOGLE_MEET__EXTRA_BROWSER_ARGS: '["--no-sandbox","--disable-setuid-sandbox"]'
   extra_hosts:
     # Free on Docker Desktop; needed explicitly on Linux.
     - "host.docker.internal:host-gateway"
@@ -35,17 +48,16 @@ x-common: &common
 services:
   # ---------------------------------------------------------------- serve
   serve:
-    <<: *common
-    # **A tag per target.** Both services used one `image:` in the shared block, so each
-    # build overwrote the other and `up serve` ran whichever target happened to build last
-    # — the login image, display stack and all. They are different images and must be
-    # named as such.
+    <<: *connector
+    # **A tag per target.** Both connector services used one `image:`, so each build
+    # overwrote the other and `up serve` ran whichever target built last — the login image,
+    # display stack and all. They are different images and must be named as such.
     image: meeting-connectors:serve
     build:
       context: .
       target: serve
     environment:
-      <<: *common-env
+      <<: *connector-env
       # **Overridden here rather than in .env on purpose.** .env is a developer's file and
       # keeps whatever they need locally; a container has no display, so a headed launch
       # fails outright. Compose `environment` wins over `env_file`, so this holds
@@ -53,42 +65,91 @@ services:
       MC_GOOGLE_MEET__HEADLESS: "true"
       MC_ZOOM_WEB__HEADLESS: "true"
       MC_TEAMS_WEB__HEADLESS: "true"
-      # Chromium's own sandbox needs privileges this container does not have. Zoom and
-      # Teams read a dedicated setting; Meet has none, so its flags go through
-      # extra_browser_args — which the launcher appends last, after its built-ins.
-      MC_ZOOM_WEB__NO_SANDBOX: "true"
-      MC_TEAMS_WEB__NO_SANDBOX: "true"
-      MC_GOOGLE_MEET__EXTRA_BROWSER_ARGS: '["--no-sandbox","--disable-setuid-sandbox"]'
     ports:
       # Host 8001 to match the port this service is run on locally.
       - "8001:8000"
+    depends_on:
+      - gateway
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- gateway
+  gateway:
+    image: avatar-gateway:local
+    build:
+      context: ./avatar_gateway
+    env_file:
+      # LiveKit project credentials and the realtime-product demo tenant.
+      - avatar_gateway/.env
+    environment:
+      # realtime-product's Initialisation service is not in this compose file — it runs on
+      # the host, so `localhost` (its default) would be this container.
+      INIT_URL: http://host.docker.internal:8000
+      GATEWAY_HOST: 0.0.0.0
+      GATEWAY_PORT: "8300"
+    # **Deliberately not published.** Only `serve` talks to it, over this network, and a
+    # host-side gateway on 8300 is a very normal thing to have running — publishing would
+    # collide with it. Add `ports: ["8300:8300"]` if you want to reach it from the host.
+    expose:
+      - "8300"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
   # ---------------------------------------------------------------- login
   login:
-    <<: *common
+    <<: *connector
     image: meeting-connectors:login
     build:
       context: .
       target: login
+    # Behind a profile so `docker compose up` does not start an idle interactive shell
+    # alongside the service. `compose run login` enables the profile on its own.
+    profiles: ["provision"]
     environment:
-      <<: *common-env
+      <<: *connector-env
       # Headed: the entire point is that a human can see and complete the sign-in,
       # including whatever second factor or device check the provider decides to present.
       MC_GOOGLE_MEET__HEADLESS: "false"
       MC_ZOOM_WEB__HEADLESS: "false"
       MC_TEAMS_WEB__HEADLESS: "false"
-      MC_ZOOM_WEB__NO_SANDBOX: "true"
-      MC_TEAMS_WEB__NO_SANDBOX: "true"
-      MC_GOOGLE_MEET__EXTRA_BROWSER_ARGS: '["--no-sandbox","--disable-setuid-sandbox"]'
     ports:
-      # **Loopback only.** x11vnc runs without a password, and what is on the other end is
-      # a browser signed in to the avatar's Google, Zoom and Teams accounts.
+      # **Loopback only.** x11vnc runs without a password, and what is on the other end is a
+      # browser signed in to the avatar's Google, Zoom and Teams accounts.
       - "127.0.0.1:7900:7900"
     stdin_open: true
     tty: true
 
+  # ---------------------------------------------------------------- orchestrator
+  orchestrator:
+    image: calendar-orchestrator:local
+    build:
+      context: ./calendar-orchestrator
+    # **Opt-in, unlike the rest.** This service watches a calendar and puts the avatar into
+    # real meetings on its own schedule. That is the last thing you want starting by
+    # surprise while testing a join by hand.
+    profiles: ["orchestrator"]
+    env_file:
+      # Does not exist yet in this checkout, and the service has defaults for everything
+      # except the credentials, so a missing file is not an error.
+      - path: calendar-orchestrator/.env
+        required: false
+    environment:
+      # Its default is http://localhost:8000/sessions — the connectors service, back when
+      # both ran on one laptop. Here it is a service name.
+      ORCH_BRIDGE__URL: http://serve:8000/sessions
+    volumes:
+      # Bind mounts rather than named volumes: the OAuth token is minted by
+      # `scripts/oauth_bootstrap.py`, which needs a real browser, so it is produced on the
+      # host and read from here. Both directories are gitignored.
+      - ./calendar-orchestrator/credentials:/app/credentials
+      - ./calendar-orchestrator/state:/app/state
+    ports:
+      - "8090:8090"
+    depends_on:
+      - serve
+    restart: unless-stopped
+
 volumes:
-  # Named, not a bind mount: the contents are a live credential and belong in Docker's
-  # own storage rather than in the working tree, where the wrong `git clean` reaches them.
+  # Named, not a bind mount: the contents are a live credential and belong in Docker's own
+  # storage rather than in the working tree, where the wrong `git clean` reaches them.
   mc-profiles:

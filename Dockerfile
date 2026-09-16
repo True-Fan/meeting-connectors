@@ -66,6 +66,25 @@ RUN playwright install --with-deps chromium \
     && chmod -R a+rX /ms-playwright \
     && rm -rf /var/lib/apt/lists/*
 
+# **A virtual microphone, and why it is in the *base* rather than in `login`.**
+# A container has no sound card, so Chromium enumerates zero audio inputs — and Zoom will
+# not start its capture pipeline until a microphone has been *selected* in its own device
+# menu. With no device there is nothing to select, which makes `zoom_web_login.py`
+# impossible to complete and leaves the avatar publishing silence exactly as it does with a
+# throwaway profile. PulseAudio's null sink plus a remapped source gives a real, selectable
+# device entirely in userspace, with no privileges and no host sound card.
+#
+# It belongs in the base because the device has to exist *identically* in both images:
+# Chromium stores the chosen microphone per origin as a device id, so a device present at
+# sign-in and absent at join is a stored preference pointing at nothing.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pulseaudio \
+        pulseaudio-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pulse runs per-user, so it needs somewhere writable for its socket.
+ENV XDG_RUNTIME_DIR=/tmp/pulse
+
 COPY src/ ./src/
 COPY tools/ ./tools/
 COPY scripts/ ./scripts/

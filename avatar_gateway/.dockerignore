@@ -1,0 +1,13 @@
+# Live LiveKit API secret and the realtime-product credentials. Passed at run time by
+# compose (`env_file`), never baked into a layer.
+.env
+.env.*
+
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+README.md
+RUNBOOK.md
+Dockerfile
+.dockerignore
