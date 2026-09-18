@@ -899,7 +899,8 @@ class BridgeSession:
         # fixed room is picked up from the initial participant snapshot rather than missed.
         self._room.on("track_subscribed", self._on_track_subscribed)
         self._room.on("participant_connected", self._on_participant_connected)
-        self._room.on("disconnected", lambda *_: logger.warning("room disconnected"))
+        self._room.on("participant_disconnected", self._on_participant_disconnected)
+        self._room.on("disconnected", self._on_disconnected)
 
         await self._room.connect(cfg.livekit_url, self._token())
         logger.info("joined room %s as %s", self._room_name, cfg.bridge_identity)
@@ -942,6 +943,46 @@ class BridgeSession:
             self._init_session.session_id,
             cfg.agent_id,
             self._room_name,
+        )
+
+    def _on_disconnected(self, *args: object) -> None:
+        """Log **why** LiveKit dropped this gateway, not merely that it did.
+
+        **The reason is the entire diagnostic, and this handler used to discard it.** It was
+        ``lambda *_: logger.warning("room disconnected")``, which turns several unrelated
+        faults into one indistinguishable line — while the symptom a user reports is the same
+        in every case: a grey tile and no audio, because a gateway that is out of the room
+        cannot forward anything the agent says.
+
+        The causes it was flattening have nothing in common:
+
+        * ``DUPLICATE_IDENTITY`` — something else joined claiming this gateway's identity.
+          LiveKit evicts the older connection, so a second gateway (a stray host-run process
+          alongside the container, say) silently kills every session the first one serves.
+        * ``ROOM_DELETED`` / ``ROOM_CLOSED`` — the room went away under the session, which
+          points at agent-worker or an operator, not at this process.
+        * ``PARTICIPANT_REMOVED`` — we were kicked.
+        * ``SERVER_SHUTDOWN`` / signalling failure — LiveKit-side or network.
+
+        Each needs a different fix and none of them is guessable from "room disconnected".
+        """
+        reason = args[0] if args else None
+        logger.warning(
+            "room disconnected — reason=%s (%r)",
+            getattr(reason, "name", None) or "unknown",
+            reason,
+        )
+
+    def _on_participant_disconnected(self, participant: rtc.RemoteParticipant) -> None:
+        """Whether it was the *agent* that left tells you which side to investigate.
+
+        An agent that joins and immediately leaves is an agent-worker problem; the room
+        surviving while only this gateway is dropped is a LiveKit or identity problem.
+        """
+        logger.warning(
+            "participant left: identity=%s kind=%s",
+            participant.identity,
+            participant.kind,
         )
 
     def _on_participant_connected(self, participant: rtc.RemoteParticipant) -> None:

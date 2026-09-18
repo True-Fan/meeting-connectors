@@ -80,7 +80,17 @@ RUN playwright install --with-deps chromium \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         pulseaudio \
         pulseaudio-utils \
+        ffmpeg \
     && rm -rf /var/lib/apt/lists/*
+
+# **ffmpeg is what makes the avatar visible and audible, and leaving it out is invisible
+# until a session runs.** `services/media/decoders/ffmpeg.py` spawns one process per
+# session — the gateway's fMP4 on stdin, raw audio and video out — and those raw frames are
+# the only thing the connector has to publish. Without the binary the decoder dies with a
+# bare `FileNotFoundError: [Errno 2]` deep inside uvloop, the avatar joins, the browser
+# reports `mic_track` live and `video_published=True`, and the meeting sees a grey tile in
+# silence. The watchdog names it precisely if you know to look: `buffered: 0` with
+# `underruns` climbing by 240k every five seconds.
 
 # Pulse runs per-user, so it needs somewhere writable for its socket.
 ENV XDG_RUNTIME_DIR=/tmp/pulse
